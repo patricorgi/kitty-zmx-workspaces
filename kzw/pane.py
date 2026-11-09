@@ -6,9 +6,18 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import uuid
 
 from .core import PANE
+
+
+def report_attachment_ended():
+    """Keep the pane visible until the supervisor verifies backend state."""
+    encoded = base64.b64encode(b"1").decode()
+    sys.stdout.write(f"\x1b]1337;SetUserVar=kzw_attach_ended={encoded}\x07")
+    sys.stdout.flush()
+    threading.Event().wait()
 
 
 def main():
@@ -48,10 +57,8 @@ def main():
             raise RuntimeError(f"attachment exited with status {result.returncode}")
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"kzw: {exc}", file=sys.stderr)
-        try:
-            input("Press Enter to close this pane...")
-        except EOFError:
-            pass
+    print("kzw: attachment ended; checking whether the session still exists", file=sys.stderr, flush=True)
+    report_attachment_ended()
 
 
 if __name__ == "__main__":

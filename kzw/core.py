@@ -94,7 +94,8 @@ def rewrite_export(text, panes, pane_executable):
             if not arg.startswith("--"):
                 break
             # Kitty's serializer writes every option as --name=value or a flag.
-            options.append(arg)
+            if not arg.startswith("--var=kzw_attach_ended="):
+                options.append(arg)
         pane, host = panes[window_id]
         command = [pane_executable, "--pane", pane, "--host", host, "--existing"]
         lines.append(shlex.join(["launch", FLAG + json.dumps(data, separators=(",", ":")), *options, *command]))

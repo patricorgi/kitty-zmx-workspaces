@@ -171,6 +171,28 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.start(3)
         self.assertEqual({v[0] for v in pane_map(self.tree()).values()}, expected - {right_pane})
 
+    def test_ctrl_d_removes_one_then_all_panes(self):
+        self.start(1)
+        first = next(iter(pane_map(self.tree())))
+        self.kitty("launch", "--match", f"id:{first}", "--next-to", f"id:{first}", "--location=hsplit")
+        self.wait_for(lambda: len(pane_map(self.tree())) == 2, "second pane missing")
+        original = pane_map(self.tree())
+        self.wait_for(lambda: {v[0] for v in original.values()}.issubset(self.remote_sessions()), "sessions missing")
+        target = next(wid for wid in original if wid != first)
+        self.kitty("send-text", "--match", f"id:{target}", "\\x04")
+        self.wait_for(lambda: len(pane_map(self.tree())) == 1, "exited pane not removed")
+        self.assertNotIn(original[target][0], self.remote_sessions())
+        self.stop()
+        self.start(1)
+        current = pane_map(self.tree())
+        self.assertEqual({v[0] for v in current.values()}, {original[first][0]})
+        survivor = next(iter(current))
+        self.kitty("send-text", "--match", f"id:{survivor}", "\\x04")
+        self.process.wait(timeout=30)
+        self.process = None
+        self.assertNotIn(original[first][0], self.remote_sessions())
+        self.assertIn("has no live panes", self.command("start", self.name, "--host", self.host))
+
 
 if __name__ == "__main__":
     unittest.main()
