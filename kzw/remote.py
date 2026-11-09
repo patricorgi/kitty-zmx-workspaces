@@ -54,6 +54,9 @@ class Store:
         if not isinstance(req, dict):
             raise ValueError("request must be an object")
         method = req.get("method")
+        if method == "workspace.list":
+            rows = self.db.execute("SELECT name,revision FROM workspaces ORDER BY name").fetchall()
+            return {"workspaces": [{"name": row[0], "revision": row[1]} for row in rows]}
         name = req.get("workspace", "")
         if not isinstance(name, str) or not NAME.fullmatch(name):
             raise ValueError("invalid workspace")
@@ -67,7 +70,7 @@ class Store:
             return {"panes": [r[0] for r in rows]}
         if method == "cleanup.retry":
             return self.retry_cleanup(name)
-        if method not in ("workspace.put", "panes.close"):
+        if method not in ("workspace.put", "panes.close", "workspace.prune"):
             raise ValueError("unknown method")
         request_id = req.get("request_id", "")
         if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
@@ -104,7 +107,18 @@ class Store:
                 if removed or not old.issubset(current):
                     raise ValueError("workspace.put cannot remove panes")
             elif not removed or removed != old - current or current - old:
-                raise ValueError("panes.close must remove exactly the specified existing panes")
+                raise ValueError("close/prune must remove exactly the specified existing panes")
+            if method == "workspace.prune":
+                # An attachment/host failure is not a shell exit. Confirm on
+                # the origin itself before forgetting any session.
+                env = os.environ.copy()
+                env.pop("ZMX_SESSION", None)
+                env.pop("ZMX_SESSION_PREFIX", None)
+                env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
+                listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
+                                         text=True, env=env, timeout=10, check=True)
+                if removed.intersection(listing.stdout.splitlines()):
+                    raise Conflict("a pruned zmx session is still alive")
             # Never share ownership: closing one workspace must not kill a pane
             # referenced by another workspace or awaiting cleanup.
             for other, other_panes in self.db.execute("SELECT name,panes FROM workspaces WHERE name<>?", (name,)):
@@ -115,9 +129,10 @@ class Store:
                 raise Conflict("pane is awaiting cleanup")
             new_revision = actual + 1
             self.db.execute("INSERT OR REPLACE INTO workspaces VALUES (?,?,?,?)", (name, new_revision, snapshot, json.dumps(sorted(current))))
-            for pane in removed:
-                self.db.execute("INSERT INTO cleanup VALUES (?,?)", (name, pane))
-            response = {"revision": new_revision, "pending_cleanup": sorted(removed)}
+            if method == "panes.close":
+                for pane in removed:
+                    self.db.execute("INSERT INTO cleanup VALUES (?,?)", (name, pane))
+            response = {"revision": new_revision, "pending_cleanup": sorted(removed) if method == "panes.close" else []}
             self.db.execute("INSERT INTO operations VALUES (?,?,?,?)", (name, request_id, digest, json.dumps(response)))
             self.db.execute("COMMIT")
             return response

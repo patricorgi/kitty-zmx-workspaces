@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from kzw.core import atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
-from kzw.cli import capture, capture_locked, cleanup_close_locked, close_pane, close_tab, detach, restore_focus
+from kzw.cli import EMPTY_SNAPSHOT, capture, capture_locked, cleanup_close_locked, close_pane, close_tab, detach, restore_focus, synchronize_exits
 from kzw import pane
 
 
@@ -56,6 +56,11 @@ class WorkspaceTests(unittest.TestCase):
     def test_invalid_export_fails_closed(self):
         with self.assertRaises(ValueError):
             rewrite_export("launch --cwd=/tmp bash", pane_map(tree()), "/bin/kzw-pane")
+
+    def test_transient_attachment_ended_marker_not_restored(self):
+        output = rewrite_export(launch(7) + " --var=kzw_attach_ended=1\n" + launch(8),
+                                pane_map(tree()), "/bin/kzw-pane")
+        self.assertNotIn("kzw_attach_ended", output)
 
     def test_workspace_path_validation(self):
         self.assertEqual(check_name("work-1"), "work-1")
@@ -136,6 +141,16 @@ class WorkspaceTests(unittest.TestCase):
                 detach("Test")
             query.assert_not_called()
 
+    def test_detach_retries_transient_layout_change_before_closing(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("kzw.cli.state_dir", return_value=Path(directory)), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.capture_locked", side_effect=[ValueError("layout changed while taking snapshot"), 2]) as capture, \
+             patch("kzw.cli.time.sleep"), patch("kzw.cli.query") as query:
+            detach("Test")
+            self.assertEqual(capture.call_count, 2)
+            query.assert_called_once()
+
     def test_cleanup_refuses_incomplete_close(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pending-close.json"
@@ -206,7 +221,7 @@ class WorkspaceTests(unittest.TestCase):
         result = __import__("subprocess").CompletedProcess(["zmx"], 0, stdout="another-session\n")
         with patch("sys.argv", ["kzw-pane", "--pane", A, "--host", "", "--existing"]), \
              patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO), \
-             patch("builtins.input"), patch("kzw.pane.subprocess.run", return_value=result) as run:
+             patch("kzw.pane.report_attachment_ended"), patch("kzw.pane.subprocess.run", return_value=result) as run:
             pane.main()
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.args[0], ["zmx", "list", "--short"])
@@ -215,6 +230,7 @@ class WorkspaceTests(unittest.TestCase):
         result = __import__("subprocess").CompletedProcess(["ssh"], 0)
         with patch("sys.argv", ["kzw-pane", "--pane", A, "--host", "example-host", "--existing"]), \
              patch("sys.stdout", new_callable=io.StringIO), \
+             patch("kzw.pane.report_attachment_ended"), \
              patch("kzw.pane.subprocess.run", return_value=result) as run:
             pane.main()
         cmd = run.call_args.args[0]
@@ -222,6 +238,40 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("zmx list --short", cmd[3])
         self.assertIn("exec zmx attach " + A, cmd[3])
         self.assertLess(cmd[3].index("zmx list"), cmd[3].index("exec zmx attach"))
+
+    def test_all_confirmed_shell_exits_save_empty_workspace(self):
+        current = tree()
+        for window in current[0]["tabs"][0]["windows"]:
+            window["user_vars"]["kzw_attach_ended"] = "1"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "panes.json").write_text(json.dumps([A, B]))
+            def query(_socket, *args):
+                return json.dumps(current) if args == ("ls",) else ""
+            with patch("kzw.cli.query", side_effect=query) as q, patch("kzw.cli.zmx_command", return_value=""):
+                self.assertEqual(synchronize_exits(path, "/bin/kzw-pane"), 2)
+            self.assertEqual((path / "workspace.kitty-session").read_text(), EMPTY_SNAPSHOT)
+            self.assertEqual(json.loads((path / "panes.json").read_text()), [])
+            self.assertEqual(sum(c.args[1] == "close-window" for c in q.call_args_list), 2)
+
+    def test_network_failure_does_not_remove_panes(self):
+        current = tree()
+        current[0]["tabs"][0]["windows"][1]["user_vars"]["kzw_attach_ended"] = "1"
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("kzw.cli.query", return_value=json.dumps(current)) as q, \
+             patch("kzw.cli.zmx_command", side_effect=OSError("network down")):
+            self.assertEqual(synchronize_exits(Path(directory), "/bin/kzw-pane"), 0)
+            self.assertEqual(q.call_count, 1)
+            self.assertFalse((Path(directory) / "workspace.kitty-session").exists())
+
+    def test_live_detached_session_is_not_removed(self):
+        current = tree()
+        current[0]["tabs"][0]["windows"][1]["user_vars"]["kzw_attach_ended"] = "1"
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("kzw.cli.query", return_value=json.dumps(current)) as q, \
+             patch("kzw.cli.zmx_command", return_value=B + "\n"):
+            self.assertEqual(synchronize_exits(Path(directory), "/bin/kzw-pane"), 0)
+            self.assertEqual(q.call_count, 1)
 
 
 if __name__ == "__main__":
