@@ -15,7 +15,6 @@ import subprocess
 import tempfile
 import time
 import unittest
-import uuid
 
 from kzw.cli import zmx_command
 from kzw.core import focused_pane, pane_map
@@ -33,7 +32,8 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="ki-", dir=cache)
         self.env = os.environ.copy()
         self.env["XDG_STATE_HOME"] = self.temp.name
-        self.name = "integration-" + uuid.uuid4().hex[:12]
+        # The state directory is unique even though the workspace is named Test.
+        self.name = "Test"
         self.path = Path(self.temp.name) / "kzw" / self.name
         self.socket = self.path / "kitty.sock"
         self.owned = set()
@@ -116,6 +116,19 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.wait_for(lambda: expected.issubset(self.remote_sessions()), "remote sessions missing")
         original_pids = {pane: pid for pane, pid in self.remote_pids().items() if pane in expected}
         self.assertEqual(set(original_pids), expected)
+        # Tab titles track the foreground program of each tab's active pane.
+        self.kitty("send-text", "--match", f"id:{bottom}", "sleep 30\\r")
+        self.wait_for(lambda: any(t["title"] == "sleep" for o in self.tree() for t in o["tabs"]
+                                 if any(w["id"] == bottom for w in t["windows"])), "foreground title did not change")
+        self.kitty("focus-window", "--match", f"id:{right}")
+        self.wait_for(lambda: any(t["title"] == "bash" for o in self.tree() for t in o["tabs"]
+                                 if any(w["id"] == right for w in t["windows"])), "title did not follow focused split")
+        self.kitty("focus-window", "--match", f"id:{bottom}")
+        self.wait_for(lambda: any(t["title"] == "sleep" for o in self.tree() for t in o["tabs"]
+                                 if any(w["id"] == bottom for w in t["windows"])), "title did not follow focus back")
+        self.kitty("send-text", "--match", f"id:{bottom}", "\\x03")
+        self.wait_for(lambda: any(t["title"] == "bash" for o in self.tree() for t in o["tabs"]
+                                 if any(w["id"] == bottom for w in t["windows"])), "shell title did not return")
         self.kitty("send-text", "--match", f"id:{bottom}", "echo New\\r")
         self.wait_for(lambda: "\nNew\n" in self.kitty("get-text", "--match", f"id:{bottom}", "--extent", "all"), "output missing")
         self.stop()
@@ -131,7 +144,8 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         left_pane = initial[second_tab_first][0]
         left_window = next(w for t in tabs for w in t["windows"] if w["user_vars"]["kzw_pane"] == left_pane)
         self.assertIn(bottom_window["id"], left_window["neighbors"]["bottom"])
-        self.assertIn("\nNew\n", self.kitty("get-text", "--match", f'id:{bottom_window["id"]}', "--extent", "all"))
+        self.wait_for(lambda: "\nNew\n" in self.kitty("get-text", "--match", f'id:{bottom_window["id"]}', "--extent", "all"),
+                      "restored terminal output missing")
         right_window = next(w for t in tabs for w in t["windows"] if w["user_vars"]["kzw_pane"] == right_pane)
         self.command("close-pane", self.name, "--window-id", str(right_window["id"]))
         self.assertNotIn(right_pane, self.remote_sessions())
@@ -143,13 +157,13 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.kitty("launch", "--match", f"id:{extra}", "--next-to", f"id:{extra}", "--location=hsplit")
         self.wait_for(lambda: len(pane_map(self.tree())) == 5, "new tab metadata missing")
         tree = self.tree()
-        tab = next(t for o in tree for t in o["tabs"] if t["title"] == "disposable")
+        tab = next(t for o in tree for t in o["tabs"] if any(w["id"] == extra for w in t["windows"]))
         disposable = {w["user_vars"]["kzw_pane"] for w in tab["windows"]}
         self.wait_for(lambda: disposable.issubset(self.remote_sessions()), "tab sessions missing")
         self.stop()
         self.start(5)
         tree = self.tree()
-        tab = next(t for o in tree for t in o["tabs"] if t["title"] == "disposable")
+        tab = next(t for o in tree for t in o["tabs"] if any(w["user_vars"]["kzw_pane"] in disposable for w in t["windows"]))
         self.assertEqual({w["user_vars"]["kzw_pane"] for w in tab["windows"]}, disposable)
         self.command("close-tab", self.name, "--tab-id", str(tab["id"]))
         self.assertTrue(disposable.isdisjoint(self.remote_sessions()))
