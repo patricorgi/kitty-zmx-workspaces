@@ -1058,7 +1058,7 @@ def kitty_launch_command(args, env):
     if sys.platform != "darwin" or not Path("/Applications/kitty.app").is_dir():
         raise ValueError("background Kitty integration requires /Applications/kitty.app on macOS")
     forwarded = {key: value for key, value in env.items()
-                 if key.startswith("KZW_") or key in ("PATH", "PYTHONPATH", "XDG_STATE_HOME", "KITTY_CONFIG_DIRECTORY")}
+                 if key.startswith("KZW_") or key in ("PATH", "PYTHONPATH", "XDG_STATE_HOME", "KITTY_CONFIG_DIRECTORY", "ZMX_DIR", "SHELL")}
     command = ["/usr/bin/open", "-g", "-j", "-n", "-W", "-a", "/Applications/kitty.app"]
     for key in sorted(forwarded):
         command.extend(["--env", key + "=" + forwarded[key]])

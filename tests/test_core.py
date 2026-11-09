@@ -29,6 +29,17 @@ def launch(window_id, extra=""):
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_background_kitty_forwards_local_test_session_environment(self):
+        from kzw.cli import kitty_launch_command
+        env = {"KZW_TEST_KITTY_BACKGROUND": "1", "ZMX_DIR": "/private/test-zmx",
+               "SHELL": "/bin/bash", "PATH": "/bin", "UNRELATED": "private"}
+        with patch("kzw.cli.sys.platform", "darwin"), patch("kzw.cli.Path.is_dir", return_value=True):
+            command = kitty_launch_command(["kitty", "--session", "none"], env)
+        self.assertIn("ZMX_DIR=/private/test-zmx", command)
+        self.assertIn("SHELL=/bin/bash", command)
+        self.assertNotIn("UNRELATED=private", command)
+        self.assertEqual(command[-3:], ["--args", "--session", "none"])
+
     def test_rewrites_commands_without_losing_layout(self):
         source = "\n".join(["new_tab work", "layout splits", launch(7, "echo bad"), launch(8),
                             'set_layout_state {"pairs":{"one":7,"two":8}}'])
