@@ -5,9 +5,14 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
+import sys
+import threading
+import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .core import PANE, atomic_write, check_name
@@ -15,29 +20,121 @@ from .core import PANE, atomic_write, check_name
 DORMANT = "# kzw-dormant-workspace\n"
 ORIGIN = "KZW_ORIGIN"
 EXECUTABLE = "KZW_PANE_EXECUTABLE"
+MAX_MESSAGE = 1024 * 1024
+_local = threading.local()
 
 
-def call(host, request):
+class RemoteRejected(ValueError):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def ssh_command(host):
     if not isinstance(host, str) or host.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host):
         raise ValueError("invalid SSH host")
     # Ship our stdlib-only RPC handler over SSH; no remote install or TCP
     # listener is required. Remote state is persistent in its XDG state dir.
     source = Path(__file__).with_name("remote.py").read_bytes()
-    program = "import base64;exec(base64.b64decode(%r))" % base64.b64encode(source).decode()
+    program = ("import base64,os;os.environ['KZW_COORDINATOR_SOURCE']=%r;"
+               "exec(base64.b64decode(os.environ['KZW_COORDINATOR_SOURCE']))") % base64.b64encode(source).decode()
     state_override = os.environ.get("KZW_REMOTE_STATE_HOME", "")
     if state_override and (not state_override.startswith("/") or "\x00" in state_override):
         raise ValueError("KZW_REMOTE_STATE_HOME must be an absolute remote path")
     command = ("XDG_STATE_HOME=" + shlex.quote(state_override) + " " if state_override else "") + "python3 -u -c " + shlex.quote(program)
-    proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
-                          input=json.dumps(request, separators=(",", ":")) + "\n", text=True,
-                          capture_output=True, timeout=30, check=True)
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command]
+
+
+class Channel:
+    """One ordered RPC stream; a broken stream is never silently replayed."""
+
+    def __init__(self, command):
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, bufsize=0)
+        os.set_blocking(self.process.stdin.fileno(), False)
+        os.set_blocking(self.process.stdout.fileno(), False)
+        self.buffer = b""
+
+    def request(self, request, timeout=30):
+        data = (json.dumps(request, separators=(",", ":")) + "\n").encode()
+        if len(data) > MAX_MESSAGE:
+            raise ValueError("remote request too large")
+        deadline = time.monotonic() + timeout
+        offset = 0
+        while offset < len(data):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [self.process.stdin], [], remaining)[1]:
+                raise TimeoutError("remote coordinator request timed out")
+            offset += os.write(self.process.stdin.fileno(), data[offset:])
+        while b"\n" not in self.buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
+                raise TimeoutError("remote coordinator response timed out")
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise OSError("remote coordinator disconnected; operation outcome may be unknown")
+            self.buffer += chunk
+            if len(self.buffer) > MAX_MESSAGE:
+                raise ValueError("remote coordinator response too large")
+        line, self.buffer = self.buffer.split(b"\n", 1)
+        return decode_response(line)
+
+    def close(self):
+        self.process.stdin.close()
+        try:
+            self.process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        self.process.stdout.close()
+
+
+@contextmanager
+def persistent_rpc():
+    """Reuse a connection in this thread; one-shot CLI commands stay independent."""
+    previous = getattr(_local, "channels", None)
+    _local.channels = {}
     try:
-        response = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
+        yield
+    finally:
+        for channel in _local.channels.values():
+            channel.close()
+        _local.channels = previous
+
+
+def decode_response(data):
+    try:
+        response = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError("invalid remote coordinator response") from exc
-    if not response.get("ok"):
-        raise ValueError("remote coordinator: " + str(response.get("error", "unknown error")))
+    if not isinstance(response, dict) or not response.get("ok"):
+        if not isinstance(response, dict):
+            raise ValueError("invalid remote coordinator response")
+        raise RemoteRejected("remote coordinator: " + str(response.get("error", "unknown error")), response.get("code"))
+    if "result" not in response:
+        raise ValueError("invalid remote coordinator response")
     return response["result"]
+
+
+def call(host, request):
+    command = ssh_command(host)
+    channels = getattr(_local, "channels", None)
+    if channels is None:
+        proc = subprocess.run(command, input=json.dumps(request, separators=(",", ":")) + "\n",
+                              text=True, capture_output=True, timeout=30, check=True)
+        return decode_response(proc.stdout)
+    key = (host, os.environ.get("KZW_REMOTE_STATE_HOME", ""))
+    if key not in channels:
+        channels[key] = Channel(command)
+    try:
+        return channels[key].request(request)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        channels.pop(key).close()
+        raise
 
 
 def translate(snapshot, executable, host, portable):
@@ -84,7 +181,133 @@ def save_config(directory, config):
     atomic_write(directory / "remote.json", json.dumps(config, separators=(",", ":")) + "\n")
 
 
-def publish(directory, snapshot, panes, confirmed_exits=False):
+def lease_token(directory):
+    path = directory / "lease.json"
+    if not path.exists():
+        return None
+    lease = json.loads(path.read_text())
+    token = lease.get("token")
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("invalid local workspace lease")
+    return token
+
+
+def reserve_pane(directory, pane, operation):
+    if not PANE.fullmatch(pane):
+        raise ValueError("invalid pane ID")
+    config = json.loads((directory / "remote.json").read_text())
+    if config.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", ""):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    if config.get("pending"):
+        raise ValueError("an earlier remote update is pending")
+    token = lease_token(directory)
+    if token is None:
+        raise ValueError("remote workspace has no active lease")
+    return call(config["host"], {"method": "pane.reserve", "workspace": config["workspace"],
+                                 "pane": pane, "request_id": operation, "revision": config["revision"],
+                                 "lease_token": token})
+
+
+def stage_layout(directory, snapshot, panes):
+    config = json.loads((directory / "remote.json").read_text())
+    if config.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", ""):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    if config.get("pending"):
+        raise ValueError("an earlier remote update is pending")
+    token = lease_token(directory)
+    if token is None:
+        raise ValueError("remote workspace has no active lease")
+    portable, parsed = translate(snapshot, "", config["host"], True)
+    if sorted(panes) != parsed:
+        raise ValueError("staged layout and pane manifest disagree")
+    return call(config["host"], {"method": "workspace.stage", "workspace": config["workspace"],
+                                 "revision": config["revision"], "snapshot": portable, "panes": parsed,
+                                 "lease_token": token})
+
+
+def acquire_lease(directory, name, host):
+    path = directory / "lease.json"
+    config_path = directory / "remote.json"
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        if (config.get("host") != host or config.get("workspace") != name or
+                config.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", "")):
+            raise ValueError("local workspace has a conflicting remote origin")
+    if not call(host, {"method": "workspace.get", "workspace": name})["exists"]:
+        raise ValueError("remote workspace does not exist")
+    if path.exists():
+        record = json.loads(path.read_text())
+        if (record.get("host") != host or record.get("workspace") != name or
+                record.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", "")):
+            raise ValueError("local workspace lease has a conflicting origin")
+        token = lease_token(directory)
+        state = call(host, {"method": "workspace.lease.inspect", "workspace": name, "token": token})["state"]
+        if state in ("own-expired", "other-expired"):
+            token = uuid.uuid4().hex
+            atomic_write(path, json.dumps({"host": host, "workspace": name, "token": token,
+                                           "state_home": os.environ.get("KZW_REMOTE_STATE_HOME", "")}) + "\n")
+    else:
+        token = uuid.uuid4().hex
+        atomic_write(path, json.dumps({"host": host, "workspace": name, "token": token,
+                                       "state_home": os.environ.get("KZW_REMOTE_STATE_HOME", "")}) + "\n")
+    call(host, {"method": "workspace.lease.acquire", "workspace": name, "token": token})
+    return token
+
+
+def renew_lease(directory):
+    token = lease_token(directory)
+    if token is None:
+        raise ValueError("remote workspace has no active lease")
+    lease = json.loads((directory / "lease.json").read_text())
+    if lease.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", ""):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    call(lease["host"], {"method": "workspace.lease.renew", "workspace": lease["workspace"], "token": token})
+
+
+def release_lease(directory):
+    path = directory / "lease.json"
+    if not path.exists():
+        return
+    lease = json.loads(path.read_text())
+    if lease.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", ""):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    token = lease_token(directory)
+    call(lease["host"], {"method": "workspace.lease.release", "workspace": lease["workspace"], "token": token})
+    if path.exists() and lease_token(directory) == token:
+        path.unlink()
+
+
+def start_lease_heartbeat(directory):
+    lease = json.loads((directory / "lease.json").read_text())
+    token = lease_token(directory)
+    stop = threading.Event()
+
+    def heartbeat():
+        failed = False
+        with persistent_rpc():
+            while not stop.wait(5):
+                try:
+                    call(lease["host"], {"method": "workspace.lease.renew", "workspace": lease["workspace"], "token": token})
+                    if failed:
+                        print("kzw: workspace lease renewed", file=sys.stderr, flush=True)
+                    failed = False
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    if not failed:
+                        print(f"kzw: workspace lease renewal failed; remote mutations are fenced: {exc}",
+                              file=sys.stderr, flush=True)
+                    failed = True
+
+    thread = threading.Thread(target=heartbeat, name="kzw-lease", daemon=True)
+    thread.start()
+
+    def close():
+        stop.set()
+        thread.join(timeout=1)
+
+    return close
+
+
+def publish(directory, snapshot, panes, confirmed_exits=False, confirmed_close=False, close_panes=None):
     """Publish with durable replay of requests whose response was lost."""
     config_path = directory / "remote.json"
     if not config_path.exists():
@@ -100,7 +323,22 @@ def publish(directory, snapshot, panes, confirmed_exits=False):
     while True:
         pending = config.get("pending")
         if pending:
-            response = call(host, pending["request"])
+            if confirmed_close and (pending["request"]["method"] != "panes.close" or
+                                    set(pending["request"].get("remove", [])) != set(close_panes or [])):
+                raise ValueError("pending remote operation differs from confirmed close")
+            current_token = lease_token(directory)
+            if current_token is not None and pending["request"].get("lease_token") != current_token:
+                pending["request"]["lease_token"] = current_token
+                save_config(directory, config)
+            try:
+                response = call(host, pending["request"])
+            except RemoteRejected as exc:
+                # A typed rejection proves this particular registration was
+                # rolled back. Unknown outcomes retain the durable request.
+                if exc.code == "session_not_ready" and pending["request"]["method"] == "workspace.put":
+                    config.pop("pending", None)
+                    save_config(directory, config)
+                raise
             config["revision"] = response["revision"]
             config["published_hash"] = pending["hash"]
             config["panes"] = pending["request"]["panes"]
@@ -110,14 +348,134 @@ def publish(directory, snapshot, panes, confirmed_exits=False):
             return
         old_panes = set(config.get("panes", []))
         removed = old_panes - set(parsed)
-        if removed and not confirmed_exits:
+        if confirmed_close and removed != set(close_panes or []):
+            raise ValueError("remote pane removal differs from confirmed close")
+        if removed and not (confirmed_exits or confirmed_close):
             raise ValueError("remote pane removal requires a confirmed shell exit")
-        request = {"method": "workspace.prune" if removed else "workspace.put", "workspace": name, "revision": config["revision"],
+        method = ("panes.close" if confirmed_close else "workspace.prune") if removed else "workspace.put"
+        request = {"method": method, "workspace": name, "revision": config["revision"],
                    "request_id": uuid.uuid4().hex, "snapshot": portable, "panes": parsed}
+        token = lease_token(directory)
+        if token is not None:
+            request["lease_token"] = token
         if removed:
             request["remove"] = sorted(removed)
         config["pending"] = {"request": request, "hash": desired}
         save_config(directory, config)
+
+
+def retry_cleanup(directory):
+    config = json.loads((directory / "remote.json").read_text())
+    if config.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", ""):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    request = {"method": "cleanup.retry", "workspace": config["workspace"]}
+    token = lease_token(directory)
+    if token is not None:
+        request["lease_token"] = token
+    result = call(config["host"], request)
+    if result["remaining"]:
+        raise ValueError("remote session cleanup incomplete: " + ", ".join(result["remaining"]))
+
+
+def status(directory):
+    """Ask the origin about owned sessions; transport failures mean unknown."""
+    config = json.loads((directory / "remote.json").read_text())
+    if config.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", ""):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    return call(config["host"], {"method": "workspace.status", "workspace": config["workspace"]})
+
+
+def ensure_current_revision(directory):
+    """Refuse view mutations while remote state differs or an update is unknown."""
+    config = json.loads((directory / "remote.json").read_text())
+    if config.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", ""):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    if config.get("pending"):
+        raise ValueError("remote update outcome is pending; retry before changing the view")
+    remote = call(config["host"], {"method": "workspace.get", "workspace": config["workspace"]})
+    if not remote.get("exists") or remote.get("revision") != config.get("revision"):
+        raise ValueError("remote workspace revision changed; reconnect before changing the view")
+
+
+def start_status_monitor(directory):
+    """Wake the supervisor when the origin reports an observed session missing."""
+    config = json.loads((directory / "remote.json").read_text())
+    if config.get("state_home", "") != os.environ.get("KZW_REMOTE_STATE_HOME", ""):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    host, name = config["host"], check_name(config["workspace"])
+    cursor = config.get("event_cursor", 0)
+    if type(cursor) is not int or cursor < 0:
+        raise ValueError("invalid saved workspace event cursor")
+    stop = threading.Event()
+    lock = threading.Lock()
+    active = [None]
+
+    def monitor():
+        nonlocal cursor
+        while not stop.is_set():
+            channel = None
+            try:
+                channel = Channel(ssh_command(host))
+                with lock:
+                    active[0] = channel
+                    if stop.is_set():
+                        continue
+                known, notified = None, None
+                while not stop.is_set():
+                    current = channel.request({"method": "workspace.watch", "workspace": name,
+                                               "known": known, "timeout": 2}, timeout=15)
+                    if (not isinstance(current, dict) or type(current.get("revision")) is not int or
+                            not isinstance(current.get("live"), list) or not isinstance(current.get("missing"), list) or
+                            not isinstance(current.get("confirmed_missing"), list) or
+                            any(not isinstance(p, str) or not PANE.fullmatch(p)
+                                for p in current["live"] + current["missing"] + current["confirmed_missing"]) or
+                            not set(current["confirmed_missing"]).issubset(current["missing"])):
+                        raise ValueError("invalid workspace status notification")
+                    missing = sorted(set(current["confirmed_missing"]))
+                    next_cursor = cursor
+                    while not stop.is_set():
+                        page = channel.request({"method": "workspace.events", "workspace": name,
+                                                "after": next_cursor, "limit": 100}, timeout=15)
+                        events = page.get("events") if isinstance(page, dict) else None
+                        if not isinstance(events, list):
+                            raise ValueError("invalid workspace event page")
+                        for event in events:
+                            if (not isinstance(event, dict) or type(event.get("seq")) is not int or
+                                    event["seq"] <= next_cursor or type(event.get("revision")) is not int or
+                                    not isinstance(event.get("kind"), str) or not isinstance(event.get("data"), dict)):
+                                raise ValueError("invalid or unordered workspace event")
+                            next_cursor = event["seq"]
+                        if len(events) < 100:
+                            break
+                    notice = (current["revision"], tuple(missing), next_cursor)
+                    if notice != notified:
+                        atomic_write(directory / "remote-status.changed",
+                                     json.dumps({"missing": missing, "revision": current["revision"],
+                                                 "event_cursor": next_cursor, "id": uuid.uuid4().hex}) + "\n")
+                        notified = notice
+                    cursor = next_cursor
+                    known = current
+            except (OSError, ValueError, subprocess.SubprocessError):
+                if not stop.is_set():
+                    stop.wait(1)
+            finally:
+                with lock:
+                    active[0] = None
+                if channel is not None:
+                    channel.close()
+
+    thread = threading.Thread(target=monitor, name="kzw-remote-status", daemon=True)
+    thread.start()
+
+    def close():
+        stop.set()
+        with lock:
+            channel = active[0]
+            if channel is not None and channel.process.poll() is None:
+                channel.process.terminate()
+        thread.join(timeout=3)
+
+    return close
 
 
 def create(directory, name, host):
@@ -152,11 +510,26 @@ def pull(directory, name, host, executable):
             raise ValueError("local workspace has conflicting or pending remote state")
     elif any(directory.iterdir()):
         # The workspace lock is created by the caller before this check.
-        if any(p.name != "lock" for p in directory.iterdir()):
+        if any(p.name not in ("lock", "lease.json") for p in directory.iterdir()):
             raise ValueError("local workspace already exists; refusing to overwrite it")
-    remote = call(host, {"method": "workspace.get", "workspace": name})
+    remote = call(host, {"method": "workspace.sync", "workspace": name})
     if not remote["exists"]:
         raise ValueError("remote workspace does not exist")
+    staged = remote.get("staged")
+    if staged and remote.get("reservations"):
+        _, staged_panes = translate(staged["snapshot"], executable, host, False)
+        if staged_panes != sorted(staged["panes"]) or staged["revision"] != remote["revision"]:
+            raise ValueError("remote staged layout is inconsistent")
+        token = lease_token(directory)
+        if token is None:
+            raise ValueError("remote workspace has no active lease")
+        digest = snapshot_hash(staged["snapshot"], staged_panes)
+        call(host, {"method": "workspace.recover-stage", "workspace": name,
+                    "revision": staged["revision"], "snapshot": staged["snapshot"], "panes": staged_panes,
+                    "request_id": "recover-" + digest, "lease_token": token})
+        remote = call(host, {"method": "workspace.sync", "workspace": name})
+    if remote.get("reservations"):
+        raise ValueError("remote workspace has an incomplete pane creation; inspect its reservations before attaching")
     snapshot, panes = translate(remote["snapshot"], executable, host, False)
     if panes != sorted(remote["panes"]):
         raise ValueError("remote snapshot and pane manifest disagree")
@@ -169,4 +542,5 @@ def pull(directory, name, host, executable):
         raise ValueError("dormant remote state conflicts with a local snapshot")
     save_config(directory, {"workspace": name, "host": host, "revision": remote["revision"], "panes": panes,
                             "state_home": os.environ.get("KZW_REMOTE_STATE_HOME", ""),
+                            "event_cursor": remote["event_cursor"],
                             "published_hash": snapshot_hash(remote["snapshot"], panes)})

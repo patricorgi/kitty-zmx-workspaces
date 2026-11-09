@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -32,6 +33,8 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="ki-", dir=cache)
         self.env = os.environ.copy()
         self.env["XDG_STATE_HOME"] = self.temp.name
+        if sys.platform == "darwin":
+            self.env["KZW_TEST_KITTY_BACKGROUND"] = "1"
         # The state directory is unique even though the workspace is named Test.
         self.name = "Test"
         self.path = Path(self.temp.name) / "kzw" / self.name
@@ -41,7 +44,9 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.addCleanup(self.cleanup)
 
     def command(self, *args):
-        return subprocess.run(["kzw", *args], env=self.env, text=True, capture_output=True, check=True, timeout=60).stdout
+        confirmation = "y\n" if args[0] in ("close-pane", "close-tab") else None
+        return subprocess.run(["kzw", *args], env=self.env, input=confirmation, text=True,
+                              capture_output=True, check=True, timeout=60).stdout
 
     def kitty(self, *args):
         return subprocess.run(["kitty", "@", "--to", f"unix:{self.socket}", *args], env=self.env,
@@ -65,11 +70,16 @@ class RealWorkspaceLifecycle(unittest.TestCase):
             time.sleep(0.1)
         self.fail(f"{message}: {last_error}")
 
-    def start(self, count):
-        self.process = subprocess.Popen(["kzw", "start", self.name, "--host", self.host],
+    def start(self, count, command="start"):
+        host_option = "--host" if command == "start" else "--shell-host"
+        self.process = subprocess.Popen(["kzw", command, self.name, host_option, self.host],
                                         env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL)
         self.wait_for(lambda: len(pane_map(self.tree())) == count, "workspace did not restore")
+        self.wait_for(lambda: not (self.path / "pending-create.json").exists() and
+                      (self.path / "panes.json").is_file() and
+                      set(json.loads((self.path / "panes.json").read_text())) ==
+                      {value[0] for value in pane_map(self.tree()).values()}, "workspace panes not registered")
 
     def stop(self):
         self.command("detach", self.name)
@@ -79,6 +89,14 @@ class RealWorkspaceLifecycle(unittest.TestCase):
     def remote_sessions(self):
         return set(zmx_command(self.host, "list", "--short").splitlines())
 
+    def wait_for_prompt_after(self, window_id, marker):
+        def ready():
+            text = self.kitty("get-text", "--match", f"id:{window_id}", "--extent", "all")
+            _, found, tail = text.rpartition("\n" + marker + "\n")
+            return bool(found and tail.strip())
+        self.wait_for(ready, "shell prompt did not return")
+        time.sleep(0.2)
+
     def remote_pids(self):
         text = zmx_command(self.host, "list")
         return {match.group(1): int(match.group(2)) for match in
@@ -87,13 +105,20 @@ class RealWorkspaceLifecycle(unittest.TestCase):
     def cleanup(self):
         # Never act on sessions merely found on the remote host. Only IDs read
         # from this test's isolated Kitty are eligible for removal.
-        if self.process and self.process.poll() is None:
+        if self.socket.exists():
             try:
                 self.tree()
-                self.kitty("close-window", "--match", "all")
-                self.process.wait(timeout=10)
             except (OSError, ValueError, subprocess.SubprocessError):
-                pass
+                print("kzw integration: could not enumerate all test pane IDs; inspect for leftover sessions")
+            try:
+                self.kitty("close-window", "--match", "all")
+            except (OSError, ValueError, subprocess.SubprocessError):
+                print(f"kzw integration: test Kitty may still be open at {self.socket}")
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                print(f"kzw integration: test supervisor may still be running for {self.socket}")
         for pane in self.owned:
             try:
                 if pane in self.remote_sessions():
@@ -132,6 +157,7 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.kitty("send-text", "--match", f"id:{bottom}", "echo New\\r")
         self.wait_for(lambda: "\nNew\n" in self.kitty("get-text", "--match", f"id:{bottom}", "--extent", "all"), "output missing")
         self.stop()
+        self.assertFalse(list((self.path / "native-pending").glob("*.json")))
         self.assertTrue(expected.issubset(self.remote_sessions()))
         self.start(4)
         tree = self.tree()
@@ -179,6 +205,8 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         original = pane_map(self.tree())
         self.wait_for(lambda: {v[0] for v in original.values()}.issubset(self.remote_sessions()), "sessions missing")
         target = next(wid for wid in original if wid != first)
+        self.kitty("send-text", "--match", f"id:{target}", "echo KZW_EXIT_READY\\r")
+        self.wait_for_prompt_after(target, "KZW_EXIT_READY")
         self.kitty("send-text", "--match", f"id:{target}", "\\x04")
         self.wait_for(lambda: len(pane_map(self.tree())) == 1, "exited pane not removed")
         self.assertNotIn(original[target][0], self.remote_sessions())
@@ -187,11 +215,18 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         current = pane_map(self.tree())
         self.assertEqual({v[0] for v in current.values()}, {original[first][0]})
         survivor = next(iter(current))
+        self.kitty("send-text", "--match", f"id:{survivor}", "echo KZW_FINAL_EXIT_READY\\r")
+        self.wait_for_prompt_after(survivor, "KZW_FINAL_EXIT_READY")
         self.kitty("send-text", "--match", f"id:{survivor}", "\\x04")
         self.process.wait(timeout=30)
         self.process = None
         self.assertNotIn(original[first][0], self.remote_sessions())
         self.assertIn("has no live panes", self.command("start", self.name, "--host", self.host))
+        self.start(1, command="new-pane")
+        new_pane = next(iter(pane_map(self.tree()).values()))[0]
+        self.assertNotEqual(new_pane, original[first][0])
+        self.wait_for(lambda: new_pane in self.remote_sessions(), "new explicit session missing")
+        self.stop()
 
 
 if __name__ == "__main__":
