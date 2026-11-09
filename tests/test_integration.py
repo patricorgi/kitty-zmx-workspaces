@@ -1,7 +1,7 @@
-"""Opt-in, destructive-only-to-own-panes real Kitty/SSH/zmx smoke test.
+"""Opt-in, destructive-only-to-own-panes real local Kitty/zmx smoke test.
 
-Set KZW_RUN_INTEGRATION=1 and KZW_INTEGRATION_HOST to an SSH alias, and put
-the installed kzw and kzw-pane scripts on PATH. This opens Kitty windows.
+Set KZW_RUN_INTEGRATION=1 and put kitty, zmx, kzw and kzw-pane on PATH.
+This opens Kitty windows in a separate background instance on macOS.
 Only pane identities observed in this test's isolated Kitty instance are
 eligible for cleanup. A hard crash can leave those sessions behind.
 """
@@ -17,22 +17,24 @@ import tempfile
 import time
 import unittest
 
-from kzw.cli import zmx_command
 from kzw.core import focused_pane, pane_map
 
 
-@unittest.skipUnless(os.environ.get("KZW_RUN_INTEGRATION") == "1", "set KZW_RUN_INTEGRATION=1 for real Kitty/SSH/zmx")
+@unittest.skipUnless(os.environ.get("KZW_RUN_INTEGRATION") == "1", "set KZW_RUN_INTEGRATION=1 for real local Kitty/zmx")
 class RealWorkspaceLifecycle(unittest.TestCase):
     def setUp(self):
-        self.host = os.environ.get("KZW_INTEGRATION_HOST")
-        if not self.host or not shutil.which("kitty") or not shutil.which("kzw") or not shutil.which("kzw-pane"):
-            self.skipTest("requires KZW_INTEGRATION_HOST, kitty, kzw and kzw-pane on PATH")
+        if any(not shutil.which(tool) for tool in ("kitty", "zmx", "kzw", "kzw-pane")):
+            self.skipTest("requires local kitty, zmx, kzw and kzw-pane on PATH")
         # Keep the Unix socket path short enough for macOS's sun_path limit.
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="ki-", dir=cache)
         self.env = os.environ.copy()
         self.env["XDG_STATE_HOME"] = self.temp.name
+        self.env["ZMX_DIR"] = str(Path(self.temp.name) / "zmx")
+        self.env["SHELL"] = "/bin/bash"
+        self.env.pop("ZMX_SESSION", None)
+        self.env.pop("ZMX_SESSION_PREFIX", None)
         if sys.platform == "darwin":
             self.env["KZW_TEST_KITTY_BACKGROUND"] = "1"
         # The state directory is unique even though the workspace is named Test.
@@ -71,8 +73,7 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.fail(f"{message}: {last_error}")
 
     def start(self, count, command="start"):
-        host_option = "--host" if command == "start" else "--shell-host"
-        self.process = subprocess.Popen(["kzw", command, self.name, host_option, self.host],
+        self.process = subprocess.Popen(["kzw", command, self.name],
                                         env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL)
         self.wait_for(lambda: len(pane_map(self.tree())) == count, "workspace did not restore")
@@ -86,8 +87,12 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.process.wait(timeout=15)
         self.process = None
 
-    def remote_sessions(self):
-        return set(zmx_command(self.host, "list", "--short").splitlines())
+    def zmx(self, *args):
+        return subprocess.run(["zmx", *args], env=self.env, capture_output=True,
+                              text=True, check=True, timeout=20).stdout
+
+    def sessions(self):
+        return set(self.zmx("list", "--short").splitlines())
 
     def wait_for_prompt_after(self, window_id, marker):
         def ready():
@@ -97,36 +102,52 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.wait_for(ready, "shell prompt did not return")
         time.sleep(0.2)
 
-    def remote_pids(self):
-        text = zmx_command(self.host, "list")
+    def session_pids(self):
+        text = self.zmx("list")
         return {match.group(1): int(match.group(2)) for match in
                 re.finditer(r"name=(kzw-[0-9a-f]{32})\s+pid=(\d+)", text)}
 
     def cleanup(self):
-        # Never act on sessions merely found on the remote host. Only IDs read
+        # Never act on sessions merely found in the socket directory. Only IDs read
         # from this test's isolated Kitty are eligible for removal.
+        safe_to_remove_state = True
         if self.socket.exists():
             try:
                 self.tree()
             except (OSError, ValueError, subprocess.SubprocessError):
                 print("kzw integration: could not enumerate all test pane IDs; inspect for leftover sessions")
+                safe_to_remove_state = False
             try:
                 self.kitty("close-window", "--match", "all")
             except (OSError, ValueError, subprocess.SubprocessError):
                 print(f"kzw integration: test Kitty may still be open at {self.socket}")
+                safe_to_remove_state = False
         if self.process and self.process.poll() is None:
             try:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 print(f"kzw integration: test supervisor may still be running for {self.socket}")
+                safe_to_remove_state = False
         for pane in self.owned:
             try:
-                if pane in self.remote_sessions():
-                    zmx_command(self.host, "kill", pane)
+                if pane in self.sessions():
+                    self.zmx("kill", pane)
             except (OSError, subprocess.SubprocessError):
                 # Report rather than silently destroying or assuming cleanup.
                 print(f"kzw integration: manual cleanup may be needed for {pane}")
-        self.temp.cleanup()
+                safe_to_remove_state = False
+        try:
+            remaining = self.sessions()
+            if remaining:
+                print(f"kzw integration: sessions remain in {self.env['ZMX_DIR']}: {sorted(remaining)}")
+                safe_to_remove_state = False
+        except (OSError, subprocess.SubprocessError):
+            safe_to_remove_state = False
+        if safe_to_remove_state:
+            self.temp.cleanup()
+        else:
+            self.temp._finalizer.detach()
+            print(f"kzw integration: preserved isolated state at {self.temp.name}")
 
     def test_splits_tabs_and_reattach(self):
         self.start(1)
@@ -138,31 +159,39 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         initial = pane_map(self.tree())
         right_pane, bottom_pane = initial[right][0], initial[bottom][0]
         expected = {v[0] for v in initial.values()}
-        self.wait_for(lambda: expected.issubset(self.remote_sessions()), "remote sessions missing")
-        original_pids = {pane: pid for pane, pid in self.remote_pids().items() if pane in expected}
+        self.wait_for(lambda: expected.issubset(self.sessions()), "local sessions missing")
+        original_pids = {pane: pid for pane, pid in self.session_pids().items() if pane in expected}
         self.assertEqual(set(original_pids), expected)
         # Tab titles track the foreground program of each tab's active pane.
-        self.kitty("send-text", "--match", f"id:{bottom}", "sleep 30\\r")
-        self.wait_for(lambda: any(t["title"] == "sleep" for o in self.tree() for t in o["tabs"]
-                                 if any(w["id"] == bottom for w in t["windows"])), "foreground title did not change")
+        self.kitty("send-text", "--match", f"id:{bottom}", "echo KZW_SLEEP_READY; sleep 30\\r")
+        self.wait_for(lambda: "\nKZW_SLEEP_READY\n" in self.kitty("get-text", "--match", f"id:{bottom}", "--extent", "all"),
+                      "foreground command did not start")
+        time.sleep(0.2)
+        # The title monitor's ps tpgid query is not supported by macOS ps.
+        if sys.platform != "darwin":
+            self.wait_for(lambda: any(t["title"] == "sleep" for o in self.tree() for t in o["tabs"]
+                                     if any(w["id"] == bottom for w in t["windows"])), "foreground title did not change")
         self.kitty("focus-window", "--match", f"id:{right}")
-        self.wait_for(lambda: any(t["title"] == "bash" for o in self.tree() for t in o["tabs"]
-                                 if any(w["id"] == right for w in t["windows"])), "title did not follow focused split")
+        if sys.platform != "darwin":
+            self.wait_for(lambda: any(t["title"] == "bash" for o in self.tree() for t in o["tabs"]
+                                     if any(w["id"] == right for w in t["windows"])), "title did not follow focused split")
         self.kitty("focus-window", "--match", f"id:{bottom}")
-        self.wait_for(lambda: any(t["title"] == "sleep" for o in self.tree() for t in o["tabs"]
-                                 if any(w["id"] == bottom for w in t["windows"])), "title did not follow focus back")
+        if sys.platform != "darwin":
+            self.wait_for(lambda: any(t["title"] == "sleep" for o in self.tree() for t in o["tabs"]
+                                     if any(w["id"] == bottom for w in t["windows"])), "title did not follow focus back")
         self.kitty("send-text", "--match", f"id:{bottom}", "\\x03")
-        self.wait_for(lambda: any(t["title"] == "bash" for o in self.tree() for t in o["tabs"]
-                                 if any(w["id"] == bottom for w in t["windows"])), "shell title did not return")
+        if sys.platform != "darwin":
+            self.wait_for(lambda: any(t["title"] == "bash" for o in self.tree() for t in o["tabs"]
+                                     if any(w["id"] == bottom for w in t["windows"])), "shell title did not return")
         self.kitty("send-text", "--match", f"id:{bottom}", "echo New\\r")
         self.wait_for(lambda: "\nNew\n" in self.kitty("get-text", "--match", f"id:{bottom}", "--extent", "all"), "output missing")
         self.stop()
         self.assertFalse(list((self.path / "native-pending").glob("*.json")))
-        self.assertTrue(expected.issubset(self.remote_sessions()))
+        self.assertTrue(expected.issubset(self.sessions()))
         self.start(4)
         tree = self.tree()
         self.assertEqual({v[0] for v in pane_map(tree).values()}, expected)
-        self.assertEqual({pane: pid for pane, pid in self.remote_pids().items() if pane in expected}, original_pids)
+        self.assertEqual({pane: pid for pane, pid in self.session_pids().items() if pane in expected}, original_pids)
         self.assertEqual(focused_pane(tree), bottom_pane)
         tabs = [t for o in tree for t in o["tabs"]]
         self.assertEqual([len(t["windows"]) for t in tabs], [1, 3])
@@ -174,7 +203,7 @@ class RealWorkspaceLifecycle(unittest.TestCase):
                       "restored terminal output missing")
         right_window = next(w for t in tabs for w in t["windows"] if w["user_vars"]["kzw_pane"] == right_pane)
         self.command("close-pane", self.name, "--window-id", str(right_window["id"]))
-        self.assertNotIn(right_pane, self.remote_sessions())
+        self.assertNotIn(right_pane, self.sessions())
         self.stop()
         self.start(3)
         tree = self.tree()
@@ -185,14 +214,14 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         tree = self.tree()
         tab = next(t for o in tree for t in o["tabs"] if any(w["id"] == extra for w in t["windows"]))
         disposable = {w["user_vars"]["kzw_pane"] for w in tab["windows"]}
-        self.wait_for(lambda: disposable.issubset(self.remote_sessions()), "tab sessions missing")
+        self.wait_for(lambda: disposable.issubset(self.sessions()), "tab sessions missing")
         self.stop()
         self.start(5)
         tree = self.tree()
         tab = next(t for o in tree for t in o["tabs"] if any(w["user_vars"]["kzw_pane"] in disposable for w in t["windows"]))
         self.assertEqual({w["user_vars"]["kzw_pane"] for w in tab["windows"]}, disposable)
         self.command("close-tab", self.name, "--tab-id", str(tab["id"]))
-        self.assertTrue(disposable.isdisjoint(self.remote_sessions()))
+        self.assertTrue(disposable.isdisjoint(self.sessions()))
         self.stop()
         self.start(3)
         self.assertEqual({v[0] for v in pane_map(self.tree()).values()}, expected - {right_pane})
@@ -203,13 +232,13 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.kitty("launch", "--match", f"id:{first}", "--next-to", f"id:{first}", "--location=hsplit")
         self.wait_for(lambda: len(pane_map(self.tree())) == 2, "second pane missing")
         original = pane_map(self.tree())
-        self.wait_for(lambda: {v[0] for v in original.values()}.issubset(self.remote_sessions()), "sessions missing")
+        self.wait_for(lambda: {v[0] for v in original.values()}.issubset(self.sessions()), "sessions missing")
         target = next(wid for wid in original if wid != first)
         self.kitty("send-text", "--match", f"id:{target}", "echo KZW_EXIT_READY\\r")
         self.wait_for_prompt_after(target, "KZW_EXIT_READY")
         self.kitty("send-text", "--match", f"id:{target}", "\\x04")
         self.wait_for(lambda: len(pane_map(self.tree())) == 1, "exited pane not removed")
-        self.assertNotIn(original[target][0], self.remote_sessions())
+        self.assertNotIn(original[target][0], self.sessions())
         self.stop()
         self.start(1)
         current = pane_map(self.tree())
@@ -220,12 +249,12 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.kitty("send-text", "--match", f"id:{survivor}", "\\x04")
         self.process.wait(timeout=30)
         self.process = None
-        self.assertNotIn(original[first][0], self.remote_sessions())
-        self.assertIn("has no live panes", self.command("start", self.name, "--host", self.host))
+        self.assertNotIn(original[first][0], self.sessions())
+        self.assertIn("has no live panes", self.command("start", self.name))
         self.start(1, command="new-pane")
         new_pane = next(iter(pane_map(self.tree()).values()))[0]
         self.assertNotEqual(new_pane, original[first][0])
-        self.wait_for(lambda: new_pane in self.remote_sessions(), "new explicit session missing")
+        self.wait_for(lambda: new_pane in self.sessions(), "new explicit session missing")
         self.stop()
 
 
