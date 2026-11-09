@@ -11,6 +11,7 @@ import time
 from contextlib import contextmanager
 
 from .core import FOCUS_PREFIX, PANE, atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
+from .titles import start_title_monitor
 
 
 def state_dir(name):
@@ -247,6 +248,7 @@ def run(name, host):
         else:
             args += ["--session", "none"]
         child = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL)
+        title_stop = start_title_monitor(sock, query)
         print(f"Workspace {name!r} started. Keep this supervisor running; close Kitty to detach.", flush=True)
         last_error = None
         pending_focus = focus
@@ -278,6 +280,8 @@ def run(name, host):
             print("\nkzw: supervisor stopped; Kitty remains open, but snapshots have stopped.", file=sys.stderr)
             # Do not release the lock while Kitty still owns the workspace.
             child.wait()
+        finally:
+            title_stop.set()
         return child.returncode
 
 
