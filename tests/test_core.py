@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from kzw.core import atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
-from kzw.cli import capture, detach, restore_focus
+from kzw.cli import capture, capture_locked, cleanup_close_locked, close_pane, close_tab, detach, restore_focus
 from kzw import pane
 
 
@@ -135,6 +135,72 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 detach("Test")
             query.assert_not_called()
+
+    def test_cleanup_refuses_incomplete_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pending-close.json"
+            path.write_text(json.dumps({"phase": "closing", "pane": A, "host": ""}))
+            with patch("kzw.cli.zmx_command") as zmx:
+                with self.assertRaises(ValueError):
+                    cleanup_close_locked(Path(directory))
+                zmx.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_close_capture_rejects_additional_pane_changes(self):
+        current = tree()
+        export = launch(7) + "\n" + launch(8)
+        def query(_socket, *args):
+            return export if "--output-format=session" in args else json.dumps(current)
+        with tempfile.TemporaryDirectory() as directory, patch("kzw.cli.query", side_effect=query):
+            with self.assertRaises(ValueError):
+                capture_locked(Path(directory), "/bin/kzw-pane", allow_removals=True, expected_panes={7: (A, "")})
+            self.assertFalse((Path(directory) / "workspace.kitty-session").exists())
+
+    def test_cleanup_preserves_record_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pending-close.json"
+            path.write_text(json.dumps({"phase": "layout-saved", "pane": A, "host": ""}))
+            with patch("kzw.cli.zmx_command", side_effect=OSError("offline")):
+                with self.assertRaises(OSError):
+                    cleanup_close_locked(Path(directory))
+            self.assertTrue(path.exists())
+
+    def test_tab_cleanup_journals_partial_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pending-close.json"
+            path.write_text(json.dumps({"phase": "layout-saved", "panes": [
+                {"pane": A, "host": ""}, {"pane": B, "host": ""}]}))
+            with patch("kzw.cli.zmx_command", side_effect=[A + "\n", "", "", OSError("offline")]) as zmx:
+                with self.assertRaises(OSError):
+                    cleanup_close_locked(Path(directory))
+            self.assertEqual(json.loads(path.read_text())["panes"], [{"pane": B, "host": ""}])
+            self.assertEqual(zmx.call_args_list[1].args, ("", "kill", A))
+            with patch("kzw.cli.zmx_command", return_value=""):
+                self.assertEqual(cleanup_close_locked(Path(directory)), [B])
+            self.assertFalse(path.exists())
+
+    def test_invalid_tab_rejected_without_terminating(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("kzw.cli.state_dir", return_value=Path(directory)), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.capture_locked"), \
+             patch("kzw.cli.query", return_value=json.dumps(tree())), \
+             patch("kzw.cli.zmx_command") as zmx:
+            with self.assertRaises(ValueError):
+                close_tab("Test", 999)
+            zmx.assert_not_called()
+
+    def test_close_refuses_unknown_pane_before_destroying_anything(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("kzw.cli.state_dir", return_value=Path(directory)), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.capture_locked"), \
+             patch("kzw.cli.query", return_value=json.dumps(tree())) as query, \
+             patch("kzw.cli.zmx_command") as zmx:
+            with self.assertRaises(ValueError):
+                close_pane("Test", 999)
+            zmx.assert_not_called()
+            self.assertEqual(query.call_count, 1)
 
     def test_missing_local_session_does_not_attach(self):
         result = __import__("subprocess").CompletedProcess(["zmx"], 0, stdout="another-session\n")
