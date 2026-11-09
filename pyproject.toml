@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kitty-zmx-workspaces"
+version = "0.1.0"
+description = "Experimental Kitty workspace snapshots for zmx-backed terminals"
+requires-python = ">=3.10"
+
+[project.scripts]
+kzw = "kzw.cli:main"
+kzw-pane = "kzw.pane:main"
+
+[tool.setuptools]
+packages = ["kzw"]
