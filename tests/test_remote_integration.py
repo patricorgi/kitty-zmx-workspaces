@@ -1,6 +1,7 @@
 """Opt-in remote-origin smoke test with isolated local and remote state."""
 import json
 import os
+import queue
 from pathlib import Path
 import shlex
 import shutil
@@ -8,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -43,6 +45,8 @@ class RemoteOriginIntegration(unittest.TestCase):
         env["KZW_REMOTE_STATE_HOME"] = self.remote
         if sys.platform == "darwin":
             env["KZW_TEST_KITTY_BACKGROUND"] = "1"
+        if getattr(self, "debug_mode", False):
+            env["KZW_DEBUG"] = "1"
         if getattr(self, "ssh_shim", None):
             env["PATH"] = str(self.ssh_shim) + os.pathsep + env.get("PATH", "")
         return env
@@ -391,6 +395,77 @@ class RemoteOriginIntegration(unittest.TestCase):
         self.assertEqual(created, {value[0] for value in pane_map(self.tree()).values()})
         self.detach()
 
+    def test_inspect_and_event_replay_across_layout_change(self):
+        self.kzw("a", "create", "Test", "--host", self.host)
+        self.attach("a", 1)
+        initial = json.loads(self.kzw("a", "inspect", "Test", "--host", self.host, "--json"))
+        self.assertEqual(len(initial["panes"]), 1)
+        window, (pane, _) = next(iter(pane_map(self.tree()).items()))
+        self.kzw("a", "_managed-create", "Test", "right", str(window), pane,
+                 "--host", self.host, "--origin", self.host)
+        self.wait_for(lambda: len(pane_map(self.tree())) == 2, "managed split missing")
+        current = json.loads(self.kzw("a", "inspect", "Test", "--host", self.host, "--json"))
+        self.assertEqual(len(current["panes"]), 2)
+        self.assertGreater(current["revision"], initial["revision"])
+        output = self.kzw("a", "events", "Test", "--host", self.host, "--json",
+                          "--after", str(initial["event_cursor"]), "--once")
+        events = [json.loads(line) for line in output.splitlines()]
+        changes = [event for event in events if event["type"] == "layout.updated"]
+        self.assertTrue(any(event["revision"] == current["revision"] and
+                            set(event["data"]["panes"]) == set(current["panes"]) for event in changes))
+        self.assertTrue(all(event["seq"] > initial["event_cursor"] for event in events))
+        self.detach()
+
+    def test_live_event_stream_reports_committed_split(self):
+        self.kzw("a", "create", "Test", "--host", self.host)
+        self.attach("a", 1)
+        messages = queue.Queue()
+        process = subprocess.Popen(["kzw", "events", "Test", "--host", self.host, "--json"],
+                                   env=self.env("a"), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        def receive():
+            for line in process.stdout:
+                messages.put(json.loads(line))
+        thread = threading.Thread(target=receive, daemon=True)
+        thread.start()
+        try:
+            initial = messages.get(timeout=30)
+            self.assertEqual(initial["type"], "snapshot")
+            window, (pane, _) = next(iter(pane_map(self.tree()).items()))
+            with patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(self.local.name) / "a")}):
+                directory = state_dir("Test", self.host)
+            def create_after_stable_capture():
+                result = subprocess.run(["kzw", "_managed-create", "Test", "right", str(window), pane,
+                                         "--host", self.host, "--origin", self.host], env=self.env("a"),
+                                        capture_output=True, text=True, timeout=60)
+                if result.returncode == 0:
+                    return True
+                if (not (directory / "pending-create.json").exists() and
+                        ("layout changed while taking snapshot" in result.stderr or
+                         "panes or focus changed while taking snapshot" in result.stderr)):
+                    return False
+                self.fail(f"managed creation failed: {result.stderr}")
+            self.wait_for(create_after_stable_capture, "managed creation did not stabilize")
+            deadline = time.monotonic() + 30
+            while True:
+                event = messages.get(timeout=max(0.1, deadline - time.monotonic()))
+                if event["type"] == "layout.updated" and len(event["data"]["panes"]) == 2:
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail("layout update was not delivered")
+            self.assertGreater(event["seq"], initial["event_cursor"])
+            self.assertGreater(event["revision"], initial["revision"])
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            thread.join(timeout=5)
+            process.stdout.close()
+        self.detach()
+
     def test_managed_creation_recovers_after_lost_stage_acknowledgement(self):
         self.kzw("a", "create", "Test", "--host", self.host)
         self.attach("a", 1)
@@ -421,6 +496,7 @@ class RemoteOriginIntegration(unittest.TestCase):
         self.detach()
 
     def test_interrupted_attachment_reconnects_then_prunes_dead_session(self):
+        self.debug_mode = True
         ssh = shutil.which("ssh")
         self.assertIsNotNone(ssh)
         self.ssh_shim = Path(self.local.name) / "bin"

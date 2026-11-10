@@ -40,6 +40,14 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(channel.request({"value": 1}), 1)
         self.assertEqual(channel.request({"value": 2}), 2)
 
+    def test_coordinator_transport_selects_local_bridge_without_ssh(self):
+        command = remote_client.coordinator_command("")
+        self.assertEqual(command[:3], [sys.executable, "-u", "-c"])
+        self.assertIn("KZW_LOCAL_COORDINATOR", command[3])
+        with patch("kzw.remote_client.ssh_command", return_value=["ssh", "origin"]) as ssh:
+            self.assertEqual(remote_client.coordinator_command("origin"), ["ssh", "origin"])
+            ssh.assert_called_once_with("origin")
+
     def test_channel_disconnect_is_not_replayed(self):
         channel = remote_client.Channel([sys.executable, "-u", "-c", "import sys; sys.stdin.readline()"])
         self.addCleanup(channel.close)

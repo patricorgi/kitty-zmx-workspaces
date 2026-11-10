@@ -31,6 +31,13 @@ class RemoteStoreTests(unittest.TestCase):
         return self.store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": request_id,
                                     "revision": revision, "snapshot": "layout", "panes": panes or [A, B]})
 
+    def test_local_coordinator_uses_private_subdirectory(self):
+        from kzw.remote import state_root
+        with patch.dict(os.environ, {"XDG_STATE_HOME": self.temp.name, "KZW_LOCAL_COORDINATOR": "1"}):
+            self.assertEqual(state_root(), Path(self.temp.name) / "kzw" / "coordinator")
+        with patch.dict(os.environ, {"XDG_STATE_HOME": self.temp.name, "KZW_LOCAL_COORDINATOR": ""}):
+            self.assertEqual(state_root(), Path(self.temp.name) / "kzw")
+
     def test_compare_and_swap_and_idempotency(self):
         self.assertEqual(self.put(), self.put())
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["revision"], 1)
@@ -144,6 +151,37 @@ class RemoteStoreTests(unittest.TestCase):
         self.assertEqual(self.store.dispatch({"method": "workspace.events", "workspace": "Other",
                                               "after": 0})["events"], [])
 
+    def test_sync_cursor_and_event_wait_cover_subsequent_layout_change(self):
+        self.put(panes=[A])
+        snapshot = self.store.dispatch({"method": "workspace.sync", "workspace": "Test"})
+        self.put("add", revision=1, panes=[A, B])
+        result = self.store.dispatch({"method": "workspace.events.wait", "workspace": "Test",
+                                      "after": snapshot["event_cursor"], "timeout": 0})
+        self.assertEqual(len(result["events"]), 1)
+        event = result["events"][0]
+        self.assertEqual((event["kind"], event["revision"], event["data"]["reason"]),
+                         ("layout.updated", 2, "snapshot"))
+        self.assertEqual(event["data"]["panes"], [A, B])
+
+    def test_event_wait_detects_absence_without_fabricating_exit(self):
+        self.put(panes=[A])
+        cursor = self.store.dispatch({"method": "workspace.sync", "workspace": "Test"})["event_cursor"]
+        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            result = self.store.dispatch({"method": "workspace.events.wait", "workspace": "Test",
+                                          "after": cursor, "timeout": 1})
+        self.assertEqual([(e["kind"], e["data"]) for e in result["events"]],
+                         [("session.missing", {"pane": A})])
+
+    def test_event_wait_listing_failure_does_not_record_absence(self):
+        self.put(panes=[A])
+        cursor = self.store.dispatch({"method": "workspace.sync", "workspace": "Test"})["event_cursor"]
+        with patch("kzw.remote.subprocess.run", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                self.store.dispatch({"method": "workspace.events.wait", "workspace": "Test",
+                                     "after": cursor, "timeout": 1})
+        self.assertEqual(self.store.dispatch({"method": "workspace.events", "workspace": "Test",
+                                              "after": cursor})["events"], [])
+
     def test_ordinary_snapshots_cannot_remove_panes(self):
         self.put()
         with self.assertRaises(ValueError):
@@ -200,15 +238,23 @@ class RemoteStoreTests(unittest.TestCase):
         self.assertEqual(self.store.dispatch(req)["pending_cleanup"], [B])
         self.assertEqual(self.store.dispatch(req)["revision"], 2)
         self.assertEqual(self.store.dispatch({"method": "cleanup.list", "workspace": "Test"})["panes"], [B])
+        events = self.store.dispatch({"method": "workspace.events", "workspace": "Test", "after": 0})["events"]
+        layout = events[-1]
+        self.assertEqual((layout["data"]["reason"], layout["data"]["pending_cleanup"]), ("managed_close", [B]))
+        cursor = layout["seq"]
         listing = subprocess.CompletedProcess([], 0, B + "\n", "")
         failed = subprocess.CompletedProcess([], 1, "", "not available")
         with patch("kzw.remote.subprocess.run", side_effect=[listing, failed]):
             self.assertEqual(self.store.dispatch({"method": "cleanup.retry", "workspace": "Test"})["remaining"], [B])
+        self.assertEqual(self.store.dispatch({"method": "workspace.events", "workspace": "Test", "after": cursor})["events"], [])
         with patch("kzw.remote.subprocess.run", side_effect=[listing, subprocess.CompletedProcess([], 0, "", ""),
                                                             subprocess.CompletedProcess([], 0, "", "")]) as run:
             self.assertEqual(self.store.dispatch({"method": "cleanup.retry", "workspace": "Test"})["remaining"], [])
             self.assertEqual(run.call_args_list[1].args[0], ["zmx", "kill", B])
         self.assertEqual(self.store.dispatch({"method": "cleanup.list", "workspace": "Test"})["panes"], [])
+        events = self.store.dispatch({"method": "workspace.events", "workspace": "Test", "after": cursor})["events"]
+        self.assertEqual([(e["kind"], e["data"]) for e in events],
+                         [("pane.cleanup_completed", {"pane": B, "reason": "managed_close"})])
 
     def test_pending_panes_cannot_be_readopted(self):
         self.put()

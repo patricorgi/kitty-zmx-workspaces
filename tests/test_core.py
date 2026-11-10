@@ -659,6 +659,16 @@ class WorkspaceTests(unittest.TestCase):
                 pane.verify_workspace_lease("other")
         renew.assert_not_called()
 
+    def test_local_coordinator_pane_renews_lease_without_ssh_origin(self):
+        from kzw import remote_client
+        env = {"KZW_WORKSPACE_COORDINATOR": "1", "KZW_WORKSPACE_ORIGIN": "",
+               "KZW_WORKSPACE_DIRECTORY": "/private/Test"}
+        with patch.dict("os.environ", env, clear=True), patch.object(remote_client, "renew_lease") as renew:
+            pane.verify_workspace_lease("")
+            renew.assert_called_once_with(Path("/private/Test"))
+            with self.assertRaisesRegex(RuntimeError, "inconsistent"):
+                pane.verify_workspace_lease("other")
+
     def test_native_remote_pane_retries_reservation_before_first_attach(self):
         from subprocess import CompletedProcess
         ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]

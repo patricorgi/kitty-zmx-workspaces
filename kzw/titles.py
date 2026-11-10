@@ -36,7 +36,10 @@ def parse_processes(zmx_list, ps_output):
         foreground = processes.get(child[1])
         if not foreground or foreground[0] != child[1] or foreground[2] != child[2]:
             continue
+        # Login shells can be displayed by ps as "-bash" or "-zsh".
         title = PurePath(foreground[3]).name
+        if title.startswith("-"):
+            title = title[1:]
         # Keep terminal-control characters and unexpected huge output out of
         # Kitty's title and remote-control command arguments.
         title = "".join(c for c in title if c.isprintable())[:100]

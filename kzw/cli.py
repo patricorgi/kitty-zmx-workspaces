@@ -33,7 +33,9 @@ def log_pane_event(event, panes):
 
 def state_dir(name, origin=""):
     root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-    path = root / "kzw" / check_name(name)
+    state_root = root / "kzw"
+    state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = state_root / check_name(name)
     if origin:
         if origin.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", origin):
             raise ValueError("invalid SSH host")
@@ -1128,7 +1130,7 @@ def kitty_launch_command(args, env):
 def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session=None, create_empty=False):
     directory = state_dir(name, host) if remote_attached else state_dir(name)
     if (directory / "remote.json").exists() and not remote_attached:
-        raise ValueError("remote workspace: use kzw attach NAME --host HOST")
+        raise ValueError("coordinator workspace: use kzw attach NAME (add --host for a remote origin)")
     pane_executable = shutil.which("kzw-pane")
     if not pane_executable:
         raise ValueError("kzw-pane not found; install the project and activate its environment")
@@ -1177,10 +1179,15 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         env["KZW_HOST"] = host
         env["KZW_WORKSPACE"] = name
         env["KZW_WORKSPACE_ORIGIN"] = host if remote_attached else ""
+        env["KZW_WORKSPACE_COORDINATOR"] = "1" if remote_attached else ""
         env["KZW_WORKSPACE_DIRECTORY"] = str(directory)
         env["KZW_CHANGE_SIGNAL"] = str(directory / "watcher.changed")
+        # Mask Kitty's automatic wrapper title until the process monitor has
+        # identified the actual foreground program, including on new tabs.
         args = ["kitty", "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only",
                 "-o", f"shell={pane_executable}", "-o", "enabled_layouts=splits,tall,stack",
+                "-o", "tab_title_template={title.replace('kzw-pane', '…')}",
+                "-o", "active_tab_title_template={title.replace('kzw-pane', '…')}",
                 "-o", f"watcher={Path(__file__).with_name('watcher.py')}"]
         kitten = Path(__file__).with_name("close_kitten.py")
         create_kitten = Path(__file__).with_name("create_kitten.py")
@@ -1296,7 +1303,8 @@ def create_remote(name, host):
         except BlockingIOError:
             raise ValueError("workspace is already running") from None
         remote_client.create(directory, name, host)
-    print(f"Created dormant remote workspace {name!r} on {host}; use kzw attach to open it")
+    location = f" on {host}" if host else " locally"
+    print(f"Created dormant coordinator workspace {name!r}{location}; use kzw attach to open it")
 
 
 def attach_remote(name, host, create_empty=False):
@@ -1344,6 +1352,86 @@ def attach_remote(name, host, create_empty=False):
                 print(f"kzw: remote lease release deferred: {exc}", file=sys.stderr, flush=True)
 
 
+def remote_snapshot(name, host):
+    """Read the authoritative remote layout and journal cursor atomically."""
+    check_name(name)
+    result = remote_client.call(host, {"method": "workspace.sync", "workspace": name})
+    if not result.get("exists"):
+        raise ValueError("remote workspace does not exist")
+    if (type(result.get("revision")) is not int or result["revision"] < 0 or
+            type(result.get("event_cursor")) is not int or result["event_cursor"] < 0 or
+            not isinstance(result.get("snapshot"), str) or not isinstance(result.get("panes"), list) or
+            any(not isinstance(p, str) or not PANE.fullmatch(p) for p in result["panes"]) or
+            len(set(result["panes"])) != len(result["panes"])):
+        raise ValueError("invalid remote workspace snapshot")
+    focus = saved_focus(result["snapshot"])
+    if focus is not None and focus not in result["panes"]:
+        raise ValueError("remote snapshot focus is not in its pane manifest")
+    return {**result, "focused_pane": focus}
+
+
+def inspect_remote(name, host, as_json=False):
+    result = remote_snapshot(name, host)
+    view = {"workspace": name, "origin": host, **result}
+    if as_json:
+        print(json.dumps(view, separators=(",", ":")), flush=True)
+    else:
+        print(f"workspace: {name}\norigin: {host}\nrevision: {result['revision']}\nevent_cursor: {result['event_cursor']}")
+        print("panes: " + (", ".join(result["panes"]) or "(none)"))
+        print("focused_pane: " + (result["focused_pane"] or "(none)"))
+        print("layout (portable Kitty session):\n" + result["snapshot"], end="")
+
+
+def events_remote(name, host, after=None, once=False, as_json=False):
+    """Stream journaled observations; the initial snapshot establishes a cursor."""
+    if after is not None and (type(after) is not int or after < 0):
+        raise ValueError("event cursor must be nonnegative")
+    with remote_client.persistent_rpc():
+        snapshot = remote_snapshot(name, host)
+        if after is None:
+            cursor = snapshot["event_cursor"]
+            message = {"type": "snapshot", "workspace": name, "origin": host, **snapshot}
+            if as_json:
+                print(json.dumps(message, separators=(",", ":")), flush=True)
+            else:
+                print(f"snapshot:{name} revision={snapshot['revision']} cursor={cursor}", flush=True)
+            if once:
+                return
+        else:
+            cursor = after
+            if cursor > snapshot["event_cursor"]:
+                raise ValueError("event cursor is ahead of this workspace's journal")
+        while True:
+            request = {"method": "workspace.events.wait", "workspace": name, "after": cursor,
+                       "limit": 100, "timeout": 0 if once else 15}
+            try:
+                result = remote_client.call(host, request)
+            except (OSError, subprocess.SubprocessError) as exc:
+                if once:
+                    raise
+                print(f"kzw: event stream interrupted; retrying from {cursor}: {exc}", file=sys.stderr, flush=True)
+                time.sleep(1)
+                continue
+            events = result.get("events")
+            if not isinstance(events, list):
+                raise ValueError("invalid remote event page")
+            for event in events:
+                if (not isinstance(event, dict) or type(event.get("seq")) is not int or event["seq"] <= cursor or
+                        type(event.get("revision")) is not int or not isinstance(event.get("kind"), str) or
+                        not isinstance(event.get("data"), dict)):
+                    raise ValueError("invalid or out-of-order remote event")
+                message = {"type": event["kind"], "workspace": name, "origin": host,
+                           "seq": event["seq"], "revision": event["revision"], "data": event["data"]}
+                if as_json:
+                    print(json.dumps(message, separators=(",", ":")), flush=True)
+                else:
+                    print(f"{event['seq']} revision={event['revision']} {event['kind']} " +
+                          json.dumps(event["data"], separators=(",", ":")), flush=True)
+                cursor = event["seq"]
+            if once and len(events) < 100:
+                return
+
+
 def main():
     parser = argparse.ArgumentParser(prog="kzw")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1352,10 +1440,20 @@ def main():
     start.add_argument("--host", default="", help="SSH host for newly created panes")
     create_parser = commands.add_parser("create", help="create a dormant remote workspace")
     create_parser.add_argument("name")
-    create_parser.add_argument("--host", required=True)
+    create_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
     attach_parser = commands.add_parser("attach", help="attach a remote workspace")
     attach_parser.add_argument("name")
-    attach_parser.add_argument("--host", required=True)
+    attach_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
+    inspect_parser = commands.add_parser("inspect", help="inspect the authoritative coordinator layout")
+    inspect_parser.add_argument("name")
+    inspect_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
+    inspect_parser.add_argument("--json", action="store_true")
+    events_parser = commands.add_parser("events", help="stream coordinator workspace observations")
+    events_parser.add_argument("name")
+    events_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
+    events_parser.add_argument("--json", action="store_true")
+    events_parser.add_argument("--after", type=int, help="replay events after this sequence number")
+    events_parser.add_argument("--once", action="store_true", help="print available state or events and exit")
     new_pane_parser = commands.add_parser("new-pane", help="explicitly start a shell in an empty workspace")
     new_pane_parser.add_argument("name")
     new_pane_parser.add_argument("--host", default="", help="remote workspace origin")
@@ -1397,19 +1495,34 @@ def main():
     list_parser = commands.add_parser("list", help="list saved workspaces")
     list_parser.add_argument("--host", default="")
     server_stop = commands.add_parser("server-stop", help="stop the remote workspace coordinator")
-    server_stop.add_argument("--host", required=True)
+    server_stop.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
     args = parser.parse_args()
     try:
         if args.command == "start":
+            if not args.host:
+                directory = state_dir(args.name)
+                config = directory / "remote.json"
+                if config.is_file() and json.loads(config.read_text()).get("host") == "":
+                    return attach_remote(args.name, "")
             return run(args.name, args.host)
         if args.command == "create":
             create_remote(args.name, args.host)
             return 0
         if args.command == "attach":
             return attach_remote(args.name, args.host)
+        if args.command == "inspect":
+            inspect_remote(args.name, args.host, args.json)
+            return 0
+        if args.command == "events":
+            events_remote(args.name, args.host, args.after, args.once, args.json)
+            return 0
         if args.command == "new-pane":
             if args.host and args.shell_host:
                 raise ValueError("--shell-host is only for local-state workspaces")
+            if not args.host and not args.shell_host:
+                config = state_dir(args.name) / "remote.json"
+                if config.is_file() and json.loads(config.read_text()).get("host") == "":
+                    return attach_remote(args.name, "", create_empty=True)
             return attach_remote(args.name, args.host, create_empty=True) if args.host else run(args.name, args.shell_host, create_empty=True)
         if args.command == "server-stop":
             if input("Stop the workspace server? Connected clients must detach first. [y/N] ").strip().lower() != "y":
@@ -1460,11 +1573,18 @@ def main():
                 print(workspace["name"])
             return 0
         root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "kzw"
+        names = set()
         if root.is_dir():
             for path in sorted(root.iterdir()):
                 if (path / "workspace.kitty-session").is_file() and not local_empty_retirable(path):
-                    print(path.name)
+                    names.add(path.name)
+            if (root / "coordinator" / "remote.sqlite3").is_file():
+                names.update(item["name"] for item in remote_client.call("", {"method": "workspace.list"})["workspaces"])
+        for name in sorted(names):
+            print(name)
         return 0
+    except KeyboardInterrupt:
+        return 130
     except (OSError, EOFError, ValueError, subprocess.SubprocessError) as exc:
         print(f"kzw: {exc}", file=sys.stderr)
         return 1

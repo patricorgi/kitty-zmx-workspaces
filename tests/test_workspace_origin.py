@@ -54,6 +54,49 @@ class WorkspaceOriginTests(unittest.TestCase):
         self.assertNotEqual(create.call_args.args[0], local)
         self.assertEqual(snapshot.read_text(), "local state")
 
+    def test_local_coordinator_create_refuses_to_overwrite_legacy_workspace(self):
+        from kzw import remote_client
+        local = cli.state_dir("Test")
+        snapshot = local / "workspace.kitty-session"
+        snapshot.write_text("legacy layout\n")
+        with patch("kzw.remote_client.call") as call:
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                remote_client.create(local, "Test", "")
+        call.assert_not_called()
+        self.assertEqual(snapshot.read_text(), "legacy layout\n")
+
+    def test_create_accepts_only_empty_legacy_remnants(self):
+        from kzw import remote_client
+        local = cli.state_dir("Test")
+        for name in ("lock", "capture.lock", "watcher.changed"):
+            (local / name).touch()
+        (local / "native-pending").mkdir()
+        with patch("kzw.remote_client.call", return_value={"exists": False}), \
+             patch("kzw.remote_client.publish"):
+            remote_client.create(local, "Test", "")
+        self.assertTrue((local / "remote.json").is_file())
+        self.assertTrue((local / "native-pending").is_dir())
+        self.assertEqual((local / "capture.lock").stat().st_size, 0)
+
+    def test_create_rejects_nonempty_unknown_and_symlink_remnants(self):
+        from kzw import remote_client
+        for kind in ("nonempty-file", "pending", "unknown", "symlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                if kind == "nonempty-file":
+                    (directory / "watcher.changed").write_text("data")
+                elif kind == "pending":
+                    (directory / "native-pending").mkdir()
+                    (directory / "native-pending" / "operation").touch()
+                elif kind == "unknown":
+                    (directory / "unknown").touch()
+                else:
+                    (directory / "capture.lock").symlink_to(directory / "missing")
+                with patch("kzw.remote_client.call") as call:
+                    with self.assertRaisesRegex(ValueError, "already exists"):
+                        remote_client.create(directory, "Test", "")
+                    call.assert_not_called()
+
     def test_detach_targets_requested_origin(self):
         remote = cli.state_dir("Test", "origin")
         with patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \

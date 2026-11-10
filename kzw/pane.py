@@ -30,7 +30,7 @@ def report_attachment_ended(retry=False):
 
 def verify_workspace_lease(host):
     origin = os.environ.get("KZW_WORKSPACE_ORIGIN", "")
-    if not origin:
+    if not origin and os.environ.get("KZW_WORKSPACE_COORDINATOR") != "1":
         return
     directory = os.environ.get("KZW_WORKSPACE_DIRECTORY", "")
     if host != origin or not directory or not Path(directory).is_absolute():
@@ -114,7 +114,8 @@ def main():
     parser.add_argument("--stage-new", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     pane = args.pane or "kzw-" + uuid.uuid4().hex
-    reservation = uuid.uuid4().hex if not args.pane and os.environ.get("KZW_WORKSPACE_ORIGIN") else None
+    coordinated = bool(os.environ.get("KZW_WORKSPACE_ORIGIN") or os.environ.get("KZW_WORKSPACE_COORDINATOR") == "1")
+    reservation = uuid.uuid4().hex if not args.pane and coordinated else None
     if not PANE.fullmatch(pane):
         parser.error("invalid pane ID")
     if args.host and (args.host.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", args.host)):
@@ -134,7 +135,7 @@ def main():
     existing = args.existing
     needs_journal = (not args.pane or args.stage_new) and bool(os.environ.get("KZW_WORKSPACE_DIRECTORY") or os.environ.get("KZW_WORKSPACE"))
     needs_stage = needs_journal
-    needs_absence_check = not args.pane and not os.environ.get("KZW_WORKSPACE_ORIGIN") and not args.existing
+    needs_absence_check = not args.pane and not coordinated and not args.existing
     while True:
         remote_command = remote
         if existing:
