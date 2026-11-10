@@ -82,6 +82,39 @@ class SessionTests(unittest.TestCase):
         self.assertIn("Split 2 — unknown [unavailable]", output.getvalue())
         self.assertNotIn(B, output.getvalue())
 
+    def test_number_attaches_live_pane_immediately(self):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        output = io.StringIO()
+        output.isatty = lambda: True
+        with os.fdopen(os.dup(slave), "r") as stream:
+            def send():
+                time.sleep(0.1)
+                os.write(master, b"1")
+            thread = threading.Thread(target=send)
+            thread.start()
+            self.assertEqual(sessions.choose("Test", [[A, B], [C]], {A, C}, stream, output), C)
+            thread.join()
+        self.assertIn("[0] Split 1", output.getvalue())
+        self.assertIn("[1] Split 1", output.getvalue())
+        self.assertIn("[ ] Split 2 — unknown [unavailable]", output.getvalue())
+
+    def test_unassigned_number_does_not_select_unavailable_pane(self):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        output = io.StringIO()
+        output.isatty = lambda: True
+        with os.fdopen(os.dup(slave), "r") as stream:
+            def send():
+                time.sleep(0.1)
+                os.write(master, b"9q")
+            thread = threading.Thread(target=send)
+            thread.start()
+            self.assertIsNone(sessions.choose("Test", [[A, B]], {A}, stream, output))
+            thread.join()
+
     def test_process_labels_do_not_guess_bash_history(self):
         processes = {A: {"name": "bash", "pid": 101}, B: {"name": "nvim", "pid": 202},
                      C: {"name": "bash", "pid": 303}}

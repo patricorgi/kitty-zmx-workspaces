@@ -122,6 +122,7 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
     saved = termios.tcgetattr(fd)
     selected = 0
     labels = labels or {}
+    shortcuts = {pane: str(index) for index, pane in enumerate(panes[:10])}
     try:
         tty.setcbreak(fd)
         output.write("\x1b[?1049h\x1b[?25l")
@@ -133,8 +134,9 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
                     marker = ">" if pane == panes[selected] else " "
                     status = "" if pane in live else " [unavailable]"
                     process = labels.get(pane, "unknown")
-                    lines.append(f"  {marker} Split {split_number} — {process}{status}")
-            output.write("\x1b[H\x1b[2J" + "\r\n".join(lines) + "\r\n\r\n↑/↓: select  Enter: attach  q/Esc: cancel\r\n")
+                    shortcut = shortcuts.get(pane, " ")
+                    lines.append(f"  {marker} [{shortcut}] Split {split_number} — {process}{status}")
+            output.write("\x1b[H\x1b[2J" + "\r\n".join(lines) + "\r\n\r\n0–9: attach  ↑/↓: select  Enter: attach  q/Esc: cancel\r\n")
             output.flush()
             key = os.read(fd, 1)
             if key == b"\x1b":
@@ -150,6 +152,10 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
                 selected = (selected + 1) % len(panes)
             elif key in (b"\r", b"\n"):
                 return panes[selected]
+            elif len(key) == 1 and b"0" <= key <= b"9":
+                index = key[0] - ord("0")
+                if index < min(10, len(panes)):
+                    return panes[index]
             elif key in (b"q", b"\x03", b""):
                 return None
     finally:
