@@ -17,6 +17,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from .core import FOCUS_PREFIX, PANE, atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
 from .titles import start_title_monitor
 from . import remote_client
+from . import supervisor_window
 
 EMPTY_SNAPSHOT = "# kzw-empty-workspace\n"
 
@@ -57,8 +58,40 @@ def state_dir(name, origin=""):
 
 
 def query(socket, *args):
-    return subprocess.run(["kitty", "@", "--to", f"unix:{socket}", *args],
-                          check=True, capture_output=True, text=True, timeout=5).stdout
+    def raw(*command):
+        return subprocess.run(["kitty", "@", "--to", f"unix:{socket}", *command],
+                              check=True, capture_output=True, text=True, timeout=5).stdout
+
+    if args not in (("ls",), ("ls", "--output-format=session")):
+        return raw(*args)
+    tree = json.loads(raw("ls"))
+    matches = []
+    for os_window in tree:
+        managed = [w for tab in os_window.get("tabs", []) for w in tab.get("windows", [])
+                   if isinstance(w.get("user_vars", {}).get("kzw_pane"), str) and
+                   PANE.fullmatch(w["user_vars"]["kzw_pane"])]
+        if managed:
+            matches.append((os_window, managed))
+    if len(matches) > 1:
+        raise ValueError("managed panes span multiple Kitty OS windows; refusing an ambiguous snapshot")
+    if not matches:
+        if args == ("ls",):
+            return "[]"
+        raise ValueError("workspace Kitty OS window is not ready")
+    os_window, managed = matches[0]
+    # The workspace remains the last focused workspace window even when a
+    # separate utility OS window is currently focused.
+    os_window["last_focused"] = True
+    if args == ("ls",):
+        return json.dumps([os_window])
+    pane_map([os_window])  # refuse unmanaged panes inside the workspace
+    anchor = int(managed[0]["id"])
+    os_id = int(os_window["id"])
+    kitten = Path(__file__).with_name("scoped_session_kitten.py")
+    response = json.loads(raw("kitten", "--match", f"id:{anchor}", str(kitten), str(os_id)))
+    if not isinstance(response, dict) or response.get("os_window_id") != os_id or not isinstance(response.get("session"), str):
+        raise ValueError("invalid scoped Kitty session response")
+    return response["session"]
 
 
 @contextmanager
@@ -439,7 +472,12 @@ def detach(name, origin=""):
         count = capture_stable_locked(directory, executable)
         if (directory / "remote.json").exists():
             remote_client.ensure_current_revision(directory)
-        query(directory / "kitty.sock", "close-window", "--match", "all")
+        tree = json.loads(query(directory / "kitty.sock", "ls"))
+        mapped = pane_map(tree)
+        if {pane for pane, _ in mapped.values()} != set(json.loads((directory / "panes.json").read_text())):
+            raise ValueError("workspace changed after final snapshot; refusing to detach")
+        ids = sorted(mapped)
+        query(directory / "kitty.sock", "close-window", "--match", " or ".join(f"id:{wid}" for wid in ids))
     print(f"Detached {name!r}; saved focus and {count} panes")
 
 
@@ -1193,13 +1231,17 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         kitten = Path(__file__).with_name("close_kitten.py")
         create_kitten = Path(__file__).with_name("create_kitten.py")
         detach_kitten = Path(__file__).with_name("detach_kitten.py")
-        args += ["-o", f"map kitty_mod+w kitten {kitten} pane",
+        args += ["-o", f"map super+w kitten {kitten} pane",
+                 "-o", f"map kitty_mod+w kitten {kitten} pane",
                  "-o", f"map kitty_mod+q kitten {kitten} tab",
                  "-o", f"map super+shift+w kitten {detach_kitten}",
                  "-o", f"map super+enter kitten {create_kitten} split",
                  "-o", f"map kitty_mod+enter kitten {create_kitten} right",
                  "-o", f"map kitty_mod+alt+enter kitten {create_kitten} below",
+                 "-o", f"map super+t kitten {create_kitten} tab",
                  "-o", f"map kitty_mod+t kitten {create_kitten} tab"]
+        for number in range(1, 11):
+            args += ["-o", f"map super+{number % 10} goto_tab {number}"]
         if appearance is not None:
             args.extend(appearance["options"])
             if appearance["marker"] is not None:
@@ -1262,6 +1304,11 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         remote_hint = []
         remote_revision = None
         next_bootstrap = 0.0
+        workspace_observed = False
+        empty_since = None
+        next_view_check = 0.0
+        source_window = supervisor_window.source_window()
+        minimize_attempted = False
         try:
             while child.poll() is None:
                 try:
@@ -1273,6 +1320,21 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                         if bootstrap:
                             time.sleep(0.1)
                             continue
+                    if workspace_observed and time.monotonic() >= next_view_check:
+                        next_view_check = time.monotonic() + 1
+                        current = json.loads(query(sock, "ls"))
+                        native = directory / "native-pending"
+                        unfinished = ((directory / "pending-create.json").exists() or (directory / "pending-close.json").exists() or
+                                      (native.exists() and (not native.is_dir() or any(native.iterdir()))))
+                        if not current and not unfinished:
+                            if empty_since is None:
+                                empty_since = time.monotonic()
+                            elif time.monotonic() - empty_since >= 2:
+                                # The workspace view is gone, but Kitty may still
+                                # own unrelated utility windows. Never close them.
+                                break
+                        else:
+                            empty_since = None
                     if pending_focus:
                         restore_focus(sock, pending_focus)
                         pending_focus = None
@@ -1303,8 +1365,17 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                         next_exit_check = time.monotonic() + 1
                     if signal != last_signal or time.monotonic() >= next_capture:
                         capture(directory, pane_executable)
+                        workspace_observed = True
                         last_signal = signal
                         next_capture = time.monotonic() + 1
+                        if source_window and not minimize_attempted:
+                            # A lost response may still mean minimization happened;
+                            # always attempt restoration when the workspace ends.
+                            minimize_attempted = True
+                            try:
+                                supervisor_window.change(source_window, "minimize")
+                            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                                print(f"kzw: could not minimize supervisor window: {exc}", file=sys.stderr, flush=True)
                     last_error = None
                 except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
                     message = str(exc)
@@ -1317,11 +1388,18 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             # Do not release the lock while Kitty still owns the workspace.
             child.wait()
         finally:
-            status_stop()
-            title_stop.set()
-            if broker:
-                broker.close()
-    return child.returncode
+            try:
+                status_stop()
+                title_stop.set()
+                if broker:
+                    broker.close()
+            finally:
+                if minimize_attempted:
+                    try:
+                        supervisor_window.change(source_window, "restore")
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        print(f"kzw: restore the supervisor window from the Dock: {exc}", file=sys.stderr, flush=True)
+    return child.returncode if child.returncode is not None else 0
 
 
 def create_remote(name, host):

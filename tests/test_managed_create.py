@@ -102,6 +102,12 @@ class ManagedCreateTests(unittest.TestCase):
             self.assertIn("mark1_foreground=#123456", popen.call_args.args[0])
             self.assertTrue(any("map super+enter kitten " in arg and arg.endswith(" split")
                                 for arg in popen.call_args.args[0]))
+            self.assertTrue(any("map super+w kitten " in arg and arg.endswith(" pane")
+                                for arg in popen.call_args.args[0]))
+            self.assertTrue(any("map super+t kitten " in arg and arg.endswith(" tab")
+                                for arg in popen.call_args.args[0]))
+            for number in range(1, 11):
+                self.assertIn(f"map super+{number % 10} goto_tab {number}", popen.call_args.args[0])
             self.assertEqual(json.loads(popen.call_args.kwargs["env"]["KZW_INHERIT_MARKER"]),
                              ["function", "helpers/privacy_marker.py"])
             title_stop.set.assert_called_once()

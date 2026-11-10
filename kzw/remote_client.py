@@ -668,6 +668,92 @@ def create(directory, name, host):
     save_config(directory, config)
 
 
+def reconcile_detached(directory, name, host, executable, remote):
+    """Replay or journal a fenced reconciliation, preserving uncertain work."""
+    from .layout_prune import prune_snapshot
+
+    journal = directory / "reconcile-pending.json"
+    if journal.is_symlink():
+        raise ValueError("unsafe reconciliation journal")
+    if journal.exists():
+        record = json.loads(journal.read_text())
+        if (not isinstance(record, dict) or record.get("workspace") != name or record.get("host") != host or
+                record.get("state_home", "") != origin_state_home(host) or not isinstance(record.get("request"), dict)):
+            raise ValueError("conflicting reconciliation journal")
+    else:
+        if remote.get("staged"):
+            return remote
+        status = call(host, {"method": "workspace.status", "workspace": name})
+        if status.get("revision") != remote.get("revision") or not isinstance(status.get("missing"), list):
+            raise ValueError("workspace changed while checking missing sessions")
+        missing = set(status["missing"])
+        old = set(remote["panes"])
+        reservations = set(remote.get("reservations", []))
+        if not missing.issubset(old) or old.intersection(reservations):
+            raise ValueError("invalid remote session status")
+        if not missing and not reservations:
+            return remote
+        if lease_token(directory) is None:
+            raise ValueError("incomplete pane creation or missing sessions require an active lease for reconciliation")
+        snapshot = prune_snapshot(remote["snapshot"], missing) if missing else remote["snapshot"]
+        _, panes = translate(snapshot, executable, host, False)
+        if set(panes) != old - missing:
+            raise ValueError("pruned layout does not match surviving panes")
+        root = directory / "native-pending"
+        journals = {}
+        if root.is_symlink() or (root.exists() and (not root.is_dir() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077)):
+            raise ValueError("unsafe native creation journal directory")
+        if root.exists():
+            for path in root.iterdir():
+                if path.is_symlink() or not path.is_file() or path.suffix != ".json" or path.stem not in reservations:
+                    raise ValueError("unreconciled native creation journal")
+                text = path.read_text()
+                if json.loads(text) != {"pane": path.stem, "host": host, "workspace": name}:
+                    raise ValueError("native creation journal conflicts with reservation")
+                journals[path.name] = text
+        request = {"method": "workspace.reconcile", "workspace": name, "revision": remote["revision"],
+                   "request_id": uuid.uuid4().hex, "snapshot": snapshot, "panes": panes,
+                   "remove": sorted(missing), "cancel_reservations": sorted(reservations)}
+        record = {"workspace": name, "host": host, "state_home": origin_state_home(host),
+                  "request": request, "journals": journals}
+        atomic_write(journal, json.dumps(record, separators=(",", ":")) + "\n")
+    request = record["request"]
+    if request.get("method") != "workspace.reconcile" or request.get("workspace") != name:
+        raise ValueError("invalid reconciliation journal")
+    token = lease_token(directory)
+    if token is None:
+        raise ValueError("incomplete pane creation or missing sessions require an active lease for reconciliation")
+    request["lease_token"] = token
+    call(host, request)
+    remote = call(host, {"method": "workspace.sync", "workspace": name})
+    if (not remote.get("exists") or remote.get("snapshot") != request.get("snapshot") or
+            sorted(remote.get("panes", [])) != sorted(request.get("panes", [])) or remote.get("reservations") or remote.get("staged")):
+        raise ValueError("workspace changed after reconciliation; retain journal for investigation")
+    local_snapshot, panes = translate(remote["snapshot"], executable, host, False)
+    if local_snapshot == DORMANT:
+        if (directory / "workspace.kitty-session").exists():
+            raise ValueError("dormant remote state conflicts with a local snapshot")
+    else:
+        atomic_write(directory / "workspace.kitty-session", local_snapshot)
+        atomic_write(directory / "panes.json", json.dumps(panes) + "\n")
+    save_config(directory, {"workspace": name, "host": host, "revision": remote["revision"], "panes": panes,
+                            "state_home": origin_state_home(host), "event_cursor": remote["event_cursor"],
+                            "published_hash": snapshot_hash(remote["snapshot"], panes)})
+    journals = record.get("journals")
+    if not isinstance(journals, dict):
+        raise ValueError("invalid reconciliation journal entries")
+    for filename, text in journals.items():
+        if not isinstance(filename, str) or not filename.endswith(".json") or not PANE.fullmatch(filename[:-5]) or not isinstance(text, str):
+            raise ValueError("invalid native reconciliation journal")
+        path = directory / "native-pending" / filename
+        if path.is_symlink() or (path.exists() and (not path.is_file() or path.read_text() != text)):
+            raise ValueError("native creation journal changed after reconciliation")
+        if path.exists():
+            path.unlink()
+    journal.unlink()
+    return remote
+
+
 def pull(directory, name, host, executable):
     check_name(name)
     path = directory / "remote.json"
@@ -683,6 +769,7 @@ def pull(directory, name, host, executable):
     remote = call(host, {"method": "workspace.sync", "workspace": name})
     if not remote["exists"]:
         raise ValueError("remote workspace does not exist")
+    remote = reconcile_detached(directory, name, host, executable, remote)
     staged = remote.get("staged")
     if staged and remote.get("reservations"):
         _, staged_panes = translate(staged["snapshot"], executable, host, False)
@@ -696,6 +783,7 @@ def pull(directory, name, host, executable):
                     "revision": staged["revision"], "snapshot": staged["snapshot"], "panes": staged_panes,
                     "request_id": "recover-" + digest, "lease_token": token})
         remote = call(host, {"method": "workspace.sync", "workspace": name})
+        remote = reconcile_detached(directory, name, host, executable, remote)
     if remote.get("reservations"):
         raise ValueError("remote workspace has an incomplete pane creation; inspect its reservations before attaching")
     snapshot, panes = translate(remote["snapshot"], executable, host, False)

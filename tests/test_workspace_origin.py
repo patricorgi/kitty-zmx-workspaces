@@ -202,9 +202,12 @@ class WorkspaceOriginTests(unittest.TestCase):
 
     def test_detach_targets_requested_origin(self):
         remote = cli.state_dir("Test", "origin")
+        pane = "kzw-" + "a" * 32
+        (remote / "panes.json").write_text(json.dumps([pane]))
+        tree = [{"tabs": [{"windows": [{"id": 7, "user_vars": {"kzw_pane": pane, "kzw_host": "origin"}}]}]}]
         with patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
              patch("kzw.cli.capture_locked", return_value=1) as capture, \
-             patch("kzw.cli.query") as query:
+             patch("kzw.cli.query", side_effect=[json.dumps(tree), ""]) as query:
             cli.detach("Test", "origin")
         self.assertEqual(capture.call_args.args[0], remote)
         self.assertEqual(query.call_args.args[0], remote / "kitty.sock")
