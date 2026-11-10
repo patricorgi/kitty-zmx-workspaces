@@ -1222,11 +1222,23 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         else:
             args += ["--session", str(prepare_bootstrap(directory, name, host, pane_executable))]
             bootstrap = True
-        title_stop = start_title_monitor(sock, query)
+        broker = remote_client.ConnectionBroker(host, name) if remote_attached else None
+        if broker:
+            env["KZW_RPC_SOCKET"] = str(broker.path)
+        else:
+            env.pop("KZW_RPC_SOCKET", None)
+        try:
+            title_stop = start_title_monitor(sock, query)
+        except Exception:
+            if broker:
+                broker.close()
+            raise
         try:
             status_stop = remote_client.start_status_monitor(directory) if remote_attached else lambda: None
         except Exception:
             title_stop.set()
+            if broker:
+                broker.close()
             raise
         try:
             if bootstrap:
@@ -1235,6 +1247,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         except Exception:
             status_stop()
             title_stop.set()
+            if broker:
+                broker.close()
             raise
         print(f"Workspace {name!r} started. Keep this supervisor running; close Kitty to detach.", flush=True)
         last_error = None
@@ -1305,6 +1319,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         finally:
             status_stop()
             title_stop.set()
+            if broker:
+                broker.close()
     return child.returncode
 
 
