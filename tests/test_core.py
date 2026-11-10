@@ -29,6 +29,34 @@ def launch(window_id, extra=""):
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_lifecycle_event_format_uses_validated_stable_pane_ids(self):
+        from kzw.cli import log_pane_event
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            log_pane_event("tab_created", [A])
+            log_pane_event("tab_destroyed", [B, A])
+        self.assertEqual(output.getvalue(),
+                         "tab_created:" + "a" * 32 + "\n" +
+                         "tab_destroyed:" + "a" * 32 + "," + "b" * 32 + "\n")
+        with self.assertRaises(ValueError):
+            log_pane_event("tab_destroyed", ["not-a-pane"])
+
+    def test_local_empty_retirement_preserves_unfinished_operations(self):
+        from kzw.cli import retire_local_empty
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            snapshot = path / "workspace.kitty-session"
+            metadata = path / "panes.json"
+            snapshot.write_text(EMPTY_SNAPSHOT)
+            metadata.write_text("[]\n")
+            journal = path / "pending-close.json"
+            journal.write_text("{}\n")
+            self.assertFalse(retire_local_empty(path))
+            self.assertTrue(snapshot.exists())
+            journal.unlink()
+            self.assertTrue(retire_local_empty(path))
+            self.assertFalse(snapshot.exists())
+            self.assertFalse(metadata.exists())
+
     def test_background_kitty_forwards_local_test_session_environment(self):
         from kzw.cli import kitty_launch_command
         env = {"KZW_TEST_KITTY_BACKGROUND": "1", "ZMX_DIR": "/private/test-zmx",
@@ -556,8 +584,8 @@ class WorkspaceTests(unittest.TestCase):
                 "phase": "closing", "last": True, "remote": False,
                 "panes": [{"pane": A, "host": ""}]}))
             retry_close("Test")
-            self.assertEqual((path / "workspace.kitty-session").read_text(), EMPTY_SNAPSHOT)
-            self.assertEqual(json.loads((path / "panes.json").read_text()), [])
+            self.assertFalse((path / "workspace.kitty-session").exists())
+            self.assertFalse((path / "panes.json").exists())
             self.assertFalse((path / "pending-close.json").exists())
 
     def test_missing_local_session_does_not_attach(self):
@@ -568,6 +596,32 @@ class WorkspaceTests(unittest.TestCase):
             pane.main()
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.args[0], ["zmx", "list", "--short"])
+
+    def test_attachment_status_is_only_printed_in_debug_mode(self):
+        from subprocess import CompletedProcess
+        for debug, expected in ((None, False), ("0", False), ("1", True)):
+            with self.subTest(debug=debug), patch.dict("os.environ", {}, clear=True), \
+                 patch("sys.argv", ["kzw-pane", "--pane", A]), \
+                 patch("sys.stdout", new_callable=io.StringIO), \
+                 patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+                 patch("kzw.pane.report_attachment_ended") as ended, \
+                 patch("kzw.pane.subprocess.run", return_value=CompletedProcess([], 0)):
+                if debug is not None:
+                    __import__("os").environ["KZW_DEBUG"] = debug
+                pane.main()
+                self.assertEqual("attachment ended; checking whether" in stderr.getvalue(), expected)
+                ended.assert_called_once_with(retry=False)
+
+    def test_attachment_errors_remain_visible_without_debug(self):
+        from subprocess import CompletedProcess
+        with patch.dict("os.environ", {}, clear=True), patch("sys.argv", ["kzw-pane", "--pane", A]), \
+             patch("sys.stdout", new_callable=io.StringIO), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+             patch("kzw.pane.report_attachment_ended"), \
+             patch("kzw.pane.subprocess.run", return_value=CompletedProcess([], 1)):
+            pane.main()
+        self.assertIn("attachment exited with status 1", stderr.getvalue())
+        self.assertNotIn("checking whether the session still exists", stderr.getvalue())
 
     def test_remote_restore_checks_existence_before_attach(self):
         result = __import__("subprocess").CompletedProcess(["ssh"], 0)
@@ -680,10 +734,12 @@ class WorkspaceTests(unittest.TestCase):
             (path / "panes.json").write_text(json.dumps([A, B]))
             def query(_socket, *args):
                 return json.dumps(current) if args == ("ls",) else ""
-            with patch("kzw.cli.query", side_effect=query) as q, patch("kzw.cli.zmx_command", return_value=""):
+            with patch("kzw.cli.query", side_effect=query) as q, patch("kzw.cli.zmx_command", return_value=""), \
+                 patch("sys.stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(synchronize_exits(path, "/bin/kzw-pane"), 2)
-            self.assertEqual((path / "workspace.kitty-session").read_text(), EMPTY_SNAPSHOT)
-            self.assertEqual(json.loads((path / "panes.json").read_text()), [])
+                self.assertEqual(output.getvalue(), "tab_destroyed:" + "a" * 32 + "," + "b" * 32 + "\n")
+            self.assertFalse((path / "workspace.kitty-session").exists())
+            self.assertFalse((path / "panes.json").exists())
             self.assertEqual(sum(c.args[1] == "close-window" for c in q.call_args_list), 2)
 
     def test_network_failure_does_not_remove_panes(self):
@@ -691,8 +747,10 @@ class WorkspaceTests(unittest.TestCase):
         current[0]["tabs"][0]["windows"][1]["user_vars"]["kzw_attach_ended"] = "1"
         with tempfile.TemporaryDirectory() as directory, \
              patch("kzw.cli.query", return_value=json.dumps(current)) as q, \
-             patch("kzw.cli.zmx_command", side_effect=OSError("network down")):
+             patch("kzw.cli.zmx_command", side_effect=OSError("network down")), \
+             patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(synchronize_exits(Path(directory), "/bin/kzw-pane"), 0)
+            self.assertEqual(output.getvalue(), "")
             self.assertEqual(q.call_count, 1)
             self.assertFalse((Path(directory) / "workspace.kitty-session").exists())
 

@@ -1,4 +1,5 @@
 import json
+import io
 import tempfile
 import threading
 import types
@@ -103,6 +104,7 @@ class ManagedCreateTests(unittest.TestCase):
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
              patch("kzw.cli.uuid.uuid4") as uid, \
              patch("kzw.cli.capture_locked") as capture, \
+             patch("sys.stdout", new_callable=io.StringIO) as output, \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query, \
              patch("kzw.cli.zmx_command", side_effect=["", B + "\n"]):
             uid.return_value.hex = "b" * 32
@@ -111,6 +113,7 @@ class ManagedCreateTests(unittest.TestCase):
             self.assertEqual(capture.call_args.kwargs["expected_panes"], {1: (A, ""), 2: (B, "")})
             self.assertIn("--location=hsplit", query.call_args_list[1].args)
             self.assertFalse((Path(tmp) / "pending-create.json").exists())
+            self.assertEqual(output.getvalue(), "pane_created:" + "b" * 32 + "\n")
 
     def test_failed_launch_keeps_journal_and_blocks_close_and_detach(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -118,6 +121,7 @@ class ManagedCreateTests(unittest.TestCase):
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
              patch("kzw.cli.capture_locked"), \
              patch("kzw.cli.zmx_command", return_value=""), \
+             patch("sys.stdout", new_callable=io.StringIO) as output, \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), OSError("lost reply")]):
             with self.assertRaises(OSError):
                 create_pane("Test", "tab", 1, A, "")
@@ -126,6 +130,20 @@ class ManagedCreateTests(unittest.TestCase):
                 close_target("Test", "pane", 1)
             with self.assertRaisesRegex(ValueError, "creation is incomplete"):
                 detach("Test")
+            self.assertEqual(output.getvalue(), "")
+
+    def test_tab_creation_logs_stable_pane_identity(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("kzw.cli.state_dir", return_value=Path(tmp)), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.uuid.uuid4") as uid, \
+             patch("kzw.cli.capture_locked"), \
+             patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]), \
+             patch("kzw.cli.zmx_command", return_value=""), \
+             patch("sys.stdout", new_callable=io.StringIO) as output:
+            uid.return_value.hex = "b" * 32
+            create_pane("Test", "tab", 1, A, "")
+            self.assertEqual(output.getvalue(), "tab_created:" + "b" * 32 + "\n")
 
     def test_changed_target_does_not_launch(self):
         with tempfile.TemporaryDirectory() as tmp, \
