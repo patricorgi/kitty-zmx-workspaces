@@ -507,6 +507,9 @@ def inert_legacy_artifacts(directory):
         elif path.name == "native-pending":
             if not stat.S_ISDIR(info.st_mode) or any(path.iterdir()):
                 return False
+        elif re.fullmatch(r"\.retired-[0-9a-f]{32}", path.name):
+            if not stat.S_ISDIR(info.st_mode):
+                return False
         else:
             return False
     return True
@@ -517,15 +520,43 @@ def create(directory, name, host):
     config_path = directory / "remote.json"
     if config_path.exists():
         config = json.loads(config_path.read_text())
-        if (config.get("workspace") != name or config.get("host") != host or not config.get("creating")
+        if (config.get("workspace") != name or config.get("host") != host
                 or config.get("state_home", "") != origin_state_home(host)):
             raise ValueError("local workspace already exists; refusing to overwrite it")
+        if not config.get("creating"):
+            if config.get("pending"):
+                raise ValueError("local workspace has a pending operation; refusing to overwrite it")
+            remote = call(host, {"method": "workspace.get", "workspace": name})
+            if remote["exists"] or remote.get("revision", 0) <= config.get("revision", 0):
+                raise ValueError("local workspace already exists; refusing to overwrite it")
+            allowed = {"lock", "capture.lock", "watcher.changed", "remote-status.changed", "remote.json",
+                       "lease.json", "workspace.kitty-session", "panes.json", "bootstrap.kitty-session",
+                       "native-pending"}
+            for path in directory.iterdir():
+                if path.name in ("pending-create.json", "pending-close.json", "native-stage.json", "kitty.sock"):
+                    raise ValueError("local workspace has unfinished operations; refusing to overwrite it")
+                if path.name not in allowed and not re.fullmatch(r"\.retired-[0-9a-f]{32}", path.name):
+                    raise ValueError("local workspace contains unknown state; refusing to overwrite it")
+                if path.name == "native-pending" and (path.is_symlink() or not path.is_dir() or any(path.iterdir())):
+                    raise ValueError("local workspace has unfinished operations; refusing to overwrite it")
+            archive = directory / (".retired-" + uuid.uuid4().hex)
+            archive.mkdir(mode=0o700)
+            # Move config last; a crash cannot make old metadata look like a
+            # freshly initialized cache. Archives are retained for inspection.
+            for path in list(directory.iterdir()):
+                if path.name in allowed and path.name not in ("lock", "remote.json"):
+                    path.rename(archive / path.name)
+            config_path.rename(archive / "remote.json")
+            config = {"workspace": name, "host": host, "revision": remote["revision"], "creating": True,
+                      "state_home": origin_state_home(host)}
+            save_config(directory, config)
     else:
         if not inert_legacy_artifacts(directory):
             raise ValueError("local workspace already exists; refusing to overwrite it")
-        if call(host, {"method": "workspace.get", "workspace": name})["exists"]:
+        remote = call(host, {"method": "workspace.get", "workspace": name})
+        if remote["exists"]:
             raise ValueError("remote workspace already exists; use attach instead")
-        config = {"workspace": name, "host": host, "revision": 0, "creating": True,
+        config = {"workspace": name, "host": host, "revision": remote.get("revision", 0), "creating": True,
                   "state_home": origin_state_home(host)}
         save_config(directory, config)
     publish(directory, DORMANT, [])

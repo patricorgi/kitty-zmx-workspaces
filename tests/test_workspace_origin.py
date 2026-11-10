@@ -54,6 +54,27 @@ class WorkspaceOriginTests(unittest.TestCase):
         self.assertNotEqual(create.call_args.args[0], local)
         self.assertEqual(snapshot.read_text(), "local state")
 
+    def test_create_attach_routes_local_and_remote(self):
+        for host in ("", "origin"):
+            with self.subTest(host=host):
+                argv = ["kzw", "create", "Test", "--attach"] + (["--host", host] if host else [])
+                with patch("sys.argv", argv), patch("kzw.cli.create_remote") as create, \
+                     patch("kzw.cli.attach_remote", return_value=7) as attach:
+                    self.assertEqual(cli.main(), 7)
+                create.assert_called_once_with("Test", host)
+                attach.assert_called_once_with("Test", host)
+
+    def test_create_does_not_attach_on_failure_or_without_flag(self):
+        with patch("sys.argv", ["kzw", "create", "Test", "--attach"]), \
+             patch("kzw.cli.create_remote", side_effect=ValueError("conflict")), \
+             patch("kzw.cli.attach_remote") as attach:
+            self.assertEqual(cli.main(), 1)
+            attach.assert_not_called()
+        with patch("sys.argv", ["kzw", "create", "Test"]), \
+             patch("kzw.cli.create_remote"), patch("kzw.cli.attach_remote") as attach:
+            self.assertEqual(cli.main(), 0)
+            attach.assert_not_called()
+
     def test_local_coordinator_create_refuses_to_overwrite_legacy_workspace(self):
         from kzw import remote_client
         local = cli.state_dir("Test")
@@ -64,6 +85,15 @@ class WorkspaceOriginTests(unittest.TestCase):
                 remote_client.create(local, "Test", "")
         call.assert_not_called()
         self.assertEqual(snapshot.read_text(), "legacy layout\n")
+
+    def test_workspace_kill_cancel_does_not_acquire_lease_or_mutate(self):
+        state = {"exists": True, "revision": 3, "panes": ["kzw-" + "a" * 32]}
+        with patch("kzw.cli.remote_client.call", return_value=state) as call, \
+             patch("kzw.cli.remote_client.acquire_lease") as acquire, \
+             patch("builtins.input", return_value="n"):
+            cli.kill_workspace("Test", "")
+        call.assert_called_once_with("", {"method": "workspace.get", "workspace": "Test"})
+        acquire.assert_not_called()
 
     def test_create_accepts_only_empty_legacy_remnants(self):
         from kzw import remote_client

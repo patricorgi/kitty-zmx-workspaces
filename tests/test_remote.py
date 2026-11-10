@@ -100,6 +100,105 @@ class RemoteStoreTests(unittest.TestCase):
                 self.store.dispatch({"method": "workspace.status", "workspace": "Test"})
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [A, B])
 
+    def test_detached_observer_records_confirmed_absence_and_retires(self):
+        self.put(panes=[A])
+        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.store.observe_detached()
+        state = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
+        self.assertFalse(state["exists"])
+        events = self.store.dispatch({"method": "workspace.events", "workspace": "Test"})["events"]
+        self.assertTrue(any(event["kind"] == "session.missing" and event["data"]["pane"] == A
+                            for event in events))
+        self.assertTrue(any(event["kind"] == "workspace.retired" for event in events))
+
+    def test_recreate_uses_new_revision_and_dormant_is_not_retired(self):
+        self.put(panes=[A])
+        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.store.observe_detached()
+            retired = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
+            self.assertFalse(retired["exists"])
+            stale = {"method": "workspace.put", "workspace": "Test", "request_id": "stale",
+                     "revision": 1, "snapshot": "old", "panes": []}
+            with self.assertRaises(Conflict):
+                self.store.dispatch(stale)
+            new = {**stale, "request_id": "new", "revision": retired["revision"],
+                   "snapshot": "# kzw-dormant-workspace\n"}
+            self.store.dispatch(new)
+            self.store.observe_detached()
+            self.assertTrue(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
+
+    def test_active_lease_prevents_detached_retirement(self):
+        self.put(panes=[A])
+        self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": "a" * 32})
+        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.store.observe_detached()
+        self.assertTrue(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
+
+    def test_workspace_kill_journals_only_owned_panes_and_fences_mutations(self):
+        self.put(panes=[A])
+        token = "a" * 32
+        self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": token})
+        request = {"method": "workspace.kill", "workspace": "Test", "revision": 1, "lease_token": token}
+        self.assertEqual(self.store.dispatch(request)["pending_cleanup"], [A])
+        self.assertEqual(self.store.dispatch({"method": "cleanup.list", "workspace": "Test"})["panes"], [A])
+        with self.assertRaisesRegex(Conflict, "termination"):
+            self.store.dispatch({"method": "workspace.put", "workspace": "Test", "revision": 2,
+                                 "request_id": "late", "snapshot": "bad", "panes": [B], "lease_token": token})
+        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.store.dispatch({"method": "cleanup.retry", "workspace": "Test", "lease_token": token})
+            self.store.dispatch({"method": "workspace.lease.release", "workspace": "Test", "token": token})
+            self.store.observe_detached()
+        self.assertFalse(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
+
+    def test_workspace_kill_rejects_stale_revision_and_pending_creation(self):
+        self.put(panes=[A])
+        token = "a" * 32
+        self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": token})
+        request = {"method": "workspace.kill", "workspace": "Test", "revision": 0, "lease_token": token}
+        with self.assertRaisesRegex(Conflict, "changed"):
+            self.store.dispatch(request)
+        self.store.db.execute("INSERT INTO reservations VALUES (?,?)", (B, "Test"))
+        with self.assertRaisesRegex(Conflict, "unfinished"):
+            self.store.dispatch({**request, "revision": 1})
+        self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [A])
+
+    def test_kill_dormant_workspace_retires_it(self):
+        self.store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "dormant",
+                             "revision": 0, "snapshot": "# kzw-dormant-workspace\n", "panes": []})
+        token = "a" * 32
+        self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": token})
+        self.store.dispatch({"method": "workspace.kill", "workspace": "Test", "revision": 1, "lease_token": token})
+        self.store.dispatch({"method": "workspace.lease.release", "workspace": "Test", "token": token})
+        self.store.observe_detached()
+        self.assertFalse(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
+
+    def test_reservations_staging_and_cleanup_block_retirement(self):
+        self.put(panes=[A])
+        for table in ("reservations", "staged_layouts", "cleanup"):
+            with self.subTest(table=table):
+                self.store.db.execute("DELETE FROM reservations")
+                self.store.db.execute("DELETE FROM staged_layouts")
+                self.store.db.execute("DELETE FROM cleanup")
+                if not self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"]:
+                    self.fail("workspace was retired despite pending state")
+                if table == "reservations":
+                    self.store.db.execute("INSERT INTO reservations VALUES (?,?)", (B, "Test"))
+                elif table == "staged_layouts":
+                    self.store.db.execute("INSERT INTO staged_layouts VALUES (?,?,?,?)", ("Test", 1, "staged", "[]"))
+                else:
+                    self.store.db.execute("INSERT INTO cleanup VALUES (?,?)", ("Test", B))
+                status = {"revision": 1, "live": [], "missing": [A], "confirmed_missing": [A]}
+                self.assertFalse(self.store.retire_if_empty("Test", status))
+
+
+    def test_detached_observer_treats_listing_failure_as_unknown(self):
+        self.put(panes=[A])
+        with patch("kzw.remote.subprocess.run", side_effect=OSError("unavailable")):
+            self.store.observe_detached()
+        events = self.store.dispatch({"method": "workspace.events", "workspace": "Test"})["events"]
+        self.assertFalse(any(event["kind"] == "session.missing" for event in events))
+        self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [A])
+
     def test_watch_reports_confirmed_status_change(self):
         self.put()
         previous = {"revision": 1, "live": [A, B], "missing": [], "confirmed_missing": []}
@@ -310,6 +409,50 @@ class RemoteStoreTests(unittest.TestCase):
 
 
 class RemoteServerTests(unittest.TestCase):
+    def test_server_observes_absence_without_connected_clients(self):
+        cache = Path.home() / ".cache"
+        cache.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ks-", dir=cache) as directory:
+            root = Path(directory) / "kzw"
+            root.mkdir(mode=0o700)
+            fake_bin = Path(directory) / "bin"
+            fake_bin.mkdir()
+            zmx = fake_bin / "zmx"
+            zmx.write_text("#!/bin/sh\nexit 0\n")
+            zmx.chmod(0o700)
+            store = Store(root / "remote.sqlite3")
+            store.db.execute("INSERT INTO workspaces VALUES (?,?,?,?)", ("Test", 1, "layout", json.dumps([A])))
+            store.db.execute("INSERT INTO observed_sessions VALUES (?,?)", ("Test", A))
+            store.db.execute("INSERT INTO session_presence VALUES (?,?,?)", ("Test", A, 1))
+            store.close()
+            env = os.environ.copy()
+            env.update(XDG_STATE_HOME=directory, PATH=str(fake_bin) + os.pathsep + env.get("PATH", ""), HOME=directory)
+            env.pop("KZW_LOCAL_COORDINATOR", None)
+            server = subprocess.Popen([sys.executable, "-m", "kzw.remote", "--serve"], env=env,
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 8
+                observed = False
+                while time.monotonic() < deadline and server.poll() is None:
+                    store = Store(root / "remote.sqlite3")
+                    try:
+                        events = store.dispatch({"method": "workspace.events", "workspace": "Test"})["events"]
+                        observed = any(event["kind"] == "session.missing" for event in events)
+                    finally:
+                        store.close()
+                    if observed:
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(observed, "server did not observe missing session without a client")
+            finally:
+                if server.poll() is None:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.settimeout(3)
+                        client.connect(str(root / "server.sock"))
+                        client.sendall(b'{"method":"server.shutdown"}\n')
+                        client.recv(4096)
+                    server.wait(timeout=5)
+
     def test_bridge_rejects_server_with_different_build_but_allows_stop(self):
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)

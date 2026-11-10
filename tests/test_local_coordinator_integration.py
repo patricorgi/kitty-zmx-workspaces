@@ -63,7 +63,8 @@ class LocalCoordinatorIntegration(unittest.TestCase):
 
     def attach(self, count, command="attach"):
         with self.log.open("a") as log:
-            self.process = subprocess.Popen(["kzw", command, "Test"], env=self.env, stdin=subprocess.DEVNULL,
+            args = ["kzw", command, "Test"] + (["--attach"] if command == "create" else [])
+            self.process = subprocess.Popen(args, env=self.env, stdin=subprocess.DEVNULL,
                                             stdout=log, stderr=log)
         self.wait_for(lambda: len(pane_map(self.tree())) == count and
                       not (self.path / "pending-create.json").exists() and
@@ -151,6 +152,14 @@ class LocalCoordinatorIntegration(unittest.TestCase):
         self.assertEqual({p for p, _ in pane_map(self.tree()).values()}, set(current["panes"]))
         self.detach()
 
+    def test_create_attach_opens_and_restores_workspace(self):
+        self.attach(1, command="create")
+        panes = {p for p, _ in pane_map(self.tree()).values()}
+        self.detach()
+        self.attach(1)
+        self.assertEqual(panes, {p for p, _ in pane_map(self.tree()).values()})
+        self.detach()
+
     def test_tab_title_tracks_focused_pane_foreground_process(self):
         # Exercise Kitty's own template compiler, not Python's str.format.
         program = ("import kitty.tab_bar as t; "
@@ -175,4 +184,67 @@ class LocalCoordinatorIntegration(unittest.TestCase):
         self.wait_for(lambda: title_is("sleep"))
         self.kitty("focus-window", "--match", f"id:{second}")
         self.wait_for(lambda: title_is("bash"))
+        self.detach()
+
+    def test_detached_last_session_retires_and_name_can_be_reused(self):
+        self.command("create", "Test")
+        self.attach(1)
+        pane = next(iter(pane_map(self.tree()).values()))[0]
+        self.detach()
+        subprocess.run(["zmx", "kill", pane], env=self.env, capture_output=True, text=True, timeout=10, check=True)
+        self.wait_for(lambda: "Test" not in self.command("list").splitlines())
+        self.command("create", "Test")
+        self.attach(1)
+        replacement = next(iter(pane_map(self.tree()).values()))[0]
+        self.assertNotEqual(pane, replacement)
+        self.detach()
+
+    def test_final_managed_close_retires_workspace(self):
+        self.command("create", "Test")
+        self.attach(1)
+        window = next(iter(pane_map(self.tree())))
+        self.command("close-pane", "Test", "--window-id", str(window), input="y\n")
+        self.process.wait(timeout=20)
+        self.process = None
+        self.wait_for(lambda: "Test" not in self.command("list").splitlines())
+        self.command("create", "Test")
+
+    def test_final_shell_exit_retires_workspace(self):
+        self.command("create", "Test")
+        self.attach(1)
+        window = next(iter(pane_map(self.tree())))
+        self.kitty("send-text", "--match", f"id:{window}", "exit\n")
+        self.process.wait(timeout=30)
+        self.process = None
+        self.wait_for(lambda: "Test" not in self.command("list").splitlines())
+        self.command("create", "Test")
+
+    def test_kill_detached_workspace_terminates_its_sessions(self):
+        self.command("create", "Test")
+        self.attach(1)
+        first, (pane, host) = next(iter(pane_map(self.tree()).items()))
+        self.command("_managed-create", "Test", "right", str(first), pane, "--host", host)
+        self.wait_for(lambda: len(pane_map(self.tree())) == 2)
+        panes = {p for p, _ in pane_map(self.tree()).values()}
+        self.detach()
+        self.command("kill", "Test", input="y\n")
+        self.wait_for(lambda: "Test" not in self.command("list").splitlines())
+        live = subprocess.run(["zmx", "list", "--short"], env=self.env, capture_output=True,
+                              text=True, timeout=10, check=True).stdout.splitlines()
+        self.assertFalse(panes.intersection(live))
+        self.command("create", "Test")
+
+    def test_detach_kitten_saves_and_preserves_sessions(self):
+        self.command("create", "Test")
+        self.attach(1)
+        panes = {p for p, _ in pane_map(self.tree()).values()}
+        kitten = Path(__file__).resolve().parents[1] / "kzw" / "detach_kitten.py"
+        self.kitty("action", "kitten", str(kitten))
+        self.process.wait(timeout=30)
+        self.process = None
+        live = subprocess.run(["zmx", "list", "--short"], env=self.env, capture_output=True,
+                              text=True, timeout=10, check=True).stdout.splitlines()
+        self.assertTrue(panes.issubset(live))
+        self.attach(1)
+        self.assertEqual(panes, {p for p, _ in pane_map(self.tree()).values()})
         self.detach()

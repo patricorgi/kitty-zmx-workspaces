@@ -48,6 +48,29 @@ class RemoteClientTests(unittest.TestCase):
             self.assertEqual(remote_client.coordinator_command("origin"), ["ssh", "origin"])
             ssh.assert_called_once_with("origin")
 
+    def test_recreate_archives_retired_cache_without_overwriting_it(self):
+        directory = self.root / "client"
+        directory.mkdir()
+        self.store.db.execute("INSERT INTO retired_workspaces VALUES (?,?)", ("Test", 5))
+        config = {"workspace": "Test", "host": "", "revision": 4, "state_home": ""}
+        (directory / "remote.json").write_text(json.dumps(config))
+        (directory / "workspace.kitty-session").write_text("old layout")
+        remote_client.create(directory, "Test", "")
+        archive, = directory.glob(".retired-*")
+        self.assertEqual((archive / "workspace.kitty-session").read_text(), "old layout")
+        self.assertEqual(json.loads((archive / "remote.json").read_text()), config)
+        self.assertEqual(json.loads((directory / "remote.json").read_text())["revision"], 6)
+
+    def test_recreate_refuses_pending_cache(self):
+        directory = self.root / "client"
+        directory.mkdir()
+        self.store.db.execute("INSERT INTO retired_workspaces VALUES (?,?)", ("Test", 5))
+        config = {"workspace": "Test", "host": "", "revision": 4, "state_home": "", "pending": {"request": {}}}
+        (directory / "remote.json").write_text(json.dumps(config))
+        with self.assertRaisesRegex(ValueError, "pending"):
+            remote_client.create(directory, "Test", "")
+        self.assertEqual(json.loads((directory / "remote.json").read_text()), config)
+
     def test_channel_disconnect_is_not_replayed(self):
         channel = remote_client.Channel([sys.executable, "-u", "-c", "import sys; sys.stdin.readline()"])
         self.addCleanup(channel.close)

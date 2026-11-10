@@ -76,11 +76,71 @@ class Store:
                 workspace TEXT PRIMARY KEY, revision INTEGER NOT NULL,
                 snapshot TEXT NOT NULL, panes TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS retired_workspaces (
+                name TEXT PRIMARY KEY, revision INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workspace_kills (
+                workspace TEXT PRIMARY KEY
+            );
         """)
         self.zmx = zmx
 
     def close(self):
         self.db.close()
+
+    def observe_detached(self):
+        """Journal status even when no client is connected; never prune here."""
+        names = [row[0] for row in self.db.execute("SELECT name FROM workspaces ORDER BY name")]
+        for name in names:
+            try:
+                if self.db.execute("SELECT 1 FROM cleanup WHERE workspace=?", (name,)).fetchone():
+                    self.retry_cleanup(name, unattended=True)
+                status = self.dispatch({"method": "workspace.status", "workspace": name})
+                self.retire_if_empty(name, status)
+            except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
+                # Failure or a concurrent mutation is unknown; retry later.
+                continue
+
+    def retire_if_empty(self, name, status):
+        """Retire only an established, fully absent, quiescent workspace."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
+            if not row or row[0] != status["revision"]:
+                self.db.execute("COMMIT")
+                return False
+            panes = set(json.loads(row[1]))
+            if panes != set(status["confirmed_missing"]) or status["live"]:
+                self.db.execute("COMMIT")
+                return False
+            # A dormant workspace has never contained a session. Preserve it.
+            established = self.db.execute(
+                "SELECT 1 FROM workspace_events WHERE workspace=? AND kind='layout.updated' "
+                "AND json_extract(data,'$.added[0]') IS NOT NULL AND seq > "
+                "COALESCE((SELECT MAX(seq) FROM workspace_events WHERE workspace=? AND kind='workspace.retired'),0) LIMIT 1",
+                (name, name)).fetchone()
+            busy = any(self.db.execute(query, (name,)).fetchone() for query in (
+                "SELECT 1 FROM leases WHERE workspace=? AND expires > strftime('%s','now')",
+                "SELECT 1 FROM reservations WHERE workspace=?",
+                "SELECT 1 FROM staged_layouts WHERE workspace=?",
+                "SELECT 1 FROM cleanup WHERE workspace=?"))
+            killing = self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone()
+            if (not established and not killing) or busy:
+                self.db.execute("COMMIT")
+                return False
+            revision = row[0] + 1
+            self.add_event(name, revision, "workspace.retired", {"reason": "managed_kill" if killing else "confirmed_absence",
+                                                                   "panes": sorted(panes)})
+            self.db.execute("INSERT OR REPLACE INTO retired_workspaces VALUES (?,?)", (name, revision))
+            self.db.execute("DELETE FROM workspace_kills WHERE workspace=?", (name,))
+            for table in ("workspaces", "leases", "observed_sessions", "session_presence"):
+                column = "name" if table == "workspaces" else "workspace"
+                self.db.execute(f"DELETE FROM {table} WHERE {column}=?", (name,))
+            self.db.execute("COMMIT")
+            return True
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
 
     def check_lease(self, name, token):
         row = self.db.execute("SELECT token,expires FROM leases WHERE workspace=?", (name,)).fetchone()
@@ -105,6 +165,39 @@ class Store:
         name = req.get("workspace", "")
         if not isinstance(name, str) or not NAME.fullmatch(name):
             raise ValueError("invalid workspace")
+        killing = self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone()
+        if killing and method not in ("workspace.get", "workspace.sync", "workspace.events", "workspace.events.wait",
+                                      "workspace.status", "workspace.watch", "cleanup.list", "cleanup.retry",
+                                      "workspace.lease.release"):
+            raise Conflict("workspace termination is pending")
+        if method == "workspace.kill":
+            revision, token = req.get("revision"), req.get("lease_token")
+            if type(revision) is not int or revision < 0 or not isinstance(token, str):
+                raise ValueError("invalid workspace kill request")
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.check_lease(name, token)
+                row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
+                if row is None or row[0] != revision:
+                    raise Conflict("workspace changed after confirmation")
+                if any(self.db.execute(query, (name,)).fetchone() for query in (
+                        "SELECT 1 FROM reservations WHERE workspace=?",
+                        "SELECT 1 FROM staged_layouts WHERE workspace=?",
+                        "SELECT 1 FROM cleanup WHERE workspace=?")):
+                    raise Conflict("workspace has unfinished operations; resolve them before killing it")
+                panes = json.loads(row[1])
+                new_revision = revision + 1
+                self.db.execute("UPDATE workspaces SET revision=?,snapshot=?,panes=? WHERE name=?",
+                                (new_revision, "# kzw-empty-workspace\n", "[]", name))
+                self.db.execute("INSERT INTO workspace_kills VALUES (?)", (name,))
+                for pane in panes:
+                    self.db.execute("INSERT INTO cleanup VALUES (?,?)", (name, pane))
+                self.add_event(name, new_revision, "workspace.kill_requested", {"panes": panes})
+                self.db.execute("COMMIT")
+                return {"revision": new_revision, "pending_cleanup": panes}
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
         if method in ("workspace.lease.acquire", "workspace.lease.renew", "workspace.lease.release", "workspace.lease.inspect"):
             token = req.get("token")
             if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
@@ -113,6 +206,9 @@ class Store:
             try:
                 if not self.db.execute("SELECT 1 FROM workspaces WHERE name=?", (name,)).fetchone():
                     raise ValueError("workspace does not exist")
+                if method != "workspace.lease.release" and self.db.execute(
+                        "SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone():
+                    raise Conflict("workspace termination is pending")
                 row = self.db.execute("SELECT token,expires FROM leases WHERE workspace=?", (name,)).fetchone()
                 now = time.time()
                 if method == "workspace.lease.inspect":
@@ -141,7 +237,8 @@ class Store:
         if method == "workspace.get":
             row = self.db.execute("SELECT revision,snapshot,panes FROM workspaces WHERE name=?", (name,)).fetchone()
             if row is None:
-                return {"exists": False, "revision": 0}
+                retired = self.db.execute("SELECT revision FROM retired_workspaces WHERE name=?", (name,)).fetchone()
+                return {"exists": False, "revision": retired[0] if retired else 0}
             reservations = [r[0] for r in self.db.execute(
                 "SELECT pane FROM reservations WHERE workspace=? ORDER BY pane", (name,))]
             staged = self.db.execute("SELECT revision,snapshot,panes FROM staged_layouts WHERE workspace=?", (name,)).fetchone()
@@ -157,6 +254,8 @@ class Store:
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 self.check_lease(name, req.get("lease_token"))
+                if self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone():
+                    raise Conflict("workspace termination is pending")
                 row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
                 if row is None or row[0] != revision:
                     raise Conflict("workspace changed before staging layout")
@@ -204,12 +303,14 @@ class Store:
             deadline = time.monotonic() + timeout
             next_status = 0.0
             while True:
-                if not self.db.execute("SELECT 1 FROM workspaces WHERE name=?", (name,)).fetchone():
-                    raise ValueError("workspace does not exist")
                 result = self.dispatch({"method": "workspace.events", "workspace": name,
                                         "after": after, "limit": limit})
+                if result["events"]:
+                    return result
+                if not self.db.execute("SELECT 1 FROM workspaces WHERE name=?", (name,)).fetchone():
+                    raise ValueError("workspace does not exist")
                 remaining = deadline - time.monotonic()
-                if result["events"] or remaining <= 0:
+                if remaining <= 0:
                     return result
                 if time.monotonic() >= next_status:
                     # A failed zmx listing is an error, never a disappearance.
@@ -236,6 +337,8 @@ class Store:
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 self.check_lease(name, req.get("lease_token"))
+                if self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone():
+                    raise Conflict("workspace termination is pending")
                 previous = self.db.execute("SELECT digest,response FROM operations WHERE workspace=? AND id=?", (name, operation)).fetchone()
                 if previous:
                     if previous[0] != digest:
@@ -348,6 +451,8 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.check_lease(name, req.get("lease_token"))
+            if self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone():
+                raise Conflict("workspace termination is pending")
             previous = self.db.execute("SELECT digest,response FROM operations WHERE workspace=? AND id=?", (name, request_id)).fetchone()
             if previous:
                 if previous[0] != digest:
@@ -355,9 +460,12 @@ class Store:
                 self.db.execute("COMMIT")
                 return json.loads(previous[1])
             row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
-            actual, old = (row[0], set(json.loads(row[1]))) if row else (0, set())
+            retired = self.db.execute("SELECT revision FROM retired_workspaces WHERE name=?", (name,)).fetchone()
+            actual, old = (row[0], set(json.loads(row[1]))) if row else (retired[0] if retired else 0, set())
             if revision != actual:
                 raise Conflict(f"revision mismatch: expected {revision}, current {actual}")
+            if row is None and retired and (method != "workspace.put" or panes or snapshot != "# kzw-dormant-workspace\n"):
+                raise Conflict("retired workspace must be explicitly recreated")
             current, removed = set(panes), set(removals)
             if method in ("workspace.put", "workspace.recover-stage"):
                 if removed or not old.issubset(current):
@@ -407,6 +515,8 @@ class Store:
                 raise Conflict("pane is reserved by another workspace")
             new_revision = actual + 1
             self.db.execute("INSERT OR REPLACE INTO workspaces VALUES (?,?,?,?)", (name, new_revision, snapshot, json.dumps(sorted(current))))
+            if row is None and retired:
+                self.db.execute("DELETE FROM retired_workspaces WHERE name=?", (name,))
             for pane in added:
                 self.db.execute("INSERT OR IGNORE INTO observed_sessions VALUES (?,?)", (name, pane))
                 self.db.execute("INSERT OR REPLACE INTO session_presence VALUES (?,?,1)", (name, pane))
@@ -434,12 +544,17 @@ class Store:
             self.db.execute("ROLLBACK")
             raise
 
-    def retry_cleanup(self, name, token=None):
-        # Serialize listing, kill, and acknowledgement. No automatic retries:
-        # cleanup occurs only when an authenticated client asks for it.
+    def retry_cleanup(self, name, token=None, unattended=False):
+        # Serialize listing, kill, and acknowledgement. The background retry
+        # is limited to already-authorized cleanup with no active lease.
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.check_lease(name, token)
+            if unattended:
+                lease = self.db.execute("SELECT expires FROM leases WHERE workspace=?", (name,)).fetchone()
+                if lease and lease[0] > time.time():
+                    raise Conflict("workspace still has an active lease")
+            else:
+                self.check_lease(name, token)
             row = self.db.execute("SELECT revision FROM workspaces WHERE name=?", (name,)).fetchone()
             if row is None:
                 raise ValueError("workspace does not exist")
@@ -536,6 +651,21 @@ def serve():
         stopping = threading.Event()
         client_lock = threading.Lock()
         active_clients = [0]
+
+        def observe():
+            try:
+                store = Store(root / "remote.sqlite3")
+                try:
+                    while not stopping.is_set():
+                        store.observe_detached()
+                        stopping.wait(2)
+                finally:
+                    store.close()
+            except (OSError, sqlite3.Error):
+                # A later server restart can retry; never infer absence here.
+                pass
+
+        threading.Thread(target=observe, name="kzw-observer", daemon=True).start()
 
         def handle(client):
             try:
