@@ -50,6 +50,11 @@ secrets. Existing Bash sessions show `bash: unavailable` until enabled. The hook
 does not edit shell configuration and refuses an existing `DEBUG` trap. Command
 files remain on disk after sessions exit.
 
+The hook also reports Bash prompts, command results and working directories to
+Kitty, unless Kitty's Bash integration is already active. Managed splits and
+tabs can inherit a validated reported directory; without one they use the
+default. Command status is advisory and may be unavailable.
+
 For a remote workspace, add `--host HOST` to each command:
 
 ```sh
@@ -85,10 +90,13 @@ saved split layouts; failed origin checks never authorize removal.
 | Switch tab | Command+1–9; Command+0 for 10 |
 | Close pane | Command+W or `kitty_mod+w` |
 | Close tab | `kitty_mod+q` |
+| Previous / next prompt | `kitty_mod+up` / `kitty_mod+down` |
 
 Managed closes ask for confirmation and terminate the selected sessions;
 unmanaged pane and tab closes are unsupported. Automatic splitting uses Kitty's
-`splits` layout; other layouts determine their own placement.
+`splits` layout; other layouts determine their own placement. Tab titles list
+split processes separated by `│`; `?` means a process is unknown. Tab numbers appear
+after the title; Kitty may truncate them when space is limited.
 
 ## Limitations
 
@@ -106,6 +114,8 @@ unmanaged pane and tab closes are unsupported. Automatic splitting uses Kitty's
 - kzw is not yet a compiled Rust application.
 - zmx may briefly recreate a vanished session.
 - Bash command tracking needs an opt-in hook.
+- Shell metadata may be missing or stale.
+- Remote cwd inheritance is not yet verified.
 - Bash command files are not pruned automatically.
 - Per-window marker color changes are not copied.
 - Marker masking can start after a pane appears.

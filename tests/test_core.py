@@ -719,7 +719,11 @@ class WorkspaceTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "does not match"):
                     pane.wait_for_native_stage(A, "origin")
                 stage.write_text(json.dumps({"kind": "kzw-native-stage-v1", "added": [A], "panes": [A]}))
-                pane.wait_for_native_stage(A, "origin")
+                for debug, visible in (("", False), ("0", False), ("1", True)):
+                    with self.subTest(debug=debug), patch.dict("os.environ", {"KZW_DEBUG": debug}), \
+                         patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        pane.wait_for_native_stage(A, "origin")
+                        self.assertEqual("waiting for the workspace layout" in stderr.getvalue(), visible)
 
     def test_failed_remote_attachment_retries_only_existing_session(self):
         from subprocess import CompletedProcess

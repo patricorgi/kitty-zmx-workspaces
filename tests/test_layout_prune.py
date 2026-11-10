@@ -38,14 +38,14 @@ class LayoutPruneTests(unittest.TestCase):
         self.assertIn(A, output)
         self.assertIn(C, output)
 
-    def test_empty_and_unknown_panes(self):
+    def test_empty_and_invalid_pruning(self):
         self.assertEqual(prune_snapshot(snapshot(), {A, B, C}), '# kzw-empty-workspace\n')
-        with self.assertRaises(ValueError):
-            prune_snapshot(snapshot(), {'kzw-' + 'd' * 32})
-
-    def test_unsupported_layout_fails_closed(self):
-        with self.assertRaises(ValueError):
-            prune_snapshot(snapshot().replace('layout splits', 'layout tall'), {B})
+        for name, data, missing in (
+            ('unknown pane', snapshot(), {'kzw-' + 'd' * 32}),
+            ('unsupported layout', snapshot().replace('layout splits', 'layout tall'), {B}),
+        ):
+            with self.subTest(case=name), self.assertRaises(ValueError):
+                prune_snapshot(data, missing)
 
     @unittest.skipUnless(os.environ.get('KZW_RUN_INTEGRATION') == '1', 'real integration is opt-in')
     def test_pruned_tree_restores_in_hidden_kitty(self):

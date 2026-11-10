@@ -93,27 +93,75 @@ def active_panes(tree):
     return result
 
 
+def tab_panes(tree):
+    """Capture ordered window identities so a changed layout cannot use stale data."""
+    result = {}
+    for os_window in tree:
+        for tab in os_window.get("tabs", []):
+            panes = []
+            for window in tab.get("windows", []):
+                variables = window.get("user_vars", {})
+                pane, host = variables.get("kzw_pane", ""), variables.get("kzw_host", "")
+                if not (isinstance(pane, str) and PANE.fullmatch(pane) and isinstance(host, str)):
+                    pane, host = "", ""
+                panes.append((window.get("id"), host, pane))
+            result[tab["id"]] = tuple(panes)
+    return result
+
+
+def command_states(tree):
+    result = {}
+    for os_window in tree:
+        for tab in os_window.get("tabs", []):
+            for window in tab.get("windows", []):
+                if not window.get("is_active"):
+                    continue
+                variables = window.get("user_vars", {})
+                pane, state = variables.get("kzw_pane"), variables.get("kzw_command_state", "")
+                if isinstance(pane, str) and PANE.fullmatch(pane) and isinstance(state, str):
+                    if state == "running":
+                        result[pane] = "running"
+                    elif re.fullmatch(r"exit:-?[0-9]{1,10}", state):
+                        result[pane] = "exit " + state[5:]
+    return result
+
+
 def refresh(socket, query, stop=None):
-    before = active_panes(json.loads(query(socket, "ls")))
+    tree = json.loads(query(socket, "ls"))
+    before = active_panes(tree)
+    before_panes = tab_panes(tree)
     hosts = {}
-    for host, _, _ in before.values():
-        if host not in hosts:
-            try:
-                hosts[host] = read_host(host)
-            except (OSError, ValueError, subprocess.SubprocessError):
-                hosts[host] = {}
+    for panes in before_panes.values():
+        for _, host, pane in panes:
+            if pane and host not in hosts:
+                try:
+                    hosts[host] = read_host(host)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    hosts[host] = {}
     if stop is not None and stop.is_set():
         return
     # Focus can change while SSH is running. Never set a title for a stale pane.
-    after = active_panes(json.loads(query(socket, "ls")))
+    tree = json.loads(query(socket, "ls"))
+    after = active_panes(tree)
+    after_panes = tab_panes(tree)
+    states = command_states(tree)
     for tab_id, (host, pane, title) in after.items():
         if stop is not None and stop.is_set():
             return
         previous = before.get(tab_id)
-        if previous is None or previous[:2] != (host, pane):
+        if previous is None or previous[:2] != (host, pane) or before_panes.get(tab_id) != after_panes.get(tab_id):
             continue
-        desired = hosts.get(host, {}).get(pane)
-        if desired and desired != title:
+        names = []
+        known = False
+        for _, pane_host, pane_id in after_panes[tab_id]:
+            name = hosts.get(pane_host, {}).get(pane_id)
+            if name:
+                known = True
+                if pane_id == pane and pane in states:
+                    name += " · " + states[pane]
+            names.append(name or "?")
+        desired = " │ ".join(names)
+        if known and desired != title:
             query(socket, "set-tab-title", "--match", f"id:{tab_id}", desired)
 
 

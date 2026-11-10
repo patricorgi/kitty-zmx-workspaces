@@ -21,6 +21,14 @@ def handle_result(args, answer, target_window_id, boss):
         return
     cmd = ["kzw", "_managed-create", name, kind, str(target_window_id), pane,
            "--host", os.environ.get("KZW_HOST", "")]
+    cwd = getattr(window.screen, "last_reported_cwd", "")
+    if isinstance(cwd, bytes):
+        try:
+            cwd = cwd.decode("utf-8")
+        except UnicodeDecodeError:
+            cwd = ""
+    if isinstance(cwd, str) and cwd:
+        cmd += ["--cwd-uri", cwd]
     origin = os.environ.get("KZW_WORKSPACE_ORIGIN", "")
     if origin:
         cmd += ["--origin", origin]

@@ -762,7 +762,7 @@ def close_target(name, kind, target_id, origin="", confirmed_selection=None):
     log_pane_event("tab_destroyed" if kind == "tab" else "pane_destroyed", closed)
 
 
-def create_pane(name, kind, window_id, expected_pane, host, origin=""):
+def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri=""):
     """Serialize managed creation with closes and retain uncertain attempts."""
     if kind not in ("right", "below", "split", "tab") or not PANE.fullmatch(expected_pane):
         raise ValueError("invalid creation target")
@@ -770,6 +770,13 @@ def create_pane(name, kind, window_id, expected_pane, host, origin=""):
     executable = shutil.which("kzw-pane")
     if not executable:
         raise ValueError("kzw-pane not found on PATH")
+    cwd = ""
+    if cwd_uri:
+        try:
+            from .shell_cwd import resolve
+            cwd = resolve(cwd_uri, host)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"kzw: shell working directory unavailable; using default: {exc}", file=sys.stderr, flush=True)
     with capture_lock(directory):
         if (directory / "remote.json").exists():
             remote_client.renew_lease(directory)
@@ -796,8 +803,10 @@ def create_pane(name, kind, window_id, expected_pane, host, origin=""):
             raise ValueError("pane ID already belongs to a live zmx session")
         options = ["--type=tab"] if kind == "tab" else ["--next-to", f"id:{window_id}",
                                                          "--location=" + {"right": "hsplit", "below": "vsplit", "split": "split"}[kind]]
-        result = query(socket, "launch", "--match", f"id:{window_id}", *options,
-                       executable, "--pane", pane, "--host", host, "--stage-new")
+        command = [executable, "--pane", pane, "--host", host, "--stage-new"]
+        if cwd:
+            command += ["--initial-cwd", cwd]
+        result = query(socket, "launch", "--match", f"id:{window_id}", *options, *command)
         try:
             new_id = int(result.strip())
         except ValueError:
@@ -1225,9 +1234,9 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         # identified the actual foreground program, including on new tabs.
         args = ["kitty", "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only",
                 "-o", f"shell={pane_executable}", "-o", "enabled_layouts=splits,tall,stack",
-                "-o", "tab_title_template={title.replace('kzw-pane', '…')}",
-                "-o", "active_tab_title_template={title.replace('kzw-pane', '…')}",
-                "-o", f"watcher={Path(__file__).with_name('watcher.py')}"]
+                 "-o", "tab_title_template={title.replace('kzw-pane', '…')}  {fmt.nobold}{fmt.noitalic}{index}",
+                 "-o", "active_tab_title_template={title.replace('kzw-pane', '…')}  {fmt.nobold}{fmt.noitalic}{index}",
+                 "-o", f"watcher={Path(__file__).with_name('watcher.py')}"]
         kitten = Path(__file__).with_name("close_kitten.py")
         create_kitten = Path(__file__).with_name("create_kitten.py")
         detach_kitten = Path(__file__).with_name("detach_kitten.py")
@@ -1238,6 +1247,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                  "-o", f"map super+enter kitten {create_kitten} split",
                  "-o", f"map kitty_mod+enter kitten {create_kitten} right",
                  "-o", f"map kitty_mod+alt+enter kitten {create_kitten} below",
+                 "-o", "map kitty_mod+up scroll_to_prompt -1",
+                 "-o", "map kitty_mod+down scroll_to_prompt 1",
                  "-o", f"map super+t kitten {create_kitten} tab",
                  "-o", f"map kitty_mod+t kitten {create_kitten} tab"]
         for number in range(1, 11):
@@ -1774,6 +1785,7 @@ def main():
     create_managed.add_argument("pane")
     create_managed.add_argument("--host", default="")
     create_managed.add_argument("--origin", default="")
+    create_managed.add_argument("--cwd-uri", default="")
     list_parser = commands.add_parser("list", help="list saved workspaces")
     list_parser.add_argument("--host", default="")
     server_stop = commands.add_parser("server-stop", help="stop the remote workspace coordinator")
@@ -1866,7 +1878,7 @@ def main():
             close_target(args.name, args.kind, args.target_id, args.host, selection)
             return 0
         if args.command == "_managed-create":
-            create_pane(args.name, args.kind, args.window_id, args.pane, args.host, args.origin)
+            create_pane(args.name, args.kind, args.window_id, args.pane, args.host, args.origin, args.cwd_uri)
             return 0
         if args.command == "retry-close":
             retry_close(args.name, args.host)
