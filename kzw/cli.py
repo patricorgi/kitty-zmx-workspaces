@@ -20,6 +20,17 @@ from . import remote_client
 EMPTY_SNAPSHOT = "# kzw-empty-workspace\n"
 
 
+def log_pane_event(event, panes):
+    """Print one lifecycle event using the stable session IDs without kzw-."""
+    if event not in ("pane_created", "pane_destroyed", "tab_created", "tab_destroyed"):
+        raise ValueError("invalid lifecycle event")
+    panes = list(panes)
+    if not panes or any(not isinstance(p, str) or not PANE.fullmatch(p) for p in panes) or len(set(panes)) != len(panes):
+        raise ValueError("invalid lifecycle event pane identity")
+    panes.sort()
+    print(f"{event}:{','.join(pane[4:] for pane in panes)}", flush=True)
+
+
 def state_dir(name, origin=""):
     root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
     path = root / "kzw" / check_name(name)
@@ -455,6 +466,35 @@ def exited_windows(tree):
     return result
 
 
+def local_empty_retirable(directory):
+    """Recognize only an empty workspace without any uncertain operations."""
+    if (directory / "remote.json").exists():
+        return False
+    for name in ("pending-create.json", "pending-close.json", "native-stage.json", "bootstrap.kitty-session"):
+        path = directory / name
+        if path.exists() or path.is_symlink():
+            return False
+    pending = directory / "native-pending"
+    if pending.is_symlink() or (pending.exists() and (not pending.is_dir() or any(pending.iterdir()))):
+        return False
+    snapshot, metadata = directory / "workspace.kitty-session", directory / "panes.json"
+    if (snapshot.is_symlink() or metadata.is_symlink() or not snapshot.is_file() or not metadata.is_file() or
+            snapshot.read_text() != EMPTY_SNAPSHOT or json.loads(metadata.read_text()) != []):
+        return False
+    return True
+
+
+def retire_local_empty(directory):
+    """Forget only a fully reconciled local empty workspace, never its directory."""
+    if not local_empty_retirable(directory):
+        return False
+    snapshot, metadata = directory / "workspace.kitty-session", directory / "panes.json"
+    # No broad removal: locks, logs and any unrecognized files remain untouched.
+    snapshot.unlink()
+    metadata.unlink()
+    return True
+
+
 def synchronize_exits(directory, executable, remote_hint=()):
     """Remove only panes whose host confirms the session is absent."""
     socket = directory / "kitty.sock"
@@ -535,6 +575,17 @@ def synchronize_exits(directory, executable, remote_hint=()):
             else:
                 raise ValueError("could not save layout after confirmed shell exits")
         remove_native_journals(journals)
+        if not expected:
+            retire_local_empty(directory)
+        for os_window in current_tree:
+            for tab in os_window.get("tabs", []):
+                ids = {window["id"] for window in tab.get("windows", [])}
+                removed = ids & gone.keys()
+                if removed and ids == removed:
+                    log_pane_event("tab_destroyed", [gone[wid][0] for wid in removed])
+                else:
+                    for wid in sorted(removed):
+                        log_pane_event("pane_destroyed", [gone[wid][0]])
     return len(gone)
 
 
@@ -575,8 +626,11 @@ def cleanup_close_locked(directory):
         closed.append(pane)
         entries = entries[1:]
         if entries:
-            atomic_write(path, json.dumps({"phase": "layout-saved", "panes": entries}) + "\n")
+            data["panes"] = entries
+            atomic_write(path, json.dumps(data) + "\n")
     path.unlink()
+    if data.get("last"):
+        retire_local_empty(directory)
     return closed
 
 
@@ -646,7 +700,7 @@ def close_target(name, kind, target_id, origin="", confirmed_selection=None):
             atomic_write(pending, json.dumps(record) + "\n")
             query(socket, command, "--match", f"id:{target_id}")
             closed = cleanup_close_locked(directory)
-            print(f"Closed {kind} and {len(closed)} zmx session(s); workspace is empty")
+            log_pane_event("tab_destroyed" if kind == "tab" else "pane_destroyed", closed)
             return
         query(socket, command, "--match", f"id:{target_id}")
         # Kitty closes asynchronously. Check identity as well as count, and
@@ -664,7 +718,7 @@ def close_target(name, kind, target_id, origin="", confirmed_selection=None):
         record["phase"] = "layout-saved"
         atomic_write(pending, json.dumps(record) + "\n")
         closed = cleanup_close_locked(directory)
-    print(f"Closed {kind} and {len(closed)} zmx session(s); saved the reduced layout")
+    log_pane_event("tab_destroyed" if kind == "tab" else "pane_destroyed", closed)
 
 
 def create_pane(name, kind, window_id, expected_pane, host, origin=""):
@@ -717,7 +771,7 @@ def create_pane(name, kind, window_id, expected_pane, host, origin=""):
                 if current == expected:
                     capture_locked(directory, executable, expected_panes=expected)
                     pending.unlink()
-                    print(f"Created {kind} pane {pane}")
+                    log_pane_event("tab_created" if kind == "tab" else "pane_created", [pane])
                     return
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
@@ -829,7 +883,11 @@ def retry_close(name, origin=""):
         elif record.get("phase") == "closing":
             resume_partial_close_locked(directory, record, pending)
         panes = cleanup_close_locked(directory)
-    print(f"Finished cleanup of {len(panes)} zmx session(s)")
+    if record.get("kind") in ("pane", "tab"):
+        log_pane_event("tab_destroyed" if record["kind"] == "tab" else "pane_destroyed", panes)
+    else:
+        for pane in panes:
+            log_pane_event("pane_destroyed", [pane])
 
 
 def retry_create(name, origin=""):
@@ -870,7 +928,7 @@ def retry_create(name, origin=""):
         pending.unlink()
         if record.get("kind") == "bootstrap":
             remove_bootstrap_session(directory, name, host, executable, pane)
-    print(f"Finished creation of pane {pane}")
+    log_pane_event("tab_created" if record.get("kind") == "tab" else "pane_created", [pane])
 
 
 def remove_bootstrap_session(directory, name, host, executable, pane):
@@ -1049,6 +1107,7 @@ def finish_bootstrap(directory, executable):
         if name is None and (directory / "remote.json").exists():
             name = json.loads((directory / "remote.json").read_text())["workspace"]
         remove_bootstrap_session(directory, name, host, executable, pane)
+        log_pane_event("tab_created", [pane])
 
 
 def kitty_launch_command(args, env):
@@ -1102,6 +1161,9 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 raise ValueError("a pane creation is incomplete; inspect pending-create.json")
             if not reconcile_local_bootstrap_commit(directory, name, host, pane_executable):
                 bootstrap_session = recover_bootstrap(directory, name, host, pane_executable)
+        if not remote_attached and bootstrap_session is None and not create_empty:
+            with capture_lock(directory):
+                retire_local_empty(directory)
         snapshot = directory / "workspace.kitty-session"
         empty = snapshot.is_file() and snapshot.read_text() == EMPTY_SNAPSHOT
         if bootstrap_session is not None and (bootstrap_session != directory / "bootstrap.kitty-session" or (snapshot.exists() and not empty)):
@@ -1400,7 +1462,7 @@ def main():
         root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "kzw"
         if root.is_dir():
             for path in sorted(root.iterdir()):
-                if (path / "workspace.kitty-session").is_file():
+                if (path / "workspace.kitty-session").is_file() and not local_empty_retirable(path):
                     print(path.name)
         return 0
     except (OSError, EOFError, ValueError, subprocess.SubprocessError) as exc:

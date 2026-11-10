@@ -172,8 +172,9 @@ def main():
             failed = True
             print(f"kzw: {exc}", file=sys.stderr)
         retry = bool(failed and (args.host or needs_journal or needs_absence_check or needs_stage))
-        print("kzw: attachment ended; checking whether the session still exists" +
-              ("; retrying connection" if retry else ""), file=sys.stderr, flush=True)
+        if os.environ.get("KZW_DEBUG") == "1":
+            print("kzw: attachment ended; checking whether the session still exists" +
+                  ("; retrying connection" if retry else ""), file=sys.stderr, flush=True)
         report_attachment_ended(retry=retry)
         if not retry:
             return

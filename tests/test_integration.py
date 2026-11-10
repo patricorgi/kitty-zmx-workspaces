@@ -240,6 +240,7 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.wait_for(lambda: len(pane_map(self.tree())) == 1, "exited pane not removed")
         self.assertNotIn(original[target][0], self.sessions())
         self.stop()
+
         self.start(1)
         current = pane_map(self.tree())
         self.assertEqual({v[0] for v in current.values()}, {original[first][0]})
@@ -250,11 +251,47 @@ class RealWorkspaceLifecycle(unittest.TestCase):
         self.process.wait(timeout=30)
         self.process = None
         self.assertNotIn(original[first][0], self.sessions())
-        self.assertIn("has no live panes", self.command("start", self.name))
-        self.start(1, command="new-pane")
+        self.assertNotIn(self.name, self.command("list").splitlines())
+        self.start(1)
         new_pane = next(iter(pane_map(self.tree()).values()))[0]
         self.assertNotEqual(new_pane, original[first][0])
         self.wait_for(lambda: new_pane in self.sessions(), "new explicit session missing")
+        self.stop()
+
+    def test_legacy_empty_workspace_is_recreated_by_start(self):
+        self.path.mkdir(parents=True)
+        (self.path / "workspace.kitty-session").write_text("# kzw-empty-workspace\n")
+        (self.path / "panes.json").write_text("[]\n")
+        self.assertNotIn(self.name, self.command("list").splitlines())
+        self.start(1)
+        pane = next(iter(pane_map(self.tree()).values()))[0]
+        self.wait_for(lambda: pane in self.sessions(), "new session missing")
+        self.stop()
+
+    def test_managed_last_pane_close_retires_and_reuses_name(self):
+        self.start(1)
+        panes = pane_map(self.tree())
+        window, (old_pane, _) = next(iter(panes.items()))
+        self.command("close-pane", self.name, "--window-id", str(window))
+        self.process.wait(timeout=30)
+        self.process = None
+        self.assertNotIn(old_pane, self.sessions())
+        self.assertNotIn(self.name, self.command("list").splitlines())
+        self.start(1)
+        self.assertNotEqual(next(iter(pane_map(self.tree()).values()))[0], old_pane)
+        self.stop()
+
+    def test_managed_tab_events_use_pane_identity(self):
+        self.start(1)
+        window, (initial, _) = next(iter(pane_map(self.tree()).items()))
+        output = self.command("_managed-create", self.name, "tab", str(window), initial, "--host", "")
+        current = self.tree()
+        new_pane = next(iter({p for p, _ in pane_map(current).values()} - {initial}))
+        self.assertIn("tab_created:" + new_pane[4:] + "\n", output)
+        tab = next(t for o in current for t in o["tabs"]
+                   if any(w["user_vars"]["kzw_pane"] == new_pane for w in t["windows"]))
+        output = self.command("close-tab", self.name, "--tab-id", str(tab["id"]))
+        self.assertIn("tab_destroyed:" + new_pane[4:] + "\n", output)
         self.stop()
 
 
