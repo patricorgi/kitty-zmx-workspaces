@@ -78,6 +78,7 @@ def journal_new_workspace_pane(pane, host):
 
 def wait_for_native_stage(pane, host):
     """Do not start a new session until its exact layout has been staged."""
+    print("kzw: waiting for the workspace layout to be saved...", file=sys.stderr, flush=True)
     directory = Path(os.environ["KZW_WORKSPACE_DIRECTORY"])
     journal = directory / "native-pending" / (pane + ".json")
     ready = journal.with_suffix(".ready")

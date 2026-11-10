@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -35,6 +36,10 @@ class ServerIntegration(unittest.TestCase):
                         self.assertEqual(cli.attach_remote("Test", host), 0)
                         self.assertTrue(run.call_args.kwargs["remote_attached"])
                     token = remote_client.acquire_lease(Path(directory), "Test", host)
+                    abandoned = "kzw-" + uuid.uuid4().hex
+                    remote_client.reserve_pane(Path(directory), abandoned, uuid.uuid4().hex)
+                    remote_client.pull(Path(directory), "Test", host, "/bin/kzw-pane")
+                    self.assertEqual(remote_client.call(host, {"method": "workspace.get", "workspace": "Test"})["reservations"], [])
                     with tempfile.TemporaryDirectory() as second_client:
                         with self.assertRaises(ValueError):
                             remote_client.acquire_lease(Path(second_client), "Test", host)

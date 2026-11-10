@@ -66,6 +66,13 @@ The flag also works with `start`, `new-pane`, and `create --attach`.
 
 Keep the supervisor terminal running while attached. `kill` asks for confirmation
 and currently requires a detached coordinator workspace.
+On macOS, when launched interactively from Kitty, kzw attempts to minimize the
+calling Kitty OS window after the workspace is ready and restore it on detach.
+This requires remote-control access and minimizes all tabs in that OS window;
+the original shell and its processes stay running. If restoration fails, use the
+Dock to reopen the window.
+On coordinator attach, confirmed-missing sessions are removed from supported
+saved split layouts; failed origin checks never authorize removal.
 
 ## Kitty shortcuts
 
@@ -74,8 +81,10 @@ and currently requires a detached coordinator workspace.
 | Detach | Command+Shift+W |
 | Automatic split | Command+Enter |
 | Split right / below | `kitty_mod+enter` / `kitty_mod+alt+enter` |
-| New tab | `kitty_mod+t` |
-| Close pane / tab | `kitty_mod+w` / `kitty_mod+q` |
+| New tab | Command+T or `kitty_mod+t` |
+| Switch tab | Command+1–9; Command+0 for 10 |
+| Close pane | Command+W or `kitty_mod+w` |
+| Close tab | `kitty_mod+q` |
 
 Managed closes ask for confirmation and terminate the selected sessions;
 unmanaged pane and tab closes are unsupported. Automatic splitting uses Kitty's
@@ -100,5 +109,6 @@ unmanaged pane and tab closes are unsupported. Automatic splitting uses Kitty's
 - Bash command files are not pruned automatically.
 - Per-window marker color changes are not copied.
 - Marker masking can start after a pane appears.
+- Missing-pane pruning supports splits layouts only.
 
 Run `kzw --help` for more commands.

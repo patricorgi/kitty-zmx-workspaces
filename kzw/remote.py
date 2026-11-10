@@ -434,7 +434,7 @@ class Store:
             return {"panes": [r[0] for r in rows]}
         if method == "cleanup.retry":
             return self.retry_cleanup(name, req.get("lease_token"))
-        if method not in ("workspace.put", "workspace.recover-stage", "panes.close", "workspace.prune"):
+        if method not in ("workspace.put", "workspace.recover-stage", "panes.close", "workspace.prune", "workspace.reconcile"):
             raise ValueError("unknown method")
         request_id = req.get("request_id", "")
         if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
@@ -453,6 +453,12 @@ class Store:
             raise ValueError("invalid removal list")
         if len(removals) != len(set(removals)):
             raise ValueError("duplicate removal")
+        cancellations = req.get("cancel_reservations", [])
+        if (not isinstance(cancellations, list) or any(not isinstance(p, str) or not PANE.fullmatch(p) for p in cancellations) or
+                len(cancellations) != len(set(cancellations)) or (cancellations and method != "workspace.reconcile")):
+            raise ValueError("invalid reservation cancellation")
+        if method == "workspace.reconcile" and not isinstance(req.get("lease_token"), str):
+            raise ValueError("workspace reconciliation requires a lease")
         # The same durable intent may be retried by a newly fenced lease owner.
         # Authorization is checked separately before looking up the operation.
         intent = {key: value for key, value in req.items() if key != "lease_token"}
@@ -479,9 +485,13 @@ class Store:
             if method in ("workspace.put", "workspace.recover-stage"):
                 if removed or not old.issubset(current):
                     raise ValueError("workspace.put cannot remove panes")
-            elif not removed or removed != old - current or current - old:
+            elif (not removed and not (method == "workspace.reconcile" and cancellations)) or removed != old - current or current - old:
                 raise ValueError("close/prune must remove exactly the specified existing panes")
-            if method == "workspace.prune":
+            if method == "workspace.reconcile":
+                reservations = {r[0] for r in self.db.execute("SELECT pane FROM reservations WHERE workspace=?", (name,))}
+                if reservations != set(cancellations) or self.db.execute("SELECT 1 FROM staged_layouts WHERE workspace=?", (name,)).fetchone():
+                    raise Conflict("reservations or staged layout changed before reconciliation")
+            if method in ("workspace.prune", "workspace.reconcile"):
                 # An attachment/host failure is not a shell exit. Confirm on
                 # the origin itself before forgetting any session.
                 env = os.environ.copy()
@@ -490,8 +500,8 @@ class Store:
                 env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
                 listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
                                          text=True, env=env, timeout=10, check=True)
-                if removed.intersection(listing.stdout.splitlines()):
-                    raise Conflict("a pruned zmx session is still alive")
+                if (removed | set(cancellations)).intersection(listing.stdout.splitlines()):
+                    raise Conflict("a reconciled zmx session is still alive")
             added = current - old
             if method == "workspace.recover-stage":
                 staged = self.db.execute("SELECT revision,snapshot,panes FROM staged_layouts WHERE workspace=?", (name,)).fetchone()
@@ -533,15 +543,19 @@ class Store:
             for pane in removed:
                 self.db.execute("DELETE FROM observed_sessions WHERE workspace=? AND pane=?", (name, pane))
                 self.db.execute("DELETE FROM session_presence WHERE workspace=? AND pane=?", (name, pane))
+            for pane in cancellations:
+                self.db.execute("DELETE FROM reservations WHERE workspace=? AND pane=?", (name, pane))
             staged = self.db.execute("SELECT snapshot,panes FROM staged_layouts WHERE workspace=?", (name,)).fetchone()
             if staged and staged[0] == snapshot and set(json.loads(staged[1])) == current:
                 self.db.execute("DELETE FROM staged_layouts WHERE workspace=?", (name,))
             reason = {"panes.close": "managed_close", "workspace.prune": "confirmed_absence",
+                      "workspace.reconcile": "confirmed_absence",
                       "workspace.recover-stage": "stage_recovery"}.get(method, "snapshot")
             self.add_event(name, new_revision, "layout.updated", {"panes": sorted(current),
                                                                   "added": sorted(added), "removed": sorted(removed),
                                                                   "pending_cleanup": sorted(removed) if method == "panes.close" else [],
-                                                                  "reason": reason})
+                                                                  "reason": reason,
+                                                                  **({"cancelled_reservations": sorted(cancellations)} if cancellations else {})})
             if method == "panes.close":
                 for pane in removed:
                     self.db.execute("INSERT INTO cleanup VALUES (?,?)", (name, pane))

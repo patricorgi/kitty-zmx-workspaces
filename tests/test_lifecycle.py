@@ -65,7 +65,9 @@ class FakeKitty:
             self.focused = int(args[2].split(":")[1])
             self.active = next(t["id"] for t in self.tabs if any(w["id"] == self.focused for w in t["windows"]))
             return ""
-        if args == ("close-window", "--match", "all"):
+        all_ids = {w['id'] for tab in self.tabs for w in tab['windows']}
+        if (args[:2] == ("close-window", "--match") and
+                set(args[2].split(' or ')) == {f'id:{wid}' for wid in all_ids}):
             self.attached = False
             return ""
         if args[0] in ("close-window", "close-tab"):

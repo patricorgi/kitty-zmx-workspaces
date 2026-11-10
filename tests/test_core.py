@@ -319,10 +319,11 @@ class WorkspaceTests(unittest.TestCase):
              patch("kzw.cli.state_dir", return_value=Path(directory)), \
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
              patch("kzw.cli.capture_locked", side_effect=[ValueError("layout changed while taking snapshot"), 2]) as capture, \
-             patch("kzw.cli.time.sleep"), patch("kzw.cli.query") as query:
+             patch("kzw.cli.time.sleep"), patch("kzw.cli.query", side_effect=[json.dumps(tree()), ""]) as query:
+            (Path(directory) / "panes.json").write_text(json.dumps([A, B]))
             detach("Test")
             self.assertEqual(capture.call_count, 2)
-            query.assert_called_once()
+            self.assertEqual(query.call_count, 2)
 
     def test_cleanup_refuses_incomplete_close(self):
         with tempfile.TemporaryDirectory() as directory:
