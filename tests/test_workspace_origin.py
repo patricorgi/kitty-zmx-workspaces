@@ -95,6 +95,79 @@ class WorkspaceOriginTests(unittest.TestCase):
         call.assert_called_once_with("", {"method": "workspace.get", "workspace": "Test"})
         acquire.assert_not_called()
 
+    def test_rename_recovers_lost_acknowledgement(self):
+        from kzw.remote import Store
+        store = Store(Path(self.temp.name) / "server.sqlite")
+        self.addCleanup(store.close)
+        store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "create",
+                        "revision": 0, "snapshot": "# kzw-dormant-workspace\n", "panes": []})
+        dropped = [False]
+        def call(host, request):
+            result = store.dispatch(request)
+            if request["method"] == "workspace.rename" and not dropped[0]:
+                dropped[0] = True
+                raise OSError("connection lost after commit")
+            return result
+        with patch("kzw.cli.remote_client.call", side_effect=call):
+            with self.assertRaises(OSError):
+                cli.rename_workspace("Test", "Renamed", "origin")
+            cli.rename_workspace("Test", "Renamed", "origin")
+        self.assertFalse(store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
+        self.assertTrue(store.dispatch({"method": "workspace.get", "workspace": "Renamed"})["exists"])
+        self.assertFalse(list((Path(self.temp.name) / "kzw/rename-intents").glob("*.json")))
+
+    def test_rename_refuses_existing_destination_cache(self):
+        target = cli.state_dir("Renamed", "origin")
+        (target / "workspace.kitty-session").write_text("preserve")
+        with patch("kzw.cli.remote_client.call") as call:
+            with self.assertRaisesRegex(ValueError, "destination"):
+                cli.rename_workspace("Test", "Renamed", "origin")
+        call.assert_not_called()
+        self.assertEqual((target / "workspace.kitty-session").read_text(), "preserve")
+
+    def test_rename_retries_after_destination_cache_was_written(self):
+        from kzw.remote import Store
+        store = Store(Path(self.temp.name) / "server.sqlite")
+        self.addCleanup(store.close)
+        store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "create",
+                        "revision": 0, "snapshot": "# kzw-dormant-workspace\n", "panes": []})
+        original = Path.unlink
+        dropped = [False]
+        def unlink(path, *args, **kwargs):
+            if path.parent.name == "rename-intents" and path.suffix == ".json" and not dropped[0]:
+                dropped[0] = True
+                raise OSError("simulated interruption")
+            return original(path, *args, **kwargs)
+        with patch("kzw.cli.remote_client.call", side_effect=lambda host, request: store.dispatch(request)), \
+             patch.object(Path, "unlink", autospec=True, side_effect=unlink):
+            with self.assertRaises(OSError):
+                cli.rename_workspace("Test", "Renamed", "origin")
+            cli.rename_workspace("Test", "Renamed", "origin")
+        target = cli.state_dir("Renamed", "origin")
+        self.assertEqual(json.loads((target / "remote.json").read_text())["workspace"], "Renamed")
+
+    def test_host_origin_rename_replays_after_source_disappears(self):
+        from kzw.remote import Store
+        root = Path(self.temp.name) / "kzw"
+        root.mkdir()
+        (root / "server.sock").touch()
+        store = Store(Path(self.temp.name) / "server.sqlite")
+        self.addCleanup(store.close)
+        store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "create",
+                        "revision": 0, "snapshot": "# kzw-dormant-workspace\n", "panes": []})
+        dropped = [False]
+        def call(request):
+            result = store.dispatch(request)
+            if request["method"] == "workspace.rename" and not dropped[0]:
+                dropped[0] = True
+                raise OSError("lost acknowledgement")
+            return result
+        with patch("kzw.sessions.coordinator_request", side_effect=call):
+            with self.assertRaises(OSError):
+                cli.rename_workspace("Test", "Renamed")
+            cli.rename_workspace("Test", "Renamed")
+        self.assertTrue(store.dispatch({"method": "workspace.get", "workspace": "Renamed"})["exists"])
+
     def test_create_accepts_only_empty_legacy_remnants(self):
         from kzw import remote_client
         local = cli.state_dir("Test")

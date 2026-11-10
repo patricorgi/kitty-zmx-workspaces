@@ -14,3 +14,6 @@ kzw-pane = "kzw.pane:main"
 
 [tool.setuptools]
 packages = ["kzw"]
+
+[tool.setuptools.package-data]
+kzw = ["bash_hook.sh"]

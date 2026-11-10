@@ -91,11 +91,19 @@ class ManagedCreateTests(unittest.TestCase):
                  patch("kzw.cli.remote_client.start_status_monitor", return_value=lambda: None), \
                  patch("kzw.cli.subprocess.Popen", return_value=child) as popen, \
                  patch("kzw.cli.synchronize_exits"), patch("kzw.cli.capture"):
-                self.assertEqual(run("Test", "origin", remote_attached=True), 0)
+                self.assertEqual(run("Test", "origin", remote_attached=True,
+                                     appearance={"options": ["-o", "font_size=19.5", "-o", "mark1_foreground=#123456"],
+                                                 "marker": ["function", "helpers/privacy_marker.py"]}), 0)
             prepare.assert_called_once_with(path, "Test", "origin", "/bin/kzw-pane")
             mark.assert_called_once_with(path)
             finish.assert_called_once_with(path, "/bin/kzw-pane")
             self.assertIn(str(bootstrap), popen.call_args.args[0])
+            self.assertIn("font_size=19.5", popen.call_args.args[0])
+            self.assertIn("mark1_foreground=#123456", popen.call_args.args[0])
+            self.assertTrue(any("map super+enter kitten " in arg and arg.endswith(" split")
+                                for arg in popen.call_args.args[0]))
+            self.assertEqual(json.loads(popen.call_args.kwargs["env"]["KZW_INHERIT_MARKER"]),
+                             ["function", "helpers/privacy_marker.py"])
             title_stop.set.assert_called_once()
 
     def test_create_saves_only_after_verified_identity_and_session(self):
@@ -114,6 +122,20 @@ class ManagedCreateTests(unittest.TestCase):
             self.assertIn("--location=hsplit", query.call_args_list[1].args)
             self.assertFalse((Path(tmp) / "pending-create.json").exists())
             self.assertEqual(output.getvalue(), "pane_created:" + "b" * 32 + "\n")
+
+    def test_automatic_split_uses_managed_creation(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("kzw.cli.state_dir", return_value=Path(tmp)), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.uuid.uuid4") as uid, \
+             patch("kzw.cli.capture_locked") as capture, \
+             patch("kzw.cli.zmx_command", side_effect=["", B + "\n"]), \
+             patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query:
+            uid.return_value.hex = "b" * 32
+            create_pane("Test", "split", 1, A, "")
+            self.assertIn("--location=split", query.call_args_list[1].args)
+            self.assertEqual(capture.call_args.kwargs["expected_panes"], {1: (A, ""), 2: (B, "")})
+            self.assertFalse((Path(tmp) / "pending-create.json").exists())
 
     def test_failed_launch_keeps_journal_and_blocks_close_and_detach(self):
         with tempfile.TemporaryDirectory() as tmp, \

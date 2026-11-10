@@ -493,13 +493,15 @@ def start_status_monitor(directory):
     return close
 
 
-def inert_legacy_artifacts(directory):
+def inert_legacy_artifacts(directory, ignored_names=()):
     """Accept only known empty remnants, never unknown or recoverable state.
 
     The caller holds the workspace lock while checking and creating state.
     Do not follow symlinks or remove any of these files.
     """
     for path in directory.iterdir():
+        if path.name in ignored_names:
+            continue
         info = path.lstat()
         if path.name in ("lock", "capture.lock", "watcher.changed"):
             if not stat.S_ISREG(info.st_mode) or info.st_size:

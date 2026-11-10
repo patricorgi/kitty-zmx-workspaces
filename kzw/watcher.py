@@ -1,6 +1,16 @@
 """Notify the supervisor of observable changes, never authorize a close."""
 
 import os
+import json
+
+
+def _inherit_marker(window):
+    spec = os.environ.get("KZW_INHERIT_MARKER")
+    if not spec or getattr(window, "_kzw_marker_initialized", False):
+        return
+    # Initialize once per pane, so a later user toggle is respected.
+    window.set_marker(json.loads(spec))
+    window._kzw_marker_initialized = True
 
 
 def _notify():
@@ -14,10 +24,12 @@ def _notify():
 
 
 def on_focus_change(boss, window, data):
+    _inherit_marker(window)
     _notify()
 
 
 def on_resize(boss, window, data):
+    _inherit_marker(window)
     _notify()
 
 

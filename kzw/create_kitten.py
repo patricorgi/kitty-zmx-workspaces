@@ -16,7 +16,7 @@ def handle_result(args, answer, target_window_id, boss):
     window = boss.window_id_map.get(target_window_id)
     name = os.environ.get("KZW_WORKSPACE", "")
     pane = window.user_vars.get("kzw_pane", "") if window else ""
-    if kind not in ("right", "below", "tab") or not name or not pane:
+    if kind not in ("right", "below", "split", "tab") or not name or not pane:
         boss.show_error("Cannot create pane", "The workspace or target pane is not managed by kzw.")
         return
     cmd = ["kzw", "_managed-create", name, kind, str(target_window_id), pane,

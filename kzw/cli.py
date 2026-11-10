@@ -5,13 +5,14 @@ import json
 import os
 import re
 import shlex
+import stat
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
 from .core import FOCUS_PREFIX, PANE, atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
 from .titles import start_title_monitor
@@ -257,7 +258,7 @@ def recover_local_managed_creation(directory, executable):
         return True
     data = json.loads(stage.read_text())
     pane, host, target, operation = (record.get(k) for k in ("pane", "host", "target", "request_id"))
-    if (record.get("kind") not in ("right", "below", "tab") or
+    if (record.get("kind") not in ("right", "below", "split", "tab") or
             not isinstance(pane, str) or not PANE.fullmatch(pane) or
             not isinstance(target, str) or not PANE.fullmatch(target) or target == pane or
             not isinstance(host, str) or not isinstance(operation, str) or not re.fullmatch(r"[0-9a-f]{32}", operation) or
@@ -295,7 +296,7 @@ def recover_remote_managed_creation(directory, name, host, executable):
         raise ValueError("managed creation journal is unavailable")
     record = json.loads(pending.read_text())
     pane, target, operation = (record.get(k) for k in ("pane", "target", "request_id"))
-    if (record.get("kind") not in ("right", "below", "tab") or record.get("host") != host or
+    if (record.get("kind") not in ("right", "below", "split", "tab") or record.get("host") != host or
             not isinstance(pane, str) or not PANE.fullmatch(pane) or
             not isinstance(target, str) or not PANE.fullmatch(target) or pane == target or
             not isinstance(operation, str) or not re.fullmatch(r"[0-9a-f]{32}", operation)):
@@ -725,7 +726,7 @@ def close_target(name, kind, target_id, origin="", confirmed_selection=None):
 
 def create_pane(name, kind, window_id, expected_pane, host, origin=""):
     """Serialize managed creation with closes and retain uncertain attempts."""
-    if kind not in ("right", "below", "tab") or not PANE.fullmatch(expected_pane):
+    if kind not in ("right", "below", "split", "tab") or not PANE.fullmatch(expected_pane):
         raise ValueError("invalid creation target")
     directory = state_dir(name, origin) if origin else state_dir(name)
     executable = shutil.which("kzw-pane")
@@ -756,7 +757,7 @@ def create_pane(name, kind, window_id, expected_pane, host, origin=""):
         elif pane in zmx_command(host, "list", "--short").splitlines():
             raise ValueError("pane ID already belongs to a live zmx session")
         options = ["--type=tab"] if kind == "tab" else ["--next-to", f"id:{window_id}",
-                                                         "--location=" + ("hsplit" if kind == "right" else "vsplit")]
+                                                         "--location=" + {"right": "hsplit", "below": "vsplit", "split": "split"}[kind]]
         result = query(socket, "launch", "--match", f"id:{window_id}", *options,
                        executable, "--pane", pane, "--host", host, "--stage-new")
         try:
@@ -1127,7 +1128,7 @@ def kitty_launch_command(args, env):
 
 
 @remote_client.persistent_rpc()
-def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session=None, create_empty=False):
+def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session=None, create_empty=False, appearance=None):
     directory = state_dir(name, host) if remote_attached else state_dir(name)
     if (directory / "remote.json").exists() and not remote_attached:
         raise ValueError("coordinator workspace: use kzw attach NAME (add --host for a remote origin)")
@@ -1195,9 +1196,19 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         args += ["-o", f"map kitty_mod+w kitten {kitten} pane",
                  "-o", f"map kitty_mod+q kitten {kitten} tab",
                  "-o", f"map super+shift+w kitten {detach_kitten}",
+                 "-o", f"map super+enter kitten {create_kitten} split",
                  "-o", f"map kitty_mod+enter kitten {create_kitten} right",
                  "-o", f"map kitty_mod+alt+enter kitten {create_kitten} below",
                  "-o", f"map kitty_mod+t kitten {create_kitten} tab"]
+        if appearance is not None:
+            args.extend(appearance["options"])
+            if appearance["marker"] is not None:
+                env["KZW_INHERIT_MARKER"] = json.dumps(appearance["marker"], separators=(",", ":"))
+                print("kzw: inherited marker initializes asynchronously; verify masking in every pane before sharing", file=sys.stderr)
+            else:
+                env.pop("KZW_INHERIT_MARKER", None)
+        else:
+            env.pop("KZW_INHERIT_MARKER", None)
         focus = saved_focus(snapshot.read_text()) if snapshot.exists() else None
         if bootstrap_session is not None:
             args += ["--session", str(bootstrap_session)]
@@ -1309,6 +1320,121 @@ def create_remote(name, host):
     print(f"Created dormant coordinator workspace {name!r}{location}; use kzw attach to open it")
 
 
+def rename_workspace(name, destination, host=""):
+    """Rename detached coordinator state; retain existing client caches."""
+    check_name(name)
+    check_name(destination)
+    if name == destination:
+        raise ValueError("destination must differ from the current workspace name")
+    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "kzw"
+    from .sessions import coordinator_request
+
+    if host:
+        call = lambda request: remote_client.call(host, request)
+        route = "ssh:" + host + ":" + remote_client.origin_state_home(host)
+        cache = True
+    else:
+        # Host-local remote-origin coordinators and local coordinators occupy
+        # distinct sockets; never silently select between two matching names.
+        pending_key = hashlib.sha256(json.dumps(["host-origin", name, destination], separators=(",", ":")).encode()).hexdigest()
+        origin_pending = (root / "rename-intents" / (pending_key + ".json")).exists()
+        origin = None
+        if (root / "server.sock").exists():
+            origin = coordinator_request({"method": "workspace.get", "workspace": name})
+        local = None
+        if (root / "coordinator" / "remote.sqlite3").is_file():
+            local = remote_client.call("", {"method": "workspace.get", "workspace": name})
+        if origin and origin.get("exists") and local and local.get("exists"):
+            raise ValueError("rename is ambiguous: workspace exists in both host-origin and local coordinators")
+        if origin_pending or (origin is not None and (origin.get("exists") or not local or not local.get("exists"))):
+            if origin is None:
+                raise ValueError("host-origin rename is pending but its coordinator is unavailable")
+            call, route, cache = coordinator_request, "host-origin", False
+        else:
+            call = lambda request: remote_client.call("", request)
+            route, cache = "local-coordinator", True
+
+    intents = root / "rename-intents"
+    intents.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = intents.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("unsafe workspace rename journal directory")
+    key = hashlib.sha256(json.dumps([route, name, destination], separators=(",", ":")).encode()).hexdigest()
+    journal = intents / (key + ".json")
+    # A stable lock also serializes retry of a request whose reply was lost.
+    with ExitStack() as stack:
+        journal_lock = stack.enter_context(open(intents / (key + ".lock"), "a+"))
+        try:
+            fcntl.flock(journal_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("workspace rename is already in progress") from None
+        if cache:
+            paths = [state_dir(name, host), state_dir(destination, host)]
+            for directory in sorted(paths):
+                lock = stack.enter_context(open(directory / "lock", "a+"))
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise ValueError("workspace is attached locally; detach before renaming") from None
+            source, target = paths
+            if any((source / item).exists() for item in ("kitty.sock", "pending-create.json", "pending-close.json", "native-stage.json")):
+                raise ValueError("workspace has an active view or unfinished local operations")
+            native = source / "native-pending"
+            if native.exists() and (native.is_symlink() or not native.is_dir() or any(native.iterdir())):
+                raise ValueError("workspace has unfinished local pane creation")
+            config = source / "remote.json"
+            if config.exists():
+                value = json.loads(config.read_text())
+                if (value.get("workspace") != name or value.get("host") != host or value.get("pending") or value.get("creating") or
+                        value.get("state_home", "") != remote_client.origin_state_home(host)):
+                    raise ValueError("workspace has conflicting or pending local coordinator state")
+            elif (source / "workspace.kitty-session").exists():
+                raise ValueError("legacy workspace cannot be renamed by the coordinator")
+            if not remote_client.inert_legacy_artifacts(target):
+                # A successful remote rename may have written this cache just
+                # before a crash. Only its own durable journal can authorize a
+                # retry; never adopt an unrelated destination cache.
+                target_config = target / "remote.json"
+                if not journal.is_file() or target_config.is_symlink() or not target_config.is_file():
+                    raise ValueError("destination has existing local workspace state")
+                pending_record = json.loads(journal.read_text())
+                cached = json.loads(target_config.read_text())
+                if (cached.get("rename_request") != pending_record.get("request_id") or
+                        cached.get("workspace") != destination or cached.get("host") != host or
+                        cached.get("pending") or cached.get("creating") or
+                        not remote_client.inert_legacy_artifacts(target, ignored_names=("remote.json",))):
+                    raise ValueError("destination has existing local workspace state")
+        if journal.exists():
+            record = json.loads(journal.read_text())
+            if (record.get("route"), record.get("workspace"), record.get("destination")) != (route, name, destination):
+                raise ValueError("workspace rename journal conflicts with this request")
+        else:
+            state = call({"method": "workspace.get", "workspace": name})
+            if not state.get("exists"):
+                raise ValueError("workspace does not exist")
+            record = {"route": route, "workspace": name, "destination": destination,
+                      "revision": state["revision"], "request_id": uuid.uuid4().hex}
+            atomic_write(journal, json.dumps(record, separators=(",", ":")) + "\n")
+        request = {"method": "workspace.rename", "workspace": name, "destination": destination,
+                   "revision": record["revision"], "request_id": record["request_id"]}
+        try:
+            result = call(request)
+        except remote_client.RemoteRejected:
+            # An explicit rejection is a rolled-back transaction, unlike an
+            # interrupted connection whose outcome must be replayed.
+            journal.unlink()
+            raise
+        if cache:
+            if type(result.get("revision")) is not int or result.get("name") != destination:
+                raise ValueError("invalid workspace rename response; retry the pending rename")
+            remote_client.save_config(target, {"workspace": destination, "host": host,
+                                              "revision": result["revision"],
+                                              "state_home": remote_client.origin_state_home(host),
+                                              "rename_request": record["request_id"]})
+        journal.unlink()
+    print(f"Renamed workspace {name!r} to {destination!r}; zmx sessions are unchanged")
+
+
 def kill_workspace(name, host):
     """Confirm and durably schedule all coordinator-owned sessions for cleanup."""
     directory = state_dir(name, host)
@@ -1345,7 +1471,7 @@ def kill_workspace(name, host):
     print(f"Workspace {name!r} termination scheduled; the coordinator will retire it after verified cleanup")
 
 
-def attach_remote(name, host, create_empty=False):
+def attach_remote(name, host, create_empty=False, appearance=None):
     directory = state_dir(name, host)
     executable = shutil.which("kzw-pane")
     if not executable:
@@ -1366,22 +1492,23 @@ def attach_remote(name, host, create_empty=False):
             recovering_managed = not recovering_bootstrap
         remote_client.acquire_lease(directory, name, host)
         stop_heartbeat = lambda: None
+        appearance_arg = {"appearance": appearance} if appearance is not None else {}
         try:
             stop_heartbeat = remote_client.start_lease_heartbeat(directory)
             if recovering_managed:
                 if create_empty:
                     raise ValueError("a pane creation is already pending")
                 recover_remote_managed_creation(directory, name, host, executable)
-                return run(name, host, remote_attached=True, existing_lock=lock)
+                return run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg)
             if recovering_bootstrap:
                 if create_empty:
                     raise ValueError("a bootstrap is already pending; attach to recover it")
                 if reconcile_bootstrap_commit(directory, name, host, executable):
-                    return run(name, host, remote_attached=True, existing_lock=lock)
+                    return run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg)
                 session = recover_bootstrap(directory, name, host, executable)
-                return run(name, host, remote_attached=True, existing_lock=lock, bootstrap_session=session)
+                return run(name, host, remote_attached=True, existing_lock=lock, bootstrap_session=session, **appearance_arg)
             remote_client.pull(directory, name, host, executable)
-            return run(name, host, remote_attached=True, existing_lock=lock, create_empty=True) if create_empty else run(name, host, remote_attached=True, existing_lock=lock)
+            return run(name, host, remote_attached=True, existing_lock=lock, create_empty=True, **appearance_arg) if create_empty else run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg)
         finally:
             stop_heartbeat()
             try:
@@ -1466,7 +1593,8 @@ def events_remote(name, host, after=None, once=False, as_json=False):
                     print(f"{event['seq']} revision={event['revision']} {event['kind']} " +
                           json.dumps(event["data"], separators=(",", ":")), flush=True)
                 cursor = event["seq"]
-                if event["kind"] == "workspace.retired":
+                if event["kind"] == "workspace.retired" or (event["kind"] == "workspace.renamed" and
+                                                             event["data"].get("from") == name):
                     return
             if once and len(events) < 100:
                 return
@@ -1475,16 +1603,27 @@ def events_remote(name, host, after=None, once=False, as_json=False):
 def main():
     parser = argparse.ArgumentParser(prog="kzw")
     commands = parser.add_subparsers(dest="command", required=True)
+    sessions_parser = commands.add_parser("sessions", help="select a session from a workspace on this host")
+    sessions_commands = sessions_parser.add_subparsers(dest="sessions_command", required=True)
+    sessions_list = sessions_commands.add_parser("list", help="select a local zmx session to attach")
+    sessions_list.add_argument("name")
+    sessions_commands.add_parser("bash-hook", help="print the optional Bash command-tracking hook")
+    sessions_record = sessions_commands.add_parser("_record", help=argparse.SUPPRESS)
+    sessions_record.add_argument("pane")
+    sessions_record.add_argument("pid", type=int)
     start = commands.add_parser("start", help="open a workspace and supervise snapshots")
     start.add_argument("name")
     start.add_argument("--host", default="", help="SSH host for newly created panes")
+    start.add_argument("--inherit-appearance", action="store_true", help="copy colors, font size and active function marker from Kitty")
     create_parser = commands.add_parser("create", help="create a dormant remote workspace")
     create_parser.add_argument("name")
     create_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
     create_parser.add_argument("--attach", action="store_true", help="attach immediately after creating the workspace")
+    create_parser.add_argument("--inherit-appearance", action="store_true", help="copy Kitty appearance when used with --attach")
     attach_parser = commands.add_parser("attach", help="attach a remote workspace")
     attach_parser.add_argument("name")
     attach_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
+    attach_parser.add_argument("--inherit-appearance", action="store_true", help="copy colors, font size and active function marker from Kitty")
     inspect_parser = commands.add_parser("inspect", help="inspect the authoritative coordinator layout")
     inspect_parser.add_argument("name")
     inspect_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
@@ -1499,6 +1638,7 @@ def main():
     new_pane_parser.add_argument("name")
     new_pane_parser.add_argument("--host", default="", help="remote workspace origin")
     new_pane_parser.add_argument("--shell-host", default="", help="SSH host for a local-state workspace's new shell")
+    new_pane_parser.add_argument("--inherit-appearance", action="store_true", help="copy colors, font size and active function marker from Kitty")
     save = commands.add_parser("save", help="save a live workspace explicitly")
     save.add_argument("name")
     save.add_argument("--allow-removals", action="store_true")
@@ -1523,6 +1663,10 @@ def main():
     kill_parser = commands.add_parser("kill", help="terminate a detached coordinator workspace and its sessions")
     kill_parser.add_argument("name")
     kill_parser.add_argument("--host", default="", help="remote workspace origin")
+    rename_parser = commands.add_parser("rename", help="rename a detached coordinator workspace")
+    rename_parser.add_argument("name")
+    rename_parser.add_argument("destination")
+    rename_parser.add_argument("--host", default="", help="remote workspace origin")
     confirmed = commands.add_parser("_confirmed-close", help=argparse.SUPPRESS)
     confirmed.add_argument("name")
     confirmed.add_argument("kind", choices=("pane", "tab"))
@@ -1531,7 +1675,7 @@ def main():
     confirmed.add_argument("--host", default="")
     create_managed = commands.add_parser("_managed-create", help=argparse.SUPPRESS)
     create_managed.add_argument("name")
-    create_managed.add_argument("kind", choices=("right", "below", "tab"))
+    create_managed.add_argument("kind", choices=("right", "below", "split", "tab"))
     create_managed.add_argument("window_id", type=int)
     create_managed.add_argument("pane")
     create_managed.add_argument("--host", default="")
@@ -1542,23 +1686,42 @@ def main():
     server_stop.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
     args = parser.parse_args()
     try:
+        appearance_arg = {}
+        if getattr(args, "inherit_appearance", False):
+            if args.command == "create" and not args.attach:
+                raise ValueError("--inherit-appearance requires --attach when creating a workspace")
+            from .appearance import capture
+            appearance_arg["appearance"] = capture()
+        if args.command == "sessions":
+            if args.sessions_command == "bash-hook":
+                sys.stdout.write(Path(__file__).with_name("bash_hook.sh").read_text())
+                return 0
+            if args.sessions_command == "_record":
+                from .session_meta import record
+                record(args.pane, args.pid, sys.stdin.read(16384))
+                return 0
+            from .sessions import list_and_attach
+            return list_and_attach(args.name)
         if args.command == "start":
             if not args.host:
                 directory = state_dir(args.name)
                 config = directory / "remote.json"
                 if config.is_file() and json.loads(config.read_text()).get("host") == "":
-                    return attach_remote(args.name, "")
-            return run(args.name, args.host)
+                    return attach_remote(args.name, "", **appearance_arg)
+            return run(args.name, args.host, **appearance_arg)
         if args.command == "create":
             create_remote(args.name, args.host)
             if args.attach:
-                return attach_remote(args.name, args.host)
+                return attach_remote(args.name, args.host, **appearance_arg)
             return 0
         if args.command == "kill":
             kill_workspace(args.name, args.host)
             return 0
+        if args.command == "rename":
+            rename_workspace(args.name, args.destination, args.host)
+            return 0
         if args.command == "attach":
-            return attach_remote(args.name, args.host)
+            return attach_remote(args.name, args.host, **appearance_arg)
         if args.command == "inspect":
             inspect_remote(args.name, args.host, args.json)
             return 0
@@ -1571,8 +1734,8 @@ def main():
             if not args.host and not args.shell_host:
                 config = state_dir(args.name) / "remote.json"
                 if config.is_file() and json.loads(config.read_text()).get("host") == "":
-                    return attach_remote(args.name, "", create_empty=True)
-            return attach_remote(args.name, args.host, create_empty=True) if args.host else run(args.name, args.shell_host, create_empty=True)
+                    return attach_remote(args.name, "", create_empty=True, **appearance_arg)
+            return attach_remote(args.name, args.host, create_empty=True, **appearance_arg) if args.host else run(args.name, args.shell_host, create_empty=True, **appearance_arg)
         if args.command == "server-stop":
             if input("Stop the workspace server? Connected clients must detach first. [y/N] ").strip().lower() != "y":
                 print("Cancelled")
