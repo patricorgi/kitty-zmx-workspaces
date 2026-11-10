@@ -28,6 +28,10 @@ class TitleTests(unittest.TestCase):
         self.assertEqual(parse_processes(sessions, "10 10 12 pts/1 bash\n12 12 12 pts/2 nvim\n"), {})
         self.assertEqual(parse_processes(sessions, "10 10 -1 ? bash\n"), {})
 
+    def test_login_shell_name_has_no_leading_dash(self):
+        sessions = f"name={A} pid=10 clients=1\n"
+        self.assertEqual(parse_processes(sessions, "10 10 10 ttys004 -bash\n"), {A: "bash"})
+
     def test_active_split_per_tab(self):
         self.assertEqual(active_panes(tree(active=2)), {7: ("host", B, "old")})
 

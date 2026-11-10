@@ -2,8 +2,7 @@
 
 This module deliberately does not own PTYs. Remote-origin workspaces use its
 revision-checked store and status queries; only explicit close requests can
-schedule zmx destruction. The server persists across SSH connections, but
-does not yet provide pushed lifecycle events.
+schedule zmx destruction. The server persists across SSH connections.
 """
 
 import hashlib
@@ -197,6 +196,32 @@ class Store:
                                    "WHERE workspace=? AND seq>? ORDER BY seq LIMIT ?", (name, after, limit)).fetchall()
             return {"events": [{"seq": seq, "revision": rev, "kind": kind, "data": json.loads(data)}
                                for seq, rev, kind, data in rows]}
+        if method == "workspace.events.wait":
+            after, limit, timeout = req.get("after", 0), req.get("limit", 100), req.get("timeout", 15)
+            if (type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 500 or
+                    type(timeout) not in (int, float) or not 0 <= timeout <= 20):
+                raise ValueError("invalid event wait")
+            deadline = time.monotonic() + timeout
+            next_status = 0.0
+            while True:
+                if not self.db.execute("SELECT 1 FROM workspaces WHERE name=?", (name,)).fetchone():
+                    raise ValueError("workspace does not exist")
+                result = self.dispatch({"method": "workspace.events", "workspace": name,
+                                        "after": after, "limit": limit})
+                remaining = deadline - time.monotonic()
+                if result["events"] or remaining <= 0:
+                    return result
+                if time.monotonic() >= next_status:
+                    # A failed zmx listing is an error, never a disappearance.
+                    # Poll only after delivering already journaled events.
+                    try:
+                        self.dispatch({"method": "workspace.status", "workspace": name})
+                    except Conflict:
+                        # A concurrent committed layout invalidates only this
+                        # status sample; fetch the journal again immediately.
+                        continue
+                    next_status = time.monotonic() + 1
+                time.sleep(min(0.25, remaining))
         if method == "pane.reserve":
             pane, operation, revision = req.get("pane"), req.get("request_id"), req.get("revision")
             if not isinstance(pane, str) or not PANE.fullmatch(pane):
@@ -392,7 +417,12 @@ class Store:
             staged = self.db.execute("SELECT snapshot,panes FROM staged_layouts WHERE workspace=?", (name,)).fetchone()
             if staged and staged[0] == snapshot and set(json.loads(staged[1])) == current:
                 self.db.execute("DELETE FROM staged_layouts WHERE workspace=?", (name,))
-            self.add_event(name, new_revision, "layout.updated", {"panes": sorted(current), "removed": sorted(removed)})
+            reason = {"panes.close": "managed_close", "workspace.prune": "confirmed_absence",
+                      "workspace.recover-stage": "stage_recovery"}.get(method, "snapshot")
+            self.add_event(name, new_revision, "layout.updated", {"panes": sorted(current),
+                                                                  "added": sorted(added), "removed": sorted(removed),
+                                                                  "pending_cleanup": sorted(removed) if method == "panes.close" else [],
+                                                                  "reason": reason})
             if method == "panes.close":
                 for pane in removed:
                     self.db.execute("INSERT INTO cleanup VALUES (?,?)", (name, pane))
@@ -410,6 +440,9 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.check_lease(name, token)
+            row = self.db.execute("SELECT revision FROM workspaces WHERE name=?", (name,)).fetchone()
+            if row is None:
+                raise ValueError("workspace does not exist")
             pending = [r[0] for r in self.db.execute("SELECT pane FROM cleanup WHERE workspace=?", (name,))]
             env = os.environ.copy()
             env.pop("ZMX_SESSION", None)
@@ -430,6 +463,7 @@ class Store:
                         failed.append(pane)
                         continue
                 self.db.execute("DELETE FROM cleanup WHERE workspace=? AND pane=?", (name, pane))
+                self.add_event(name, row[0], "pane.cleanup_completed", {"pane": pane, "reason": "managed_close"})
             self.db.execute("COMMIT")
             return {"remaining": failed}
         except Exception:
@@ -438,7 +472,8 @@ class Store:
 
 
 def state_root():
-    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "kzw"
+    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "kzw"
+    return root / "coordinator" if os.environ.get("KZW_LOCAL_COORDINATOR") == "1" else root
 
 
 def build_id():
