@@ -1191,8 +1191,10 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 "-o", f"watcher={Path(__file__).with_name('watcher.py')}"]
         kitten = Path(__file__).with_name("close_kitten.py")
         create_kitten = Path(__file__).with_name("create_kitten.py")
+        detach_kitten = Path(__file__).with_name("detach_kitten.py")
         args += ["-o", f"map kitty_mod+w kitten {kitten} pane",
                  "-o", f"map kitty_mod+q kitten {kitten} tab",
+                 "-o", f"map super+shift+w kitten {detach_kitten}",
                  "-o", f"map kitty_mod+enter kitten {create_kitten} right",
                  "-o", f"map kitty_mod+alt+enter kitten {create_kitten} below",
                  "-o", f"map kitty_mod+t kitten {create_kitten} tab"]
@@ -1305,6 +1307,42 @@ def create_remote(name, host):
         remote_client.create(directory, name, host)
     location = f" on {host}" if host else " locally"
     print(f"Created dormant coordinator workspace {name!r}{location}; use kzw attach to open it")
+
+
+def kill_workspace(name, host):
+    """Confirm and durably schedule all coordinator-owned sessions for cleanup."""
+    directory = state_dir(name, host)
+    with open(directory / "lock", "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("workspace is attached locally; detach it before killing it") from None
+        if not host and (directory / "workspace.kitty-session").exists() and not (directory / "remote.json").exists():
+            raise ValueError("kill currently supports coordinator workspaces only; this is a legacy workspace")
+        if any((directory / item).exists() for item in
+               ("kitty.sock", "pending-close.json", "pending-create.json", "native-stage.json")):
+            raise ValueError("workspace may be active or has unfinished local operations")
+        pending = directory / "native-pending"
+        if pending.exists() and (not pending.is_dir() or any(pending.iterdir())):
+            raise ValueError("workspace has unfinished local pane creation")
+        state = remote_client.call(host, {"method": "workspace.get", "workspace": name})
+        if not state.get("exists"):
+            raise ValueError("workspace does not exist")
+        panes = state["panes"]
+        if input(f"Kill workspace {name!r} and terminate its {len(panes)} zmx session(s) and all their programs? [y/N] ").strip().lower() != "y":
+            print("Cancelled")
+            return
+        remote_client.acquire_lease(directory, name, host)
+        try:
+            token = remote_client.lease_token(directory)
+            remote_client.call(host, {"method": "workspace.kill", "workspace": name,
+                                      "revision": state["revision"], "lease_token": token})
+            result = remote_client.call(host, {"method": "cleanup.retry", "workspace": name, "lease_token": token})
+            if result["remaining"]:
+                raise ValueError("workspace kill is pending cleanup; the server will retry")
+        finally:
+            remote_client.release_lease(directory)
+    print(f"Workspace {name!r} termination scheduled; the coordinator will retire it after verified cleanup")
 
 
 def attach_remote(name, host, create_empty=False):
@@ -1428,6 +1466,8 @@ def events_remote(name, host, after=None, once=False, as_json=False):
                     print(f"{event['seq']} revision={event['revision']} {event['kind']} " +
                           json.dumps(event["data"], separators=(",", ":")), flush=True)
                 cursor = event["seq"]
+                if event["kind"] == "workspace.retired":
+                    return
             if once and len(events) < 100:
                 return
 
@@ -1441,6 +1481,7 @@ def main():
     create_parser = commands.add_parser("create", help="create a dormant remote workspace")
     create_parser.add_argument("name")
     create_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
+    create_parser.add_argument("--attach", action="store_true", help="attach immediately after creating the workspace")
     attach_parser = commands.add_parser("attach", help="attach a remote workspace")
     attach_parser.add_argument("name")
     attach_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
@@ -1479,6 +1520,9 @@ def main():
     retry_create_parser = commands.add_parser("retry-create", help="finish an interrupted pane creation in a live Kitty view")
     retry_create_parser.add_argument("name")
     retry_create_parser.add_argument("--host", default="", help="remote workspace origin")
+    kill_parser = commands.add_parser("kill", help="terminate a detached coordinator workspace and its sessions")
+    kill_parser.add_argument("name")
+    kill_parser.add_argument("--host", default="", help="remote workspace origin")
     confirmed = commands.add_parser("_confirmed-close", help=argparse.SUPPRESS)
     confirmed.add_argument("name")
     confirmed.add_argument("kind", choices=("pane", "tab"))
@@ -1507,6 +1551,11 @@ def main():
             return run(args.name, args.host)
         if args.command == "create":
             create_remote(args.name, args.host)
+            if args.attach:
+                return attach_remote(args.name, args.host)
+            return 0
+        if args.command == "kill":
+            kill_workspace(args.name, args.host)
             return 0
         if args.command == "attach":
             return attach_remote(args.name, args.host)
@@ -1576,7 +1625,8 @@ def main():
         names = set()
         if root.is_dir():
             for path in sorted(root.iterdir()):
-                if (path / "workspace.kitty-session").is_file() and not local_empty_retirable(path):
+                if ((path / "workspace.kitty-session").is_file() and not (path / "remote.json").exists()
+                        and not local_empty_retirable(path)):
                     names.add(path.name)
             if (root / "coordinator" / "remote.sqlite3").is_file():
                 names.update(item["name"] for item in remote_client.call("", {"method": "workspace.list"})["workspaces"])

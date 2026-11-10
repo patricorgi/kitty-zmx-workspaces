@@ -21,6 +21,30 @@ from kzw.core import pane_map
 
 @unittest.skipUnless(os.environ.get("KZW_RUN_INTEGRATION") == "1", "real remote integration is opt-in")
 class RemoteOriginIntegration(unittest.TestCase):
+    def test_kill_detached_workspace_terminates_its_sessions(self):
+        self.kzw("client", "create", "Test", "--host", self.host)
+        self.attach("client", 1)
+        pane = next(iter(pane_map(self.tree()).values()))[0]
+        self.detach()
+        self.kzw("client", "kill", "Test", "--host", self.host)
+        self.wait_for(lambda: "Test" not in self.kzw("client", "list", "--host", self.host).splitlines(),
+                      "remote workspace did not retire after kill")
+        self.assertNotIn(pane, zmx_command(self.host, "list", "--short").splitlines())
+        self.kzw("client", "create", "Test", "--host", self.host)
+
+    def test_detached_last_session_retires_and_name_can_be_reused(self):
+        self.kzw("client", "create", "Test", "--host", self.host)
+        self.attach("client", 1)
+        pane = next(iter(pane_map(self.tree()).values()))[0]
+        self.detach()
+        zmx_command(self.host, "kill", pane)
+        self.wait_for(lambda: "Test" not in self.kzw("client", "list", "--host", self.host).splitlines(),
+                      "remote coordinator did not retire workspace")
+        self.kzw("client", "create", "Test", "--host", self.host)
+        self.attach("client", 1)
+        self.assertNotEqual(pane, next(iter(pane_map(self.tree()).values()))[0])
+        self.detach()
+
     def setUp(self):
         self.host = os.environ.get("KZW_INTEGRATION_HOST")
         if not self.host or not shutil.which("kitty") or not shutil.which("kzw") or not shutil.which("kzw-pane"):
@@ -52,7 +76,7 @@ class RemoteOriginIntegration(unittest.TestCase):
         return env
 
     def kzw(self, client, *args):
-        confirmation = "y\n" if args[0] in ("close-pane", "close-tab") else None
+        confirmation = "y\n" if args[0] in ("close-pane", "close-tab", "kill") else None
         result = subprocess.run(["kzw", *args], env=self.env(client), capture_output=True,
                                 input=confirmation, text=True, timeout=60)
         if result.returncode:
