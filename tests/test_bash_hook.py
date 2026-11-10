@@ -48,37 +48,22 @@ class BashHookTests(unittest.TestCase):
         self.assertGreaterEqual(output.count(expected), count, output.decode(errors="replace"))
         return output
 
-    def test_opt_in_records_last_command_for_the_correct_shell(self):
+    def test_opt_in_records_commands_and_reports_prompt_and_status(self):
         with tempfile.TemporaryDirectory() as home:
             proc, master = self.shell(home)
             self.until(master, PROMPT)
             os.write(master, b'eval "$(kzw sessions bash-hook)"\n')
-            self.until(master, PROMPT)
+            first = self.until(master, PROMPT)
+            self.assertIn(b'\x1b]133;A\x07', first)
+            self.assertIn(b'\x1b]7;file://', first)
             os.write(master, b'printf "HOOK_TEST\\n"\n')
             self.until(master, PROMPT)
             with patch.dict(os.environ, {"XDG_STATE_HOME": home}):
                 self.assertEqual(session_meta.read(PANE, proc.pid), 'printf "HOOK_TEST\\n"')
-
-    def test_hook_refuses_to_replace_existing_debug_trap(self):
-        with tempfile.TemporaryDirectory() as home:
-            proc, master = self.shell(home)
-            self.until(master, PROMPT)
-            os.write(master, b"trap ':' DEBUG\n")
-            self.until(master, PROMPT)
-            os.write(master, b'eval "$(kzw sessions bash-hook)"\n')
-            output = self.until(master, PROMPT)
-            self.assertIn(b"existing DEBUG trap", output)
-            with patch.dict(os.environ, {"XDG_STATE_HOME": home}):
-                self.assertIsNone(session_meta.read(PANE, proc.pid))
-
-    def test_hook_preserves_command_exit_status(self):
-        with tempfile.TemporaryDirectory() as home:
-            _, master = self.shell(home)
-            self.until(master, PROMPT)
-            os.write(master, b'eval "$(kzw sessions bash-hook)"\n')
-            self.until(master, PROMPT)
-            os.write(master, b"false\n")
-            self.until(master, PROMPT)
+            os.write(master, b'false\n')
+            result = self.until(master, PROMPT)
+            self.assertIn(b'\x1b]133;C\x07', result)
+            self.assertIn(b'\x1b]133;D;1\x07', result)
             os.write(master, b"echo STATUS:$?\n")
             output = self.until(master, PROMPT)
             self.assertIn(b"STATUS:1", output)
@@ -98,8 +83,9 @@ class BashHookTests(unittest.TestCase):
             with patch.dict(os.environ, {"XDG_STATE_HOME": home}):
                 self.assertEqual(session_meta.read(PANE, proc.pid), 'printf "TRACK_ME\\n"')
 
-    def test_hook_refuses_functrace_and_readonly_prompt(self):
-        for setup, warning in ((b"set -T\n", b"functrace"),
+    def test_hook_refuses_incompatible_shell_settings(self):
+        for setup, warning in ((b"trap ':' DEBUG\n", b"existing DEBUG trap"),
+                               (b"set -T\n", b"functrace"),
                                (b"readonly PROMPT_COMMAND=''\n", b"readonly")):
             with self.subTest(setup=setup), tempfile.TemporaryDirectory() as home:
                 proc, master = self.shell(home)

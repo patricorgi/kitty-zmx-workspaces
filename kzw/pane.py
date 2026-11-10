@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -78,7 +79,8 @@ def journal_new_workspace_pane(pane, host):
 
 def wait_for_native_stage(pane, host):
     """Do not start a new session until its exact layout has been staged."""
-    print("kzw: waiting for the workspace layout to be saved...", file=sys.stderr, flush=True)
+    if os.environ.get("KZW_DEBUG") == "1":
+        print("kzw: waiting for the workspace layout to be saved...", file=sys.stderr, flush=True)
     directory = Path(os.environ["KZW_WORKSPACE_DIRECTORY"])
     journal = directory / "native-pending" / (pane + ".json")
     ready = journal.with_suffix(".ready")
@@ -113,6 +115,7 @@ def main():
     parser.add_argument("--host", default=os.environ.get("KZW_HOST", ""))
     parser.add_argument("--existing", action="store_true", help="refuse to create a missing session")
     parser.add_argument("--stage-new", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--initial-cwd", default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
     pane = args.pane or "kzw-" + uuid.uuid4().hex
     coordinated = bool(os.environ.get("KZW_WORKSPACE_ORIGIN") or os.environ.get("KZW_WORKSPACE_COORDINATOR") == "1")
@@ -121,6 +124,9 @@ def main():
         parser.error("invalid pane ID")
     if args.host and (args.host.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", args.host)):
         parser.error("invalid SSH host")
+    if args.initial_cwd and (args.existing or not args.stage_new or not args.initial_cwd.startswith('/') or
+                             any(ord(c) < 32 or ord(c) == 127 for c in args.initial_cwd)):
+        parser.error("invalid initial working directory")
     for key, value in (("kzw_pane", pane), ("kzw_host", args.host)):
         encoded = base64.b64encode(value.encode()).decode()
         sys.stdout.write(f"\x1b]1337;SetUserVar={key}={encoded}\x07")
@@ -142,7 +148,13 @@ def main():
         if existing:
             remote_command += f'zmx list --short | grep -F -x -- {pane} >/dev/null || {{ echo "kzw: session {pane} is missing or unavailable" >&2; exit 1; }}; '
         remote_command += f'exec zmx attach {pane}'
-        cmd = ["ssh", "-t", args.host, remote_command] if args.host else ["zmx", "attach", pane]
+        local_command = ["zmx", "attach", pane]
+        if args.initial_cwd and not existing:
+            shell_command = 'cd -- "$1" || printf "kzw: cannot enter requested directory; using default\\n" >&2; exec "${SHELL:-/bin/sh}" -l'
+            shell_args = ['/bin/sh', '-c', shell_command, 'kzw-shell', args.initial_cwd]
+            remote_command += ' ' + shlex.join(shell_args)
+            local_command += shell_args
+        cmd = ["ssh", "-t", args.host, remote_command] if args.host else local_command
         failed = False
         attempted_attach = False
         try:
