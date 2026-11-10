@@ -36,7 +36,7 @@ kzw kill Demo                  # Terminate a detached workspace and its sessions
 On a workspace's origin host, `kzw sessions list Demo` lets you select a split
 and attach from any interactive terminal, without Kitty. Install kzw on that
 host first. The host selector supports Python 3.8+. Use arrow keys or `j`/`k`
-and Enter; press `q` or Escape to cancel.
+and Enter, or press `0`–`9` for a numbered pane; press `q` or Escape to cancel.
 On the origin host, `kzw rename Demo NewName` targets that host's coordinator.
 
 To show the last command for a Bash pane, opt in **inside that pane**:
