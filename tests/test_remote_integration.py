@@ -1,7 +1,9 @@
 """Opt-in remote-origin smoke test with isolated local and remote state."""
 import json
 import os
+import pty
 import queue
+import select
 from pathlib import Path
 import shlex
 import shutil
@@ -11,16 +13,135 @@ import sys
 import tempfile
 import threading
 import time
+import tty
 import unittest
+import zipfile
 
 from kzw.cli import state_dir, zmx_command
 from kzw import remote_client
 from unittest.mock import patch
-from kzw.core import pane_map
+from kzw.core import focused_pane, pane_map
 
 
 @unittest.skipUnless(os.environ.get("KZW_RUN_INTEGRATION") == "1", "real remote integration is opt-in")
 class RemoteOriginIntegration(unittest.TestCase):
+    def check_rename_roundtrip(self, on_host):
+        self.kzw("client", "create", "Test", "--host", self.host)
+        self.attach("client", 1)
+        window, (pane, origin) = next(iter(pane_map(self.tree()).items()))
+        self.kzw("client", "_managed-create", "Test", "right", str(window), pane,
+                 "--host", origin, "--origin", self.host)
+        self.wait_for(lambda: len(pane_map(self.tree())) == 2, "second test pane did not appear")
+        tree = self.tree()
+        panes = {item[0] for item in pane_map(tree).values()}
+        focus = focused_pane(tree)
+        self.detach()
+        if on_host:
+            archive = Path(self.local.name) / "kzw-cli.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                for path in (Path(__file__).resolve().parents[1] / "kzw").glob("*.py"):
+                    bundle.write(path, "kzw/" + path.name)
+            subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(archive),
+                            self.host + ":" + self.remote + "/kzw-cli.zip"], check=True, timeout=30)
+            command = ("env XDG_STATE_HOME=" + shlex.quote(self.remote) + " PYTHONPATH=" +
+                       shlex.quote(self.remote + "/kzw-cli.zip") + " python3 -m kzw.cli rename Test TestRenamed")
+            subprocess.run(["ssh", "-o", "BatchMode=yes", self.host, command], check=True,
+                           capture_output=True, text=True, timeout=30)
+        else:
+            self.kzw("client", "rename", "Test", "TestRenamed", "--host", self.host)
+        names = self.kzw("client", "list", "--host", self.host).splitlines()
+        self.assertNotIn("Test", names)
+        self.assertIn("TestRenamed", names)
+        self.kzw("client", "create", "Test", "--host", self.host)
+        self.name = "TestRenamed"
+        self.attach("client", 2)
+        restored = self.tree()
+        self.assertEqual(panes, {item[0] for item in pane_map(restored).values()})
+        self.assertEqual(focus, focused_pane(restored))
+        self.detach()
+
+    def test_rename_remote_workspace_preserves_layout(self):
+        self.check_rename_roundtrip(on_host=False)
+
+    def test_rename_on_origin_preserves_layout(self):
+        self.check_rename_roundtrip(on_host=True)
+
+    def test_host_local_selector_attaches_without_kitty(self):
+        host_cli = os.environ.get("KZW_HOST_CLI")
+        if not host_cli or not host_cli.startswith("/"):
+            self.skipTest("requires KZW_HOST_CLI pointing to the test host CLI")
+        self.kzw("client", "create", "Test", "--host", self.host)
+        self.attach("client", 1)
+        pane = next(iter(pane_map(self.tree()).values()))[0]
+        command = ("env XDG_STATE_HOME=" + shlex.quote(self.remote) + " " +
+                   shlex.quote(host_cli) + " sessions list Test")
+        master, slave = pty.openpty()
+        tty.setraw(slave)
+        proc = subprocess.Popen(["ssh", "-tt", "-o", "BatchMode=yes", self.host, command],
+                                stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        output = bytearray()
+        try:
+            def wait_for_bytes(value):
+                deadline = time.monotonic() + 30
+                while value not in output and time.monotonic() < deadline and proc.poll() is None:
+                    if select.select([master], [], [], 0.2)[0]:
+                        try:
+                            output.extend(os.read(master, 65536))
+                        except OSError:
+                            break
+                self.assertIn(value, output, output.decode(errors="replace"))
+            wait_for_bytes(b"Split 1")
+            os.write(master, b"\r")
+            wait_for_bytes(b"\x1b[?1049l")
+            time.sleep(1)
+            self.assertIsNone(proc.poll(), "session attachment exited unexpectedly")
+            prepare = ("export XDG_STATE_HOME=" + shlex.quote(self.remote) +
+                       "; unset PROMPT_COMMAND; bash --noprofile --norc -i\r")
+            os.write(master, prepare.encode())
+            time.sleep(1)
+            os.write(master, b'eval "$(kzw sessions bash-hook)"\r')
+            time.sleep(1)
+            os.write(master, b"echo KZW_COMMAND_TRACKING_TEST\r")
+            time.sleep(2)
+            master2, slave2 = pty.openpty()
+            tty.setraw(slave2)
+            viewer = subprocess.Popen(["ssh", "-tt", "-o", "BatchMode=yes", self.host, command],
+                                      stdin=slave2, stdout=slave2, stderr=slave2, start_new_session=True)
+            try:
+                seen = bytearray()
+                deadline = time.monotonic() + 25
+                while b"bash: echo KZW_COMMAND_TRACKING_TEST" not in seen and time.monotonic() < deadline and viewer.poll() is None:
+                    if select.select([master2], [], [], 0.2)[0]:
+                        try:
+                            seen.extend(os.read(master2, 65536))
+                        except OSError:
+                            break
+                self.assertIn(b"bash: echo KZW_COMMAND_TRACKING_TEST", seen, seen.decode(errors="replace"))
+            finally:
+                if viewer.poll() is None:
+                    viewer.kill()
+                    viewer.wait(timeout=5)
+                os.close(master2)
+                os.close(slave2)
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            self.assertIn(pane, zmx_command(self.host, "list", "--short").splitlines())
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
+        self.detach()
+
     def test_kill_detached_workspace_terminates_its_sessions(self):
         self.kzw("client", "create", "Test", "--host", self.host)
         self.attach("client", 1)
@@ -47,6 +168,7 @@ class RemoteOriginIntegration(unittest.TestCase):
 
     def setUp(self):
         self.host = os.environ.get("KZW_INTEGRATION_HOST")
+        self.name = "Test"
         if not self.host or not shutil.which("kitty") or not shutil.which("kzw") or not shutil.which("kzw-pane"):
             self.skipTest("requires KZW_INTEGRATION_HOST, kitty, kzw and kzw-pane on PATH")
         cache = Path.home() / ".cache"
@@ -85,7 +207,7 @@ class RemoteOriginIntegration(unittest.TestCase):
 
     def kitty(self, *args):
         with patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(self.local.name) / self.state)}):
-            socket = state_dir("Test", self.host) / "kitty.sock"
+            socket = state_dir(self.name, self.host) / "kitty.sock"
         return subprocess.run(["kitty", "@", "--to", f"unix:{socket}", *args],
                               capture_output=True, text=True, check=True, timeout=10).stdout
 
@@ -130,11 +252,11 @@ class RemoteOriginIntegration(unittest.TestCase):
     def attach(self, client, count, command="attach"):
         self.state = client
         with self.log.open("a") as log:
-            self.process = subprocess.Popen(["kzw", command, "Test", "--host", self.host],
+            self.process = subprocess.Popen(["kzw", command, self.name, "--host", self.host],
                                             env=self.env(client), stdin=subprocess.DEVNULL,
                                             stdout=log, stderr=log)
         with patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(self.local.name) / client)}):
-            directory = state_dir("Test", self.host)
+            directory = state_dir(self.name, self.host)
         def ready():
             panes = pane_map(self.tree())
             manifest = directory / "panes.json"
@@ -143,7 +265,7 @@ class RemoteOriginIntegration(unittest.TestCase):
         self.wait_for(ready, "remote workspace did not attach and finish registration")
 
     def detach(self):
-        self.kzw(self.state, "detach", "Test", "--host", self.host)
+        self.kzw(self.state, "detach", self.name, "--host", self.host)
         self.process.wait(timeout=20)
         self.process = None
 
@@ -151,7 +273,7 @@ class RemoteOriginIntegration(unittest.TestCase):
         if self.state:
             try:
                 with patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(self.local.name) / self.state)}):
-                    socket = state_dir("Test", self.host) / "kitty.sock"
+                    socket = state_dir(self.name, self.host) / "kitty.sock"
                 if socket.exists():
                     try:
                         self.tree()
@@ -186,14 +308,19 @@ class RemoteOriginIntegration(unittest.TestCase):
             return
         # Remove only the private SQLite files and directories created by this
         # test; never recursively remove or touch any other remote path.
-        script = ("import os,sys,time; p=sys.argv[1]; d=os.path.join(p,'kzw'); "
+        script = ("import os,sys,time,re; p=sys.argv[1]; d=os.path.join(p,'kzw'); m=os.path.join(d,'session-meta'); r=os.path.join(d,'rename-intents'); "
                   "[(time.sleep(.1)) for _ in range(30) if os.path.exists(os.path.join(d,'server.sock'))]; "
+                  "[(os.unlink(os.path.join(m,n+'.json')) if os.path.isfile(os.path.join(m,n+'.json')) else None) for n in sys.argv[2:]]; "
+                  "(os.rmdir(m) if os.path.isdir(m) else None); "
+                  "[(os.unlink(os.path.join(r,n)) if re.fullmatch('[0-9a-f]{64}\\.lock',n) else None) for n in (os.listdir(r) if os.path.isdir(r) else [])]; "
+                  "(os.rmdir(r) if os.path.isdir(r) else None); "
+                  "(os.unlink(os.path.join(p,'kzw-cli.zip')) if os.path.isfile(os.path.join(p,'kzw-cli.zip')) else None); "
                   "[(os.unlink(os.path.join(d,n)) if os.path.isfile(os.path.join(d,n)) else None) "
                   "for n in ('remote.sqlite3','remote.sqlite3-journal','remote.sqlite3-wal','remote.sqlite3-shm','server.lock')]; "
                   "os.rmdir(d); os.rmdir(p)")
         try:
             subprocess.run(["ssh", "-o", "BatchMode=yes", self.host,
-                            "python3 -c " + shlex.quote(script) + " " + shlex.quote(self.remote)],
+                            "python3 -c " + shlex.quote(script) + " " + shlex.join([self.remote, *sorted(self.owned)])],
                            capture_output=True, text=True, check=True, timeout=20)
         except subprocess.SubprocessError:
             print(f"kzw remote integration: test state remains at {self.remote}")

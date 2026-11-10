@@ -46,6 +46,57 @@ class RemoteStoreTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.put("two", revision=0)
 
+    def test_rename_preserves_panes_fences_old_name_and_replays(self):
+        self.put(panes=[A])
+        request = {"method": "workspace.rename", "workspace": "Test", "destination": "Renamed",
+                   "revision": 1, "request_id": "rename-one"}
+        result = self.store.dispatch(request)
+        self.assertEqual(result["panes"], [A])
+        self.assertEqual(self.store.dispatch(request), result)
+        self.assertFalse(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
+        new = self.store.dispatch({"method": "workspace.get", "workspace": "Renamed"})
+        self.assertEqual((new["snapshot"], new["panes"]), ("layout", [A]))
+        self.assertGreater(new["revision"], 1)
+        self.assertEqual(self.store.db.execute("SELECT workspace FROM observed_sessions WHERE pane=?", (A,)).fetchone()[0], "Renamed")
+        with self.assertRaises(Conflict):
+            self.put("stale", revision=1, panes=[A])
+        self.assertTrue(any(event["kind"] == "workspace.renamed" for event in
+                            self.store.dispatch({"method": "workspace.events", "workspace": "Renamed"})["events"]))
+
+    def test_rename_rejects_busy_or_conflicting_workspace(self):
+        self.put(panes=[A])
+        request = {"method": "workspace.rename", "workspace": "Test", "destination": "Renamed",
+                   "revision": 1, "request_id": "rename-one"}
+        token = "a" * 32
+        self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": token})
+        with self.assertRaisesRegex(Conflict, "attached"):
+            self.store.dispatch(request)
+        self.store.dispatch({"method": "workspace.lease.release", "workspace": "Test", "token": token})
+        self.store.db.execute("INSERT INTO reservations VALUES (?,?)", (B, "Test"))
+        with self.assertRaisesRegex(Conflict, "unfinished"):
+            self.store.dispatch(request)
+        self.store.db.execute("DELETE FROM reservations WHERE pane=?", (B,))
+        self.store.db.execute("INSERT INTO workspaces VALUES (?,?,?,?)", ("Renamed", 1, "other", "[]"))
+        with self.assertRaisesRegex(Conflict, "already exists"):
+            self.store.dispatch(request)
+        self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [A])
+
+    def test_rename_retired_destination_fences_stale_revisions(self):
+        self.put(panes=[A])
+        self.store.db.execute("INSERT INTO retired_workspaces VALUES (?,?)", ("Renamed", 99))
+        result = self.store.dispatch({"method": "workspace.rename", "workspace": "Test", "destination": "Renamed",
+                                      "revision": 1, "request_id": "rename-one"})
+        self.assertGreater(result["revision"], 99)
+        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.store.observe_detached()
+        self.assertFalse(self.store.dispatch({"method": "workspace.get", "workspace": "Renamed"})["exists"])
+        previous = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
+        self.store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "recreate",
+                             "revision": previous["revision"], "snapshot": "# kzw-dormant-workspace\n", "panes": []})
+        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.store.observe_detached()
+        self.assertTrue(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
+
     def test_staging_preserves_authoritative_layout_and_rejects_stale_revision(self):
         self.put(panes=[A])
         with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, A + "\n", "")):

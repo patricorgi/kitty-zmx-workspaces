@@ -10,7 +10,7 @@ import threading
 from .core import PANE
 
 
-def parse_processes(zmx_list, ps_output):
+def parse_process_details(zmx_list, ps_output):
     """Map session names to foreground process names using their PTY's tpgid.
 
     zmx's list output identifies the session's child PID. The child's tty and
@@ -44,11 +44,15 @@ def parse_processes(zmx_list, ps_output):
         # Kitty's title and remote-control command arguments.
         title = "".join(c for c in title if c.isprintable())[:100]
         if title:
-            result[name] = title
+            result[name] = {"name": title, "pid": child[1]}
     return result
 
 
-def read_host(host):
+def parse_processes(zmx_list, ps_output):
+    return {pane: detail["name"] for pane, detail in parse_process_details(zmx_list, ps_output).items()}
+
+
+def read_process_details(host):
     """Read session/process metadata in one local process or SSH request."""
     script = ("PATH=\"$HOME/.local/bin:$PATH\"; export PATH; "
               "unset ZMX_SESSION ZMX_SESSION_PREFIX; "
@@ -67,7 +71,11 @@ def read_host(host):
     sessions, separator, processes = out.partition("\n__KZW_PROCESS_LIST__\n")
     if not separator:
         raise ValueError("incomplete process listing")
-    return parse_processes(sessions, processes)
+    return parse_process_details(sessions, processes)
+
+
+def read_host(host):
+    return {pane: detail["name"] for pane, detail in read_process_details(host).items()}
 
 
 def active_panes(tree):

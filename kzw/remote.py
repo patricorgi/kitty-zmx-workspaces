@@ -82,6 +82,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS workspace_kills (
                 workspace TEXT PRIMARY KEY
             );
+            CREATE TABLE IF NOT EXISTS workspace_renames (
+                workspace TEXT NOT NULL, id TEXT NOT NULL, destination TEXT NOT NULL,
+                revision INTEGER NOT NULL, result TEXT NOT NULL,
+                PRIMARY KEY(workspace, id)
+            );
         """)
         self.zmx = zmx
 
@@ -115,10 +120,12 @@ class Store:
                 return False
             # A dormant workspace has never contained a session. Preserve it.
             established = self.db.execute(
-                "SELECT 1 FROM workspace_events WHERE workspace=? AND kind='layout.updated' "
-                "AND json_extract(data,'$.added[0]') IS NOT NULL AND seq > "
-                "COALESCE((SELECT MAX(seq) FROM workspace_events WHERE workspace=? AND kind='workspace.retired'),0) LIMIT 1",
-                (name, name)).fetchone()
+                "SELECT 1 FROM workspace_events WHERE workspace=? AND "
+                "((kind='layout.updated' AND json_extract(data,'$.added[0]') IS NOT NULL) OR "
+                "(kind='workspace.renamed' AND json_extract(data,'$.to')=? AND json_extract(data,'$.panes[0]') IS NOT NULL)) AND seq > "
+                "COALESCE((SELECT MAX(seq) FROM workspace_events WHERE workspace=? AND "
+                "(kind='workspace.retired' OR (kind='workspace.renamed' AND json_extract(data,'$.from')=?))),0) LIMIT 1",
+                (name, name, name, name)).fetchone()
             busy = any(self.db.execute(query, (name,)).fetchone() for query in (
                 "SELECT 1 FROM leases WHERE workspace=? AND expires > strftime('%s','now')",
                 "SELECT 1 FROM reservations WHERE workspace=?",
@@ -165,6 +172,8 @@ class Store:
         name = req.get("workspace", "")
         if not isinstance(name, str) or not NAME.fullmatch(name):
             raise ValueError("invalid workspace")
+        if method == "workspace.rename":
+            return self.rename_workspace(name, req)
         killing = self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone()
         if killing and method not in ("workspace.get", "workspace.sync", "workspace.events", "workspace.events.wait",
                                       "workspace.status", "workspace.watch", "cleanup.list", "cleanup.retry",
@@ -540,6 +549,57 @@ class Store:
             self.db.execute("INSERT INTO operations VALUES (?,?,?,?)", (name, request_id, digest, json.dumps(response)))
             self.db.execute("COMMIT")
             return response
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def rename_workspace(self, name, req):
+        """Rename a detached workspace in one revision-fenced transaction."""
+        destination, request_id, revision = req.get("destination"), req.get("request_id"), req.get("revision")
+        if not isinstance(destination, str) or not NAME.fullmatch(destination) or destination == name:
+            raise ValueError("invalid destination workspace name")
+        if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id) or type(revision) is not int or revision < 0:
+            raise ValueError("invalid workspace rename request")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            previous = self.db.execute("SELECT destination,revision,result FROM workspace_renames WHERE workspace=? AND id=?",
+                                       (name, request_id)).fetchone()
+            if previous:
+                if previous[:2] != (destination, revision):
+                    raise Conflict("rename request ID already used for a different operation")
+                self.db.execute("COMMIT")
+                return json.loads(previous[2])
+            row = self.db.execute("SELECT revision,snapshot,panes FROM workspaces WHERE name=?", (name,)).fetchone()
+            if row is None or row[0] != revision:
+                raise Conflict("workspace changed before rename")
+            if self.db.execute("SELECT 1 FROM workspaces WHERE name=?", (destination,)).fetchone():
+                raise Conflict("destination workspace already exists")
+            for workspace in (name, destination):
+                lease = self.db.execute("SELECT expires FROM leases WHERE workspace=?", (workspace,)).fetchone()
+                if lease and lease[0] > time.time():
+                    raise Conflict("workspace is attached; detach before renaming")
+                for table in ("reservations", "staged_layouts", "cleanup", "workspace_kills"):
+                    if self.db.execute(f"SELECT 1 FROM {table} WHERE workspace=?", (workspace,)).fetchone():
+                        raise Conflict("workspace has unfinished operations")
+            old_retired = self.db.execute("SELECT revision FROM retired_workspaces WHERE name=?", (name,)).fetchone()
+            new_retired = self.db.execute("SELECT revision FROM retired_workspaces WHERE name=?", (destination,)).fetchone()
+            old_revision = max(revision, old_retired[0] if old_retired else 0) + 1
+            new_revision = max(old_revision, new_retired[0] if new_retired else 0) + 1
+            panes = json.loads(row[2])
+            self.db.execute("DELETE FROM workspaces WHERE name=?", (name,))
+            self.db.execute("INSERT INTO workspaces VALUES (?,?,?,?)", (destination, new_revision, row[1], row[2]))
+            for table in ("observed_sessions", "session_presence"):
+                self.db.execute(f"UPDATE {table} SET workspace=? WHERE workspace=?", (destination, name))
+            self.db.execute("DELETE FROM leases WHERE workspace IN (?,?)", (name, destination))
+            self.db.execute("INSERT OR REPLACE INTO retired_workspaces VALUES (?,?)", (name, old_revision))
+            self.db.execute("DELETE FROM retired_workspaces WHERE name=?", (destination,))
+            self.add_event(name, old_revision, "workspace.renamed", {"from": name, "to": destination, "panes": panes})
+            self.add_event(destination, new_revision, "workspace.renamed", {"from": name, "to": destination, "panes": panes})
+            result = {"name": destination, "revision": new_revision, "panes": panes}
+            self.db.execute("INSERT INTO workspace_renames VALUES (?,?,?,?,?)",
+                            (name, request_id, destination, revision, json.dumps(result)))
+            self.db.execute("COMMIT")
+            return result
         except Exception:
             self.db.execute("ROLLBACK")
             raise

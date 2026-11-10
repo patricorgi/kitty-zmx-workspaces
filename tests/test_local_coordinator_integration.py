@@ -9,8 +9,10 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
-from kzw.core import pane_map
+from kzw import appearance
+from kzw.core import focused_pane, pane_map
 
 
 @unittest.skipUnless(os.environ.get("KZW_RUN_INTEGRATION") == "1", "real integration is opt-in")
@@ -30,6 +32,7 @@ class LocalCoordinatorIntegration(unittest.TestCase):
         if sys.platform == "darwin":
             self.env["KZW_TEST_KITTY_BACKGROUND"] = "1"
         self.path = Path(self.temp.name) / "kzw" / "Test"
+        self.name = "Test"
         self.socket = self.path / "kitty.sock"
         self.process = None
         self.owned = set()
@@ -63,7 +66,7 @@ class LocalCoordinatorIntegration(unittest.TestCase):
 
     def attach(self, count, command="attach"):
         with self.log.open("a") as log:
-            args = ["kzw", command, "Test"] + (["--attach"] if command == "create" else [])
+            args = ["kzw", command, self.name] + (["--attach"] if command == "create" else [])
             self.process = subprocess.Popen(args, env=self.env, stdin=subprocess.DEVNULL,
                                             stdout=log, stderr=log)
         self.wait_for(lambda: len(pane_map(self.tree())) == count and
@@ -72,7 +75,7 @@ class LocalCoordinatorIntegration(unittest.TestCase):
                       {p for p, _ in pane_map(self.tree()).values()})
 
     def detach(self):
-        self.command("detach", "Test")
+        self.command("detach", self.name)
         self.process.wait(timeout=20)
         self.process = None
 
@@ -150,6 +153,39 @@ class LocalCoordinatorIntegration(unittest.TestCase):
         self.detach()
         self.attach(2, command="start")
         self.assertEqual({p for p, _ in pane_map(self.tree()).values()}, set(current["panes"]))
+        self.detach()
+
+    def test_capture_live_kitty_appearance(self):
+        self.command("create", "Test")
+        self.attach(1)
+        window = next(iter(pane_map(self.tree())))
+        self.kitty("set-font-size", "19.5")
+        self.kitty("set-colors", "--all", "--configured", "mark1_foreground=#123456")
+        env = {"KITTY_WINDOW_ID": str(window), "KITTY_LISTEN_ON": "unix:" + str(self.socket)}
+        with patch.dict(os.environ, env):
+            options = appearance.capture()
+        self.assertIn("font_size=19.5", options["options"])
+        self.assertIn("mark1_foreground=#123456", options["options"])
+        self.detach()
+
+    def test_rename_preserves_local_workspace_layout(self):
+        self.command("create", "Test")
+        self.attach(1)
+        window, (pane, host) = next(iter(pane_map(self.tree()).items()))
+        self.command("_managed-create", "Test", "right", str(window), pane, "--host", host)
+        self.wait_for(lambda: len(pane_map(self.tree())) == 2)
+        tree = self.tree()
+        panes = {item[0] for item in pane_map(tree).values()}
+        focus = focused_pane(tree)
+        self.detach()
+        self.command("rename", "Test", "TestRenamed")
+        self.name = "TestRenamed"
+        self.path = Path(self.temp.name) / "kzw" / self.name
+        self.socket = self.path / "kitty.sock"
+        self.attach(2, command="start")
+        restored = self.tree()
+        self.assertEqual(panes, {item[0] for item in pane_map(restored).values()})
+        self.assertEqual(focus, focused_pane(restored))
         self.detach()
 
     def test_create_attach_opens_and_restores_workspace(self):
