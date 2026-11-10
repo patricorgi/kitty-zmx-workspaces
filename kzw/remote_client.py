@@ -7,9 +7,11 @@ import os
 import re
 import select
 import shlex
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -23,6 +25,7 @@ ORIGIN = "KZW_ORIGIN"
 EXECUTABLE = "KZW_PANE_EXECUTABLE"
 MAX_MESSAGE = 1024 * 1024
 _local = threading.local()
+_channel_lock = threading.RLock()
 
 
 def origin_state_home(host):
@@ -116,8 +119,9 @@ def persistent_rpc():
     try:
         yield
     finally:
-        for channel in _local.channels.values():
-            channel.close()
+        with _channel_lock:
+            for channel in _local.channels.values():
+                channel.close()
         _local.channels = previous
 
 
@@ -136,20 +140,117 @@ def decode_response(data):
 
 
 def call(host, request):
-    command = coordinator_command(host)
+    broker = os.environ.get("KZW_RPC_SOCKET")
+    if (broker and host == os.environ.get("KZW_WORKSPACE_ORIGIN", "") and
+            request.get("workspace") == os.environ.get("KZW_WORKSPACE") and request.get("workspace")):
+        return broker_call(broker, host, request)
+    return direct_call(host, request)
+
+
+def direct_call(host, request):
     channels = getattr(_local, "channels", None)
     if channels is None:
-        proc = subprocess.run(command, input=json.dumps(request, separators=(",", ":")) + "\n",
+        proc = subprocess.run(coordinator_command(host), input=json.dumps(request, separators=(",", ":")) + "\n",
                               text=True, capture_output=True, timeout=30, check=True)
         return decode_response(proc.stdout)
     key = (host, os.environ.get("KZW_REMOTE_STATE_HOME", "") if host else os.environ.get("XDG_STATE_HOME", ""))
-    if key not in channels:
-        channels[key] = Channel(command)
-    try:
-        return channels[key].request(request)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        channels.pop(key).close()
-        raise
+    with _channel_lock:
+        if key not in channels:
+            channels[key] = Channel(coordinator_command(host))
+        try:
+            return channels[key].request(request)
+        except RemoteRejected:
+            raise
+        except (OSError, ValueError, subprocess.SubprocessError):
+            channels.pop(key).close()
+            raise
+
+
+def broker_call(path, host, request):
+    message = json.dumps({"host": host, "request": request}, separators=(",", ":")).encode() + b"\n"
+    if len(message) > MAX_MESSAGE:
+        raise ValueError("coordinator request too large")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(35)
+        client.connect(path)
+        client.sendall(message)
+        with client.makefile("rb") as stream:
+            data = stream.readline(MAX_MESSAGE + 1)
+    if not data or len(data) > MAX_MESSAGE or not data.endswith(b"\n"):
+        raise OSError("coordinator broker disconnected; operation outcome may be unknown")
+    response = json.loads(data)
+    if response.get("transport_error"):
+        raise OSError("coordinator broker: " + str(response["transport_error"]))
+    return decode_response(data)
+
+
+class ConnectionBroker:
+    """Share the supervisor's ordered RPC stream with its local child processes."""
+
+    def __init__(self, host, workspace):
+        self.host = host
+        self.workspace = check_name(workspace)
+        self.channels = getattr(_local, "channels", None)
+        if self.channels is None:
+            raise ValueError("connection broker requires persistent RPC")
+        cache = Path.home() / ".cache"
+        cache.mkdir(exist_ok=True)
+        self.directory = Path(tempfile.mkdtemp(prefix="kzw-rpc-", dir=cache))
+        self.path = self.directory / "socket"
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.server.bind(str(self.path))
+            self.server.listen(16)
+            self.server.settimeout(0.2)
+        except Exception:
+            self.server.close()
+            if self.path.exists():
+                self.path.unlink()
+            self.directory.rmdir()
+            raise
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        _local.channels = self.channels
+        while not self.stopping.is_set():
+            try:
+                client, _ = self.server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with client:
+                client.settimeout(35)
+                try:
+                    with client.makefile("rb") as stream:
+                        raw = stream.readline(MAX_MESSAGE + 1)
+                    if not raw.endswith(b"\n") or len(raw) > MAX_MESSAGE:
+                        raise ValueError("invalid broker request")
+                    msg = json.loads(raw)
+                    if (not isinstance(msg, dict) or msg.get("host") != self.host or
+                            not isinstance(msg.get("request"), dict) or msg["request"].get("workspace") != self.workspace):
+                        raise ValueError("broker origin mismatch")
+                    result = direct_call(self.host, msg["request"])
+                    response = {"ok": True, "result": result}
+                except RemoteRejected as exc:
+                    response = {"ok": False, "error": str(exc), "code": exc.code}
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    response = {"transport_error": str(exc)}
+                try:
+                    client.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
+                except OSError:
+                    pass
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=37)
+        if self.thread.is_alive():
+            raise OSError("coordinator broker did not stop; socket retained")
+        self.server.close()
+        self.path.unlink()
+        self.directory.rmdir()
 
 
 def translate(snapshot, executable, host, portable):
