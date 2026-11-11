@@ -753,7 +753,7 @@ def start_status_monitor(directory):
 
 
 def inert_legacy_artifacts(directory, ignored_names=()):
-    """Accept only known empty remnants, never unknown or recoverable state.
+    """Accept only empty remnants and diagnostics, never recoverable state.
 
     The caller holds the workspace lock while checking and creating state.
     Do not follow symlinks or remove any of these files.
@@ -764,6 +764,11 @@ def inert_legacy_artifacts(directory, ignored_names=()):
         info = path.lstat()
         if path.name in ("lock", "capture.lock", "lease.lock", "watcher.changed"):
             if not stat.S_ISREG(info.st_mode) or info.st_size:
+                return False
+        elif path.name == "supervisor.log":
+            # Background launch opens this before create/attach. Retain even
+            # nonempty logs from failed attempts; they are not layout state.
+            if not stat.S_ISREG(info.st_mode):
                 return False
         elif path.name == "native-pending":
             if not stat.S_ISDIR(info.st_mode) or any(path.iterdir()):
@@ -858,8 +863,11 @@ def pull(directory, name, host, executable):
                 or config.get("state_home", "") != origin_state_home(host)):
             raise ValueError("local workspace has conflicting or pending remote state")
     elif any(directory.iterdir()):
-        # The workspace lock is created by the caller before this check.
-        if any(p.name not in ("lock", "lease.lock", "lease.json") for p in directory.iterdir()):
+        # The caller creates locks/lease state and the background launcher
+        # opens its diagnostic log before this first pull.
+        if any(p.name not in ("lock", "lease.lock", "lease.json") and
+               not (p.name == "supervisor.log" and stat.S_ISREG(p.lstat().st_mode))
+               for p in directory.iterdir()):
             raise ValueError("local workspace already exists; refusing to overwrite it")
     remote = call(host, {"method": "workspace.sync", "workspace": name})
     if not remote["exists"]:

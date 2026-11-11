@@ -332,6 +332,20 @@ class BackgroundSupervisorTests(unittest.TestCase):
                 cli.spawn_background(self.args())
             popen.assert_not_called()
 
+    def test_spawn_background_refuses_unsafe_log_before_launch(self):
+        for kind in ("symlink", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                log = directory / "supervisor.log"
+                if kind == "symlink":
+                    log.symlink_to(directory / "missing")
+                else:
+                    log.mkdir()
+                with patch("kzw.cli.background_directory", return_value=directory), \
+                     patch("kzw.cli.subprocess.Popen") as popen, self.assertRaisesRegex(ValueError, "unsafe supervisor log"):
+                    cli.spawn_background(self.args())
+                popen.assert_not_called()
+
     def test_cli_attachment_flags_choose_background_or_foreground_execution(self):
         cases = ((["attach", "Test"], "background", {}),
                  (["attach", "Test", "--hold"], "attach", {}),

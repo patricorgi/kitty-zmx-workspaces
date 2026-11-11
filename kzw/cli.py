@@ -2022,6 +2022,8 @@ def spawn_background(args):
     log = directory / "supervisor.log"
     if status.is_symlink():
         raise ValueError("unsafe supervisor startup state")
+    if log.is_symlink() or (log.exists() and not log.is_file()):
+        raise ValueError("unsafe supervisor log")
     try:
         status.unlink()
     except FileNotFoundError:

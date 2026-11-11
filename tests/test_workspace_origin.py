@@ -181,6 +181,47 @@ class WorkspaceOriginTests(unittest.TestCase):
         self.assertTrue((local / "native-pending").is_dir())
         self.assertEqual((local / "capture.lock").stat().st_size, 0)
 
+    def test_create_accepts_background_logs_for_local_and_remote_origins(self):
+        from kzw import remote_client
+        for host in ("", "origin"):
+            for text in ("", "previous startup failed\n"):
+                with self.subTest(host=host, text=text), tempfile.TemporaryDirectory() as temp:
+                    directory = Path(temp)
+                    (directory / "lock").touch()
+                    log = directory / "supervisor.log"
+                    log.write_text(text)
+                    with patch("kzw.remote_client.call", return_value={"exists": False}) as call, \
+                         patch("kzw.remote_client.publish") as publish:
+                        remote_client.create(directory, "Test", host)
+                    call.assert_called_once_with(host, {"method": "workspace.get", "workspace": "Test"})
+                    publish.assert_called_once_with(directory, remote_client.DORMANT, [])
+                    self.assertEqual(log.read_text(), text)
+
+    def test_create_and_first_pull_reject_unsafe_logs_and_real_workspace_state(self):
+        from kzw import remote_client
+        for method in ("create", "pull"):
+            for kind in ("log-directory", "log-symlink", "unknown", "layout", "pending-exit"):
+                with self.subTest(method=method, kind=kind), tempfile.TemporaryDirectory() as temp:
+                    directory = Path(temp)
+                    log = directory / "supervisor.log"
+                    if kind == "log-directory":
+                        log.mkdir()
+                    elif kind == "log-symlink":
+                        log.symlink_to(directory / "missing")
+                    else:
+                        log.write_text("diagnostic\n")
+                        name = {"unknown": "unknown", "layout": "workspace.kitty-session",
+                                "pending-exit": "pending-exit.json"}[kind]
+                        (directory / name).write_text("preserve\n")
+                    with patch("kzw.remote_client.call") as call, self.assertRaisesRegex(ValueError, "already exists"):
+                        if method == "create":
+                            remote_client.create(directory, "Test", "origin")
+                        else:
+                            remote_client.pull(directory, "Test", "origin", "/bin/kzw-pane")
+                    call.assert_not_called()
+                    if kind not in ("log-directory", "log-symlink"):
+                        self.assertEqual((directory / name).read_text(), "preserve\n")
+
     def test_create_rejects_nonempty_unknown_and_symlink_remnants(self):
         from kzw import remote_client
         for kind in ("nonempty-file", "pending", "unknown", "symlink"):
