@@ -27,8 +27,9 @@ def handle_result(args, answer, target_window_id, boss):
         boss.show_error("Cannot close", "The selected panes are not all managed by kzw.")
         return
     target = window.id if kind == "pane" else tab.id
-    name = os.environ.get("KZW_WORKSPACE", "")
-    origin = os.environ.get("KZW_WORKSPACE_ORIGIN", "")
+    variables = window.user_vars
+    name = variables.get("kzw_workspace", os.environ.get("KZW_WORKSPACE", ""))
+    origin = variables.get("kzw_origin", "" if "kzw_workspace" in variables else os.environ.get("KZW_WORKSPACE_ORIGIN", ""))
     if not name:
         boss.show_error("Cannot close", "Workspace identity is unavailable.")
         return

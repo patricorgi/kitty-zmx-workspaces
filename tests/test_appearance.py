@@ -41,7 +41,7 @@ class AppearanceTests(unittest.TestCase):
                 appearance.capture()
 
     def test_attach_routes_inherited_appearance(self):
-        with patch("sys.argv", ["kzw", "attach", "Test", "--host", "origin", "--inherit-appearance"]), \
+        with patch("sys.argv", ["kzw", "attach", "Test", "--host", "origin", "--inherit-appearance", "--hold"]), \
              patch("kzw.appearance.capture", return_value=["-o", "font_size=20"]), \
              patch("kzw.cli.attach_remote", return_value=0) as attach:
             self.assertEqual(cli.main(), 0)

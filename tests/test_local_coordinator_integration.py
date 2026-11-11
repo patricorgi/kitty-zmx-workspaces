@@ -66,7 +66,7 @@ class LocalCoordinatorIntegration(unittest.TestCase):
 
     def attach(self, count, command="attach"):
         with self.log.open("a") as log:
-            args = ["kzw", command, self.name] + (["--attach"] if command == "create" else [])
+            args = ["kzw", command, self.name, "--hold", "--new-kitty-instance"] + (["--attach"] if command == "create" else [])
             self.process = subprocess.Popen(args, env=self.env, stdin=subprocess.DEVNULL,
                                             stdout=log, stderr=log)
         self.wait_for(lambda: len(pane_map(self.tree())) == count and
@@ -129,6 +129,11 @@ class LocalCoordinatorIntegration(unittest.TestCase):
         self.command("_managed-create", "Test", "right", str(wid), pane, "--host", host)
         current = json.loads(self.command("inspect", "Test", "--json"))
         self.assertEqual(len(current["panes"]), 2)
+        inventory = json.loads(self.command("inventory", "--json"))
+        self.assertTrue(inventory["available"])
+        self.assertEqual(set(inventory["observation"]["sessions"]), set(current["panes"]))
+        self.assertEqual(inventory["workspaces"]["Test"]["snapshot"], current["snapshot"])
+        self.assertTrue(all(s["workspace"] == "Test" and s["presence"] == "live" for s in inventory["sessions"]))
         events = [json.loads(line) for line in self.command("events", "Test", "--json", "--once",
                                                            "--after", str(initial["event_cursor"])).splitlines()]
         self.assertTrue(any(event["type"] == "layout.updated" and
@@ -151,6 +156,8 @@ class LocalCoordinatorIntegration(unittest.TestCase):
         current = json.loads(self.command("inspect", "Test", "--json"))
         self.assertEqual(len(current["panes"]), 2)
         self.detach()
+        detached = json.loads(self.command("inventory", "--json"))
+        self.assertEqual(set(detached["observation"]["sessions"]), set(current["panes"]))
         self.attach(2, command="start")
         self.assertEqual({p for p, _ in pane_map(self.tree()).values()}, set(current["panes"]))
         self.detach()

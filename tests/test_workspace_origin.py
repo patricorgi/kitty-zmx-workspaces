@@ -57,7 +57,7 @@ class WorkspaceOriginTests(unittest.TestCase):
     def test_create_attach_routes_local_and_remote(self):
         for host in ("", "origin"):
             with self.subTest(host=host):
-                argv = ["kzw", "create", "Test", "--attach"] + (["--host", host] if host else [])
+                argv = ["kzw", "create", "Test", "--attach", "--hold"] + (["--host", host] if host else [])
                 with patch("sys.argv", argv), patch("kzw.cli.create_remote") as create, \
                      patch("kzw.cli.attach_remote", return_value=7) as attach:
                     self.assertEqual(cli.main(), 7)
@@ -65,7 +65,7 @@ class WorkspaceOriginTests(unittest.TestCase):
                 attach.assert_called_once_with("Test", host)
 
     def test_create_does_not_attach_on_failure_or_without_flag(self):
-        with patch("sys.argv", ["kzw", "create", "Test", "--attach"]), \
+        with patch("sys.argv", ["kzw", "create", "Test", "--attach", "--hold"]), \
              patch("kzw.cli.create_remote", side_effect=ValueError("conflict")), \
              patch("kzw.cli.attach_remote") as attach:
             self.assertEqual(cli.main(), 1)

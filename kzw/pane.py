@@ -10,11 +10,63 @@ import shlex
 import stat
 import subprocess
 import sys
+import termios
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .core import PANE, check_name
+
+
+def ssh_diagnostic_visible(line):
+    """Hide only known multiplexing fallback noise, not SSH failures."""
+    return not (line.startswith("mux_client_request_session: session request failed: Session open refused by peer") or
+                (line.startswith("ControlSocket ") and line.rstrip().endswith(" already exists, disabling multiplexing")))
+
+
+def run_attachment(cmd, env, remote):
+    if not remote or env.get("KZW_DEBUG") == "1":
+        return subprocess.run(cmd, env=env, check=False)
+    read_fd, write_fd = os.pipe()
+
+    def forward():
+        with os.fdopen(read_fd, "r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if ssh_diagnostic_visible(line):
+                    print(line, end="", file=sys.stderr, flush=True)
+
+    thread = threading.Thread(target=forward, daemon=True)
+    thread.start()
+    try:
+        return subprocess.run(cmd, env=env, check=False, stderr=write_fd)
+    finally:
+        os.close(write_fd)
+        thread.join(timeout=1)
+
+
+@contextmanager
+def attachment_terminal():
+    """Return to wrapper input modes after SSH/zmx exits, including failures."""
+    saved = None
+    if sys.stdin.isatty():
+        try:
+            saved = termios.tcgetattr(sys.stdin.fileno())
+        except (OSError, termios.error):
+            pass
+    try:
+        yield
+    finally:
+        if saved is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved)
+            except (OSError, termios.error):
+                pass
+        if sys.stdout.isatty():
+            # Do not clear the screen or scrollback. The next zmx attachment
+            # restores its application's modes when it redraws the terminal.
+            sys.stdout.write("\x1b[?1000;1002;1003;1004;1005;1006;1015;1016;2004l")
+            sys.stdout.flush()
 
 
 def set_attachment_ended(ended):
@@ -130,6 +182,20 @@ def main():
     for key, value in (("kzw_pane", pane), ("kzw_host", args.host)):
         encoded = base64.b64encode(value.encode()).decode()
         sys.stdout.write(f"\x1b]1337;SetUserVar={key}={encoded}\x07")
+    # Persist workspace identity in the window itself so shared-instance
+    # shortcuts and the watcher do not depend on the Kitty server environment.
+    context = {
+        "kzw_workspace": os.environ.get("KZW_WORKSPACE", ""),
+        "kzw_origin": os.environ.get("KZW_WORKSPACE_ORIGIN", ""),
+        "kzw_directory": os.environ.get("KZW_WORKSPACE_DIRECTORY", ""),
+        "kzw_signal": os.environ.get("KZW_CHANGE_SIGNAL", ""),
+        "kzw_coordinator": os.environ.get("KZW_WORKSPACE_COORDINATOR", ""),
+        "kzw_marker": os.environ.get("KZW_INHERIT_MARKER", ""),
+    }
+    for key, value in context.items():
+        if value:
+            encoded = base64.b64encode(value.encode()).decode()
+            sys.stdout.write(f"\x1b]1337;SetUserVar={key}={encoded}\x07")
     sys.stdout.flush()
     env = os.environ.copy()
     # zmx uses this variable to switch an existing client instead of attaching.
@@ -143,6 +209,7 @@ def main():
     needs_journal = (not args.pane or args.stage_new) and bool(os.environ.get("KZW_WORKSPACE_DIRECTORY") or os.environ.get("KZW_WORKSPACE"))
     needs_stage = needs_journal
     needs_absence_check = not args.pane and not coordinated and not args.existing
+    last_error = None
     while True:
         remote_command = remote
         if existing:
@@ -154,10 +221,14 @@ def main():
             shell_args = ['/bin/sh', '-c', shell_command, 'kzw-shell', args.initial_cwd]
             remote_command += ' ' + shlex.join(shell_args)
             local_command += shell_args
-        cmd = ["ssh", "-t", args.host, remote_command] if args.host else local_command
         failed = False
         attempted_attach = False
         try:
+            if args.host:
+                from .ssh_transport import pane_options
+                cmd = ["ssh", *pane_options(args.host, env), "-t", args.host, remote_command]
+            else:
+                cmd = local_command
             if needs_journal:
                 journal_new_workspace_pane(pane, args.host)
                 needs_journal = False
@@ -179,13 +250,18 @@ def main():
                 if pane not in listing.stdout.splitlines():
                     raise RuntimeError(f"session {pane} is missing or unavailable")
             attempted_attach = True
-            result = subprocess.run(cmd, env=env, check=False)
+            set_attachment_ended(False)
+            with attachment_terminal():
+                result = run_attachment(cmd, env, bool(args.host))
             if result.returncode:
                 raise RuntimeError(f"attachment exited with status {result.returncode}")
+            last_error = None
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             failed = True
-            print(f"kzw: {exc}", file=sys.stderr)
-        retry = bool(failed and (args.host or needs_journal or needs_absence_check or needs_stage))
+            if str(exc) != last_error:
+                print(f"kzw: {exc}; waiting to reconnect", file=sys.stderr, flush=True)
+            last_error = str(exc)
+        retry = bool(failed and (args.host or coordinated or needs_journal or needs_absence_check or needs_stage))
         if os.environ.get("KZW_DEBUG") == "1":
             print("kzw: attachment ended; checking whether the session still exists" +
                   ("; retrying connection" if retry else ""), file=sys.stderr, flush=True)
@@ -195,7 +271,6 @@ def main():
         # A retry must never silently create a replacement for a lost session.
         if attempted_attach:
             existing = True
-        set_attachment_ended(False)
 
 
 if __name__ == "__main__":

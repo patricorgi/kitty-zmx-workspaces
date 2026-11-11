@@ -91,7 +91,7 @@ class ManagedCreateTests(unittest.TestCase):
                  patch("kzw.cli.remote_client.start_status_monitor", return_value=lambda: None), \
                  patch("kzw.cli.subprocess.Popen", return_value=child) as popen, \
                  patch("kzw.cli.synchronize_exits"), patch("kzw.cli.capture"):
-                self.assertEqual(run("Test", "origin", remote_attached=True,
+                self.assertEqual(run("Test", "origin", remote_attached=True, new_instance=True,
                                      appearance={"options": ["-o", "font_size=19.5", "-o", "mark1_foreground=#123456"],
                                                  "marker": ["function", "helpers/privacy_marker.py"]}), 0)
             prepare.assert_called_once_with(path, "Test", "origin", "/bin/kzw-pane")
@@ -176,12 +176,13 @@ class ManagedCreateTests(unittest.TestCase):
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
              patch("kzw.cli.uuid.uuid4") as uid, \
              patch("kzw.cli.capture_locked"), \
-             patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]), \
+             patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query, \
              patch("kzw.cli.zmx_command", return_value=""), \
              patch("sys.stdout", new_callable=io.StringIO) as output:
             uid.return_value.hex = "b" * 32
             create_pane("Test", "tab", 1, A, "")
             self.assertEqual(output.getvalue(), "tab_created:" + "b" * 32 + "\n")
+            self.assertIn("--tab-title=...", query.call_args_list[1].args)
 
     def test_changed_target_does_not_launch(self):
         with tempfile.TemporaryDirectory() as tmp, \

@@ -9,6 +9,20 @@ from kzw import remote_client
 
 
 class BrokerTests(unittest.TestCase):
+    def test_transport_errors_are_bounded_and_never_replay_or_print_shipped_source(self):
+        command = ["ssh", "origin", "encoded-private-coordinator-source"]
+        failures = (subprocess.CalledProcessError(1, command, stderr="traceback\nserver disconnected"),
+                    subprocess.TimeoutExpired(command, 30))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), \
+                 patch("kzw.remote_client.coordinator_command", return_value=command), \
+                 patch("kzw.remote_client.subprocess.run", side_effect=failure) as run:
+                with self.assertRaises(OSError) as caught:
+                    remote_client.direct_call("origin", {"method": "workspace.put"})
+                self.assertIn("operation outcome may be unknown", str(caught.exception))
+                self.assertNotIn(command[-1], str(caught.exception))
+                run.assert_called_once()
+
     def test_shares_supervisor_connection_and_checks_origin(self):
         channel = Mock()
         channel.request.side_effect = lambda request: {"method": request["method"]}
@@ -57,6 +71,7 @@ class BrokerTests(unittest.TestCase):
                     with self.assertRaises(remote_client.RemoteRejected) as rejected:
                         remote_client.broker_call(str(broker.path), "origin", {"method": "pane.reserve", "workspace": "Test"})
                     self.assertEqual(rejected.exception.code, "conflict")
+                    self.assertEqual(str(rejected.exception), "remote coordinator: conflict")
                     self.assertTrue(remote_client.broker_call(str(broker.path), "origin", {"method": "workspace.get", "workspace": "Test"})["exists"])
                 finally:
                     broker.close()

@@ -14,13 +14,16 @@ def main(args):
 def handle_result(args, answer, target_window_id, boss):
     kind = args[1] if len(args) > 1 else ""
     window = boss.window_id_map.get(target_window_id)
-    name = os.environ.get("KZW_WORKSPACE", "")
-    pane = window.user_vars.get("kzw_pane", "") if window else ""
+    variables = getattr(window, "user_vars", {}) if window is not None else {}
+    name = variables.get("kzw_workspace", os.environ.get("KZW_WORKSPACE", ""))
+    pane = variables.get("kzw_pane", "")
     if kind not in ("right", "below", "split", "tab") or not name or not pane:
         boss.show_error("Cannot create pane", "The workspace or target pane is not managed by kzw.")
         return
-    cmd = ["kzw", "_managed-create", name, kind, str(target_window_id), pane,
-           "--host", os.environ.get("KZW_HOST", "")]
+    # Window context is authoritative in a shared instance, including an empty
+    # local origin. Older private instances can still use their environment.
+    host = variables.get("kzw_host", "" if "kzw_workspace" in variables else os.environ.get("KZW_HOST", ""))
+    cmd = ["kzw", "_managed-create", name, kind, str(target_window_id), pane, "--host", host]
     cwd = getattr(window.screen, "last_reported_cwd", "")
     if isinstance(cwd, bytes):
         try:
@@ -29,7 +32,7 @@ def handle_result(args, answer, target_window_id, boss):
             cwd = ""
     if isinstance(cwd, str) and cwd:
         cmd += ["--cwd-uri", cwd]
-    origin = os.environ.get("KZW_WORKSPACE_ORIGIN", "")
+    origin = variables.get("kzw_origin", "" if "kzw_workspace" in variables else os.environ.get("KZW_WORKSPACE_ORIGIN", ""))
     if origin:
         cmd += ["--origin", origin]
     try:

@@ -14,6 +14,7 @@ from unittest.mock import patch
 from kzw import remote_client
 from kzw import cli
 from kzw.cli import zmx_command
+from workspace_fixtures import layout
 
 
 @unittest.skipUnless(os.environ.get("KZW_RUN_SERVER_INTEGRATION") == "1", "remote server test is opt-in")
@@ -36,10 +37,6 @@ class ServerIntegration(unittest.TestCase):
                         self.assertEqual(cli.attach_remote("Test", host), 0)
                         self.assertTrue(run.call_args.kwargs["remote_attached"])
                     token = remote_client.acquire_lease(Path(directory), "Test", host)
-                    abandoned = "kzw-" + uuid.uuid4().hex
-                    remote_client.reserve_pane(Path(directory), abandoned, uuid.uuid4().hex)
-                    remote_client.pull(Path(directory), "Test", host, "/bin/kzw-pane")
-                    self.assertEqual(remote_client.call(host, {"method": "workspace.get", "workspace": "Test"})["reservations"], [])
                     with tempfile.TemporaryDirectory() as second_client:
                         with self.assertRaises(ValueError):
                             remote_client.acquire_lease(Path(second_client), "Test", host)
@@ -72,7 +69,7 @@ class ServerIntegration(unittest.TestCase):
                         self.assertEqual(cli.recover_bootstrap(Path(directory), "Test", host, "/bin/kzw-pane"), bootstrap)
                         self.assertIn("--existing", bootstrap.read_text())
                         remote_client.call(host, {"method": "workspace.put", "workspace": "Test", "request_id": "own-pane",
-                                                  "revision": first["revision"], "snapshot": "test layout", "panes": [pane],
+                                                  "revision": first["revision"], "snapshot": layout(pane), "panes": [pane],
                                                   "lease_token": token})
                         self.assertEqual(remote_client.call(host, {"method": "workspace.get", "workspace": "Test"})["reservations"], [])
                         live = remote_client.call(host, {"method": "workspace.status", "workspace": "Test"})
@@ -97,6 +94,16 @@ class ServerIntegration(unittest.TestCase):
                             attachment.terminate()
                         attachment.wait(timeout=10)
                         attachment.stdin.close()
+                    remote_client.release_lease(Path(directory))
+                    # Interrupted reservations remain accounted for, never cancelled by observation.
+                    token = remote_client.acquire_lease(Path(directory), "Test", host)
+                    abandoned = "kzw-" + uuid.uuid4().hex
+                    revision = remote_client.call(host, {"method": "workspace.get", "workspace": "Test"})["revision"]
+                    remote_client.call(host, {"method": "pane.reserve", "workspace": "Test", "revision": revision,
+                                              "pane": abandoned, "request_id": uuid.uuid4().hex, "lease_token": token})
+                    with self.assertRaisesRegex(ValueError, "disabled"):
+                        remote_client.pull(Path(directory), "Test", host, "/bin/kzw-pane")
+                    self.assertEqual(remote_client.call(host, {"method": "workspace.get", "workspace": "Test"})["reservations"], [abandoned])
                     remote_client.release_lease(Path(directory))
             finally:
                 stopped = False

@@ -5,11 +5,14 @@ import socket
 import sys
 import tempfile
 import time
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
 from kzw.remote import Conflict, Store, response
+from workspace_fixtures import layout
 
 A = "kzw-" + "a" * 32
 B = "kzw-" + "b" * 32
@@ -28,8 +31,9 @@ class RemoteStoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def put(self, request_id="one", revision=0, panes=None):
+        panes = [A, B] if panes is None else panes
         return self.store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": request_id,
-                                    "revision": revision, "snapshot": "layout", "panes": panes or [A, B]})
+                                    "revision": revision, "snapshot": layout(*panes), "panes": panes})
 
     def test_local_coordinator_uses_private_subdirectory(self):
         from kzw.remote import state_root
@@ -46,6 +50,36 @@ class RemoteStoreTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.put("two", revision=0)
 
+    def test_concurrent_layout_writers_commit_exactly_one_revision(self):
+        self.put()
+        token = "f" * 32
+        self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": token})
+        barrier = threading.Barrier(2)
+        requests = [{"method": "workspace.put", "workspace": "Test", "revision": 1,
+                     "request_id": "writer-" + str(i), "snapshot": layout(*panes), "panes": [A, B], "lease_token": token}
+                    for i, panes in enumerate(((A, B), (B, A)))]
+
+        def write(request):
+            store = Store(Path(self.temp.name) / "private" / "state.sqlite")
+            try:
+                barrier.wait(timeout=5)
+                try:
+                    return store.dispatch(request)
+                except Conflict as exc:
+                    return exc
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(write, requests))
+        self.assertEqual(sum(isinstance(outcome, Conflict) for outcome in outcomes), 1)
+        winner = next(i for i, outcome in enumerate(outcomes) if isinstance(outcome, dict))
+        state = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
+        self.assertEqual((state["revision"], state["snapshot"]), (2, requests[winner]["snapshot"]))
+        self.assertEqual(self.store.dispatch(requests[winner]), outcomes[winner])
+        events = self.store.dispatch({"method": "workspace.events", "workspace": "Test"})["events"]
+        self.assertEqual([event["revision"] for event in events if event["kind"] == "layout.updated"], [1, 2])
+
     def test_rename_preserves_panes_fences_old_name_and_replays(self):
         self.put(panes=[A])
         request = {"method": "workspace.rename", "workspace": "Test", "destination": "Renamed",
@@ -55,7 +89,7 @@ class RemoteStoreTests(unittest.TestCase):
         self.assertEqual(self.store.dispatch(request), result)
         self.assertFalse(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
         new = self.store.dispatch({"method": "workspace.get", "workspace": "Renamed"})
-        self.assertEqual((new["snapshot"], new["panes"]), ("layout", [A]))
+        self.assertEqual((new["snapshot"], new["panes"]), (layout(A), [A]))
         self.assertGreater(new["revision"], 1)
         self.assertEqual(self.store.db.execute("SELECT workspace FROM observed_sessions WHERE pane=?", (A,)).fetchone()[0], "Renamed")
         with self.assertRaises(Conflict):
@@ -87,6 +121,7 @@ class RemoteStoreTests(unittest.TestCase):
         result = self.store.dispatch({"method": "workspace.rename", "workspace": "Test", "destination": "Renamed",
                                       "revision": 1, "request_id": "rename-one"})
         self.assertGreater(result["revision"], 99)
+        self.store.db.execute("INSERT INTO workspace_kills VALUES (?)", ("Renamed",))
         with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.store.observe_detached()
         self.assertFalse(self.store.dispatch({"method": "workspace.get", "workspace": "Renamed"})["exists"])
@@ -103,16 +138,16 @@ class RemoteStoreTests(unittest.TestCase):
             self.store.dispatch({"method": "pane.reserve", "workspace": "Test", "pane": B,
                                  "request_id": "reserve", "revision": 1})
         request = {"method": "workspace.stage", "workspace": "Test", "revision": 1,
-                   "snapshot": "staged layout", "panes": [A, B]}
+                   "snapshot": layout(A, B, label="staged"), "panes": [A, B]}
         self.assertEqual(self.store.dispatch(request), self.store.dispatch(request))
         state = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
-        self.assertEqual((state["revision"], state["snapshot"], state["panes"]), (1, "layout", [A]))
-        self.assertEqual(state["staged"]["snapshot"], "staged layout")
+        self.assertEqual((state["revision"], state["snapshot"], state["panes"]), (1, layout(A), [A]))
+        self.assertEqual(state["staged"]["snapshot"], request["snapshot"])
         with self.assertRaises(Conflict):
             self.store.dispatch({**request, "revision": 0})
         self.put("publish", revision=1, panes=[A, B])
         state = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
-        self.assertEqual(state["staged"]["snapshot"], "staged layout")
+        self.assertEqual(state["staged"]["snapshot"], request["snapshot"])
 
     def test_stage_recovery_requires_every_session_and_matching_reservations(self):
         self.put(panes=[A])
@@ -120,7 +155,7 @@ class RemoteStoreTests(unittest.TestCase):
         with patch("kzw.remote.subprocess.run", return_value=missing_b):
             self.store.dispatch({"method": "pane.reserve", "workspace": "Test", "pane": B,
                                  "request_id": "reserve", "revision": 1})
-        request = {"workspace": "Test", "revision": 1, "snapshot": "staged", "panes": [A, B]}
+        request = {"workspace": "Test", "revision": 1, "snapshot": layout(A, B, label="staged"), "panes": [A, B]}
         self.store.dispatch({**request, "method": "workspace.stage"})
         recover = {**request, "method": "workspace.recover-stage", "request_id": "recovery"}
         with patch("kzw.remote.subprocess.run", return_value=missing_b):
@@ -151,25 +186,27 @@ class RemoteStoreTests(unittest.TestCase):
                 self.store.dispatch({"method": "workspace.status", "workspace": "Test"})
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [A, B])
 
-    def test_detached_observer_records_confirmed_absence_and_retires(self):
+    def test_detached_observer_records_absence_without_retiring(self):
         self.put(panes=[A])
         with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.store.observe_detached()
         state = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
-        self.assertFalse(state["exists"])
+        self.assertTrue(state["exists"])
+        self.assertEqual(state["panes"], [A])
         events = self.store.dispatch({"method": "workspace.events", "workspace": "Test"})["events"]
         self.assertTrue(any(event["kind"] == "session.missing" and event["data"]["pane"] == A
                             for event in events))
-        self.assertTrue(any(event["kind"] == "workspace.retired" for event in events))
+        self.assertFalse(any(event["kind"] == "workspace.retired" for event in events))
 
     def test_recreate_uses_new_revision_and_dormant_is_not_retired(self):
         self.put(panes=[A])
+        self.store.db.execute("INSERT INTO workspace_kills VALUES (?)", ("Test",))
         with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.store.observe_detached()
             retired = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
             self.assertFalse(retired["exists"])
             stale = {"method": "workspace.put", "workspace": "Test", "request_id": "stale",
-                     "revision": 1, "snapshot": "old", "panes": []}
+                     "revision": 1, "snapshot": layout(), "panes": []}
             with self.assertRaises(Conflict):
                 self.store.dispatch(stale)
             new = {**stale, "request_id": "new", "revision": retired["revision"],
@@ -291,8 +328,9 @@ class RemoteStoreTests(unittest.TestCase):
             self.store.dispatch({"method": "workspace.status", "workspace": "Test"})
         events = self.store.dispatch({"method": "workspace.events", "workspace": "Test",
                                       "after": initial["event_cursor"]})["events"]
-        self.assertEqual([(event["kind"], event["data"]) for event in events],
-                         [("session.missing", {"pane": B})])
+        self.assertEqual([(event["kind"], event["data"]["pane"]) for event in events], [("session.missing", B)])
+        self.assertEqual(events[0]["data"]["inventory_generation"], 2)
+        self.assertIn("socket_base", events[0]["data"]["source"])
         path = Path(self.temp.name) / "private" / "state.sqlite"
         self.store.close()
         self.store = Store(path)
@@ -319,8 +357,7 @@ class RemoteStoreTests(unittest.TestCase):
         with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             result = self.store.dispatch({"method": "workspace.events.wait", "workspace": "Test",
                                           "after": cursor, "timeout": 1})
-        self.assertEqual([(e["kind"], e["data"]) for e in result["events"]],
-                         [("session.missing", {"pane": A})])
+        self.assertEqual([(e["kind"], e["data"]["pane"]) for e in result["events"]], [("session.missing", A)])
 
     def test_event_wait_listing_failure_does_not_record_absence(self):
         self.put(panes=[A])
@@ -346,7 +383,7 @@ class RemoteStoreTests(unittest.TestCase):
 
     def test_not_ready_response_explicitly_identifies_rolled_back_registration(self):
         request = {"method": "workspace.put", "workspace": "Test", "request_id": "test", "revision": 0,
-                   "snapshot": "layout", "panes": [A, B]}
+                   "snapshot": layout(A, B), "panes": [A, B]}
         with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, A + "\n", "")):
             result = response(self.store, json.dumps(request).encode())
         self.assertFalse(result["ok"])
@@ -371,7 +408,7 @@ class RemoteStoreTests(unittest.TestCase):
         with patch("kzw.remote.subprocess.run", return_value=listing):
             with self.assertRaises(Conflict):
                 self.store.dispatch({"method": "workspace.put", "workspace": "other", "request_id": "steal",
-                                     "revision": 0, "snapshot": "layout", "panes": [pane]})
+                                     "revision": 0, "snapshot": layout(pane), "panes": [pane]})
             self.put("register", revision=1, panes=[A, B, pane])
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["reservations"], [])
 
@@ -384,14 +421,14 @@ class RemoteStoreTests(unittest.TestCase):
     def test_explicit_close_records_intent_before_cleanup(self):
         self.put()
         req = {"method": "panes.close", "workspace": "Test", "request_id": "close-B", "revision": 1,
-               "snapshot": "new layout", "panes": [A], "remove": [B]}
+               "snapshot": layout(A), "panes": [A], "remove": [B]}
         self.assertEqual(self.store.dispatch(req)["pending_cleanup"], [B])
         self.assertEqual(self.store.dispatch(req)["revision"], 2)
         self.assertEqual(self.store.dispatch({"method": "cleanup.list", "workspace": "Test"})["panes"], [B])
         events = self.store.dispatch({"method": "workspace.events", "workspace": "Test", "after": 0})["events"]
-        layout = events[-1]
-        self.assertEqual((layout["data"]["reason"], layout["data"]["pending_cleanup"]), ("managed_close", [B]))
-        cursor = layout["seq"]
+        update = events[-1]
+        self.assertEqual((update["data"]["reason"], update["data"]["pending_cleanup"]), ("managed_close", [B]))
+        cursor = update["seq"]
         listing = subprocess.CompletedProcess([], 0, B + "\n", "")
         failed = subprocess.CompletedProcess([], 1, "", "not available")
         with patch("kzw.remote.subprocess.run", side_effect=[listing, failed]):
@@ -409,7 +446,7 @@ class RemoteStoreTests(unittest.TestCase):
     def test_pending_panes_cannot_be_readopted(self):
         self.put()
         self.store.dispatch({"method": "panes.close", "workspace": "Test", "request_id": "close", "revision": 1,
-                             "snapshot": "new", "panes": [A], "remove": [B]})
+                             "snapshot": layout(A), "panes": [A], "remove": [B]})
         with self.assertRaises(Conflict):
             self.put("three", revision=2)
 
@@ -417,13 +454,13 @@ class RemoteStoreTests(unittest.TestCase):
         self.put()
         with self.assertRaises(Conflict):
             self.store.dispatch({"method": "workspace.put", "workspace": "other", "request_id": "one",
-                                 "revision": 0, "snapshot": "other", "panes": [B]})
+                                 "revision": 0, "snapshot": layout(B), "panes": [B]})
 
     def test_close_rejects_unowned_pane(self):
         self.put()
         with self.assertRaises(ValueError):
             self.store.dispatch({"method": "panes.close", "workspace": "Test", "request_id": "close", "revision": 1,
-                                 "snapshot": "new", "panes": [A], "remove": ["kzw-" + "c" * 32]})
+                                 "snapshot": layout(A), "panes": [A], "remove": ["kzw-" + "c" * 32]})
 
     def test_lease_fences_old_and_unidentified_writers(self):
         self.put()
@@ -437,14 +474,14 @@ class RemoteStoreTests(unittest.TestCase):
             with self.assertRaises(Conflict):
                 self.put("unidentified", revision=1)
             self.store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "owner",
-                                 "revision": 1, "snapshot": "new", "panes": [A, B], "lease_token": token1})
+                                 "revision": 1, "snapshot": layout(A, B), "panes": [A, B], "lease_token": token1})
         with patch("kzw.remote.time.time", return_value=131):
             with self.assertRaises(Conflict):
                 self.store.dispatch({"method": "workspace.lease.renew", "workspace": "Test", "token": token1})
             self.assertTrue(self.store.dispatch({**acquire, "token": token2})["held"])
             with self.assertRaises(Conflict):
                 self.store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "stale",
-                                     "revision": 2, "snapshot": "stale", "panes": [A, B], "lease_token": token1})
+                                     "revision": 2, "snapshot": layout(A, B), "panes": [A, B], "lease_token": token1})
             with self.assertRaises(Conflict):
                 self.store.dispatch({"method": "cleanup.retry", "workspace": "Test", "lease_token": token1})
 
@@ -460,25 +497,32 @@ class RemoteStoreTests(unittest.TestCase):
 
 
 class RemoteServerTests(unittest.TestCase):
+    def server_env(self, directory):
+        """Process-level protocol tests use a stub, never the user's real zmx."""
+        fake_bin = Path(directory) / "bin"
+        fake_bin.mkdir()
+        zmx = fake_bin / "zmx"
+        zmx.write_text('#!/bin/sh\n[ "$1 $2" = "list --short" ] || exit 99\nexit 0\n')
+        zmx.chmod(0o700)
+        env = os.environ.copy()
+        for key in ("ZMX_SESSION", "ZMX_SESSION_PREFIX", "KZW_LOCAL_COORDINATOR", "KZW_COORDINATOR_SOURCE"):
+            env.pop(key, None)
+        env.update(XDG_STATE_HOME=directory, ZMX_DIR=str(Path(directory) / "zmx"), HOME=directory,
+                   PATH=str(fake_bin) + os.pathsep + env.get("PATH", ""))
+        return env
+
     def test_server_observes_absence_without_connected_clients(self):
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="ks-", dir=cache) as directory:
             root = Path(directory) / "kzw"
             root.mkdir(mode=0o700)
-            fake_bin = Path(directory) / "bin"
-            fake_bin.mkdir()
-            zmx = fake_bin / "zmx"
-            zmx.write_text("#!/bin/sh\nexit 0\n")
-            zmx.chmod(0o700)
             store = Store(root / "remote.sqlite3")
             store.db.execute("INSERT INTO workspaces VALUES (?,?,?,?)", ("Test", 1, "layout", json.dumps([A])))
             store.db.execute("INSERT INTO observed_sessions VALUES (?,?)", ("Test", A))
             store.db.execute("INSERT INTO session_presence VALUES (?,?,?)", ("Test", A, 1))
             store.close()
-            env = os.environ.copy()
-            env.update(XDG_STATE_HOME=directory, PATH=str(fake_bin) + os.pathsep + env.get("PATH", ""), HOME=directory)
-            env.pop("KZW_LOCAL_COORDINATOR", None)
+            env = self.server_env(directory)
             server = subprocess.Popen([sys.executable, "-m", "kzw.remote", "--serve"], env=env,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
@@ -508,8 +552,8 @@ class RemoteServerTests(unittest.TestCase):
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="ks-", dir=cache) as directory:
-            env = os.environ.copy()
-            env.update({"XDG_STATE_HOME": directory, "KZW_COORDINATOR_SOURCE": "old-build"})
+            env = self.server_env(directory)
+            env["KZW_COORDINATOR_SOURCE"] = "old-build"
             server = subprocess.Popen([sys.executable, "-m", "kzw.remote", "--serve"], env=env,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
@@ -540,8 +584,7 @@ class RemoteServerTests(unittest.TestCase):
             root.mkdir(mode=0o700)
             path = root / "server.sock"
             path.write_text("do not replace")
-            env = os.environ.copy()
-            env["XDG_STATE_HOME"] = directory
+            env = self.server_env(directory)
             result = subprocess.run([sys.executable, "-m", "kzw.remote", "--serve"], env=env,
                                     capture_output=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
@@ -551,8 +594,7 @@ class RemoteServerTests(unittest.TestCase):
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="ks-", dir=cache) as directory:
-            env = os.environ.copy()
-            env["XDG_STATE_HOME"] = directory
+            env = self.server_env(directory)
             def call(req):
                 proc = subprocess.run([sys.executable, "-m", "kzw.remote"], env=env,
                                       input=json.dumps(req, separators=(",", ":")) + "\n",
@@ -560,7 +602,7 @@ class RemoteServerTests(unittest.TestCase):
                 return json.loads(proc.stdout)
             try:
                 request = {"method": "workspace.put", "workspace": "Test", "request_id": "create",
-                           "revision": 0, "snapshot": "layout", "panes": []}
+                           "revision": 0, "snapshot": layout(), "panes": []}
                 self.assertEqual(call(request)["result"]["revision"], 1)
                 self.assertEqual(call({"method": "workspace.get", "workspace": "Test"})["result"]["panes"], [])
             finally:
@@ -575,8 +617,7 @@ class RemoteServerTests(unittest.TestCase):
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="ks-", dir=cache) as directory:
-            env = os.environ.copy()
-            env["XDG_STATE_HOME"] = directory
+            env = self.server_env(directory)
             server = subprocess.Popen([sys.executable, "-m", "kzw.remote", "--serve"], env=env,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
@@ -605,8 +646,7 @@ class RemoteServerTests(unittest.TestCase):
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="ks-", dir=cache) as directory:
-            env = os.environ.copy()
-            env["XDG_STATE_HOME"] = directory
+            env = self.server_env(directory)
             server = subprocess.Popen([sys.executable, "-m", "kzw.remote", "--serve"], env=env,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
@@ -625,7 +665,7 @@ class RemoteServerTests(unittest.TestCase):
                             return json.loads(reader.readline())
 
                 created = call({"method": "workspace.put", "workspace": "Test", "request_id": "create",
-                                "revision": 0, "snapshot": "layout", "panes": []})
+                                "revision": 0, "snapshot": layout(), "panes": []})
                 self.assertEqual(created["result"]["revision"], 1)
                 read = call({"method": "workspace.get", "workspace": "Test"})
                 self.assertEqual(read["result"]["panes"], [])
