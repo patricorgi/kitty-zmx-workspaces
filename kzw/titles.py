@@ -11,7 +11,8 @@ from .core import PANE
 
 # The same template is used by private instances and by the tab-style kitten
 # that temporarily configures a shared instance.
-TAB_TITLE_TEMPLATE = "{title.replace('kzw-pane', '…').replace(' │ ', ' · ')}  {fmt.nobold}{fmt.noitalic}{index}"
+ACTIVE_TAB_TITLE_TEMPLATE = " {index} {title.replace('kzw-pane', '…').replace(' │ ', '·').replace(' · ', '·')} "
+TAB_TITLE_TEMPLATE = ACTIVE_TAB_TITLE_TEMPLATE.replace("{index}", "{fmt.fg._9399b2}{index}{fmt.fg.tab}")
 
 
 def parse_process_details(zmx_list, ps_output):

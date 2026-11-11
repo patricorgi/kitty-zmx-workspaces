@@ -19,6 +19,11 @@ def tree(panes):
 
 
 class ManagedCreateTests(unittest.TestCase):
+    def setUp(self):
+        lookup = patch("kzw.shell_cwd.from_session", return_value="")
+        self.cwd_lookup = lookup.start()
+        self.addCleanup(lookup.stop)
+
     def test_local_bootstrap_recovery_requires_original_session_after_launch(self):
         from kzw.cli import EMPTY_SNAPSHOT, mark_bootstrap_launching, prepare_bootstrap, recover_bootstrap
         with tempfile.TemporaryDirectory() as tmp:
@@ -109,15 +114,14 @@ class ManagedCreateTests(unittest.TestCase):
             for number in range(1, 11):
                 self.assertIn(f"map super+{number % 10} goto_tab {number}", popen.call_args.args[0])
             for option in ("tab_title_template", "active_tab_title_template"):
-                self.assertIn(f"{option}={{title.replace('kzw-pane', '…').replace(' │ ', ' · ')}}  {{fmt.nobold}}{{fmt.noitalic}}{{index}}",
-                              popen.call_args.args[0])
                 template = next(arg.split("=", 1)[1] for arg in popen.call_args.args[0]
                                 if arg.startswith(option + "="))
-                for index, suffix in ((1, "  1"), (9, "  9"), (10, "  10"), (11, "  11")):
+                for index in (1, 9, 10, 11):
                     with self.subTest(option=option, index=index):
-                        rendered = eval('f' + repr(template), {"title": "bash", "index": index,
-                                        "fmt": types.SimpleNamespace(nobold="", noitalic="")})
-                        self.assertEqual(rendered, "bash" + suffix)
+                        fmt = types.SimpleNamespace(fg=types.SimpleNamespace(_9399b2="<gray>", tab="<title>"))
+                        rendered = eval('f' + template, {"title": "bash", "index": index, "fmt": fmt})
+                        expected = f" <gray>{index}<title> bash " if option == "tab_title_template" else f" {index} bash "
+                        self.assertEqual(rendered, expected)
             self.assertEqual(json.loads(popen.call_args.kwargs["env"]["KZW_INHERIT_MARKER"]),
                              ["function", "helpers/privacy_marker.py"])
             title_stop.set.assert_called_once()
@@ -139,6 +143,24 @@ class ManagedCreateTests(unittest.TestCase):
             self.assertFalse((Path(tmp) / "pending-create.json").exists())
             self.assertEqual(output.getvalue(), "pane_created:" + "b" * 32 + "\n")
 
+    def test_every_creation_uses_the_selected_session_cwd(self):
+        for kind in ("right", "below", "split", "tab"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp, \
+                 patch("kzw.cli.state_dir", return_value=Path(tmp)), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.uuid.uuid4") as uid, patch("kzw.cli.capture_locked"), \
+                 patch("kzw.cli.zmx_command", return_value=""), \
+                 patch("kzw.shell_cwd.resolve") as reported, \
+                 patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query:
+                uid.return_value.hex = "b" * 32
+                self.cwd_lookup.return_value = "/tmp/current directory's name"
+                create_pane("Test", kind, 1, A, "", cwd_uri="file://old/stale")
+                self.cwd_lookup.assert_called_with(A, "")
+                reported.assert_not_called()
+                launched = query.call_args_list[1].args
+                self.assertEqual(launched[launched.index("--match") + 1], "window_id:1")
+                self.assertEqual(launched[launched.index("--initial-cwd") + 1], self.cwd_lookup.return_value)
+
     def test_automatic_split_uses_managed_creation(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
@@ -151,6 +173,40 @@ class ManagedCreateTests(unittest.TestCase):
             create_pane("Test", "split", 1, A, "")
             self.assertIn("--location=split", query.call_args_list[1].args)
             self.assertEqual(capture.call_args.kwargs["expected_panes"], {1: (A, ""), 2: (B, "")})
+            self.assertFalse((Path(tmp) / "pending-create.json").exists())
+
+    def test_cwd_lookup_failure_uses_validated_report_or_default(self):
+        self.cwd_lookup.side_effect = ValueError("process is unavailable")
+        for reported_cwd in ("/reported directory", ValueError("wrong origin")):
+            with self.subTest(cwd=reported_cwd), tempfile.TemporaryDirectory() as tmp, \
+                 patch("kzw.cli.state_dir", return_value=Path(tmp)), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.uuid.uuid4") as uid, patch("kzw.cli.capture_locked"), \
+                 patch("kzw.cli.zmx_command", return_value=""), \
+                 patch("kzw.shell_cwd.resolve", side_effect=[reported_cwd]) as reported, \
+                 patch("sys.stderr", new_callable=io.StringIO) as errors, \
+                 patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query:
+                uid.return_value.hex = "b" * 32
+                create_pane("Test", "tab", 1, A, "", cwd_uri="file://origin/reported")
+                reported.assert_called_once_with("file://origin/reported", "")
+                launched = query.call_args_list[1].args
+                if isinstance(reported_cwd, str):
+                    self.assertEqual(launched[launched.index("--initial-cwd") + 1], reported_cwd)
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertNotIn("--initial-cwd", launched)
+                    self.assertIn("using default", errors.getvalue())
+
+    def test_wrong_origin_cannot_probe_or_create(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("kzw.cli.state_dir", return_value=Path(tmp)), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.capture_locked"), \
+             patch("kzw.cli.query", return_value=json.dumps(tree([(1, A)]))) as query:
+            with self.assertRaisesRegex(ValueError, "target changed"):
+                create_pane("Test", "tab", 1, A, "another-host")
+            self.assertEqual(query.call_count, 1)
+            self.cwd_lookup.assert_not_called()
             self.assertFalse((Path(tmp) / "pending-create.json").exists())
 
     def test_failed_launch_keeps_journal_and_blocks_close_and_detach(self):
@@ -193,6 +249,7 @@ class ManagedCreateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "target changed"):
                 create_pane("Test", "below", 1, A, "")
             self.assertEqual(query.call_count, 1)
+            self.cwd_lookup.assert_not_called()
             self.assertFalse((Path(tmp) / "pending-create.json").exists())
 
     def test_creation_waits_for_workspace_mutation_lock(self):

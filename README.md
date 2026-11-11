@@ -109,7 +109,9 @@ Managed closes ask for confirmation and terminate the selected sessions;
 unmanaged pane and tab closes are unsupported. Automatic splitting uses Kitty's
 `splits` layout; other layouts determine their own placement. Tab titles list
 split processes separated by `·`; `?` means a process is unknown. Tab numbers appear
-after the title; Kitty may truncate them when space is limited.
+before the title, with compact process separators such as `bash·nvim`.
+New tabs and splits stay in the selected pane's workspace and inherit its zmx
+shell's current directory on the origin host, without requiring shell integration.
 
 ## Limitations
 
@@ -129,7 +131,8 @@ after the title; Kitty may truncate them when space is limited.
 - zmx may briefly recreate a vanished session.
 - Bash command tracking needs an opt-in hook.
 - Shell metadata may be missing or stale.
-- Remote cwd inheritance is not yet verified.
+- Unavailable cwd falls back to the default.
+- Nested SSH cwd is not the origin shell's cwd.
 - Bash command files are not pruned automatically.
 - Per-window marker color changes are not copied.
 - Marker masking can start after a pane appears.

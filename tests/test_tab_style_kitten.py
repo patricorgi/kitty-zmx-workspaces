@@ -52,6 +52,18 @@ class TabStyleKittenTests(unittest.TestCase):
     def test_template_matches_private_instance(self):
         kitten, _ = load_kitten()
         self.assertEqual(kitten.TEMPLATE, titles.TAB_TITLE_TEMPLATE)
+        self.assertEqual(kitten.ACTIVE_TEMPLATE, titles.ACTIVE_TAB_TITLE_TEMPLATE)
+
+    def test_template_prefixes_index_and_compacts_existing_split_titles(self):
+        kitten, _ = load_kitten()
+        template = compile('f' + repr(kitten.ACTIVE_TEMPLATE), '<tab-title>', 'eval')
+        for title, expected in (
+                ('opencode', ' 1 opencode '),
+                ('bash · nvim', ' 1 bash·nvim '),
+                ('ssh │ ssh │ ssh', ' 1 ssh·ssh·ssh '),
+                ('kzw-pane', ' 1 … ')):
+            with self.subTest(title=title):
+                self.assertEqual(eval(template, {'index': 1, 'title': title}), expected)
 
     def test_apply_saves_originals_once_and_sets_plain_index(self):
         kitten, holder = load_kitten()
@@ -64,7 +76,7 @@ class TabStyleKittenTests(unittest.TestCase):
             self.assertEqual(saved["tab_title_template"], "user {title}")
             self.assertIsNone(saved["active_tab_title_template"])
             self.assertEqual(opts.tab_title_template, kitten.TEMPLATE)
-            self.assertEqual(opts.active_tab_title_template, kitten.TEMPLATE)
+            self.assertEqual(opts.active_tab_title_template, kitten.ACTIVE_TEMPLATE)
             self.assertEqual(opts.active_tab_font_style, (True, True))
             fake.apply_new_options.assert_not_called()
             fake.os_window_map[1].tab_bar.apply_options.assert_called_once_with()

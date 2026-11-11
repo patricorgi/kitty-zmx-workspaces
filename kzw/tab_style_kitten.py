@@ -21,9 +21,14 @@ try:  # Kitty 0.50+
 except ImportError:  # pragma: no cover - older Kitty exposes boss.opts
     get_options = None
 
-TEMPLATE = "{title.replace('kzw-pane', '…').replace(' │ ', ' · ')}  {fmt.nobold}{fmt.noitalic}{index}"
+ACTIVE_TEMPLATE = " {index} {title.replace('kzw-pane', '…').replace(' │ ', '·').replace(' · ', '·')} "
+TEMPLATE = ACTIVE_TEMPLATE.replace("{index}", "{fmt.fg._9399b2}{index}{fmt.fg.tab}")
 PANE = re.compile(r"^kzw-[0-9a-f]{32}$")
-ORIGINALS = ("tab_title_template", "active_tab_title_template")
+APPLIED_TEMPLATES = {
+    "tab_title_template": TEMPLATE,
+    "active_tab_title_template": ACTIVE_TEMPLATE,
+}
+ORIGINALS = tuple(APPLIED_TEMPLATES)
 
 
 def main(args):
@@ -92,8 +97,8 @@ def refresh_tab_bars(boss):
 
 
 def apply(options, boss):
-    options.tab_title_template = TEMPLATE
-    options.active_tab_title_template = TEMPLATE
+    for name, template in APPLIED_TEMPLATES.items():
+        setattr(options, name, template)
     refresh_tab_bars(boss)
 
 
@@ -118,9 +123,9 @@ def handle_result(args, answer, target_window_id, boss):
         originals = read_originals(path)
         if managed_pane(boss):
             return "busy"
-        for name in ORIGINALS:
+        for name, template in APPLIED_TEMPLATES.items():
             # Preserve any runtime configuration change made while attached.
-            if getattr(options, name) == TEMPLATE:
+            if getattr(options, name) == template:
                 setattr(options, name, originals[name])
         refresh_tab_bars(boss)
         path.unlink()
