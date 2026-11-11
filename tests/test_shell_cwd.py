@@ -47,6 +47,33 @@ class ShellCwdTests(unittest.TestCase):
                 shell_cwd.resolve('file://other/home/user/work', 'origin')
         self.assertEqual(run.call_args.args[0][:5], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5'])
 
+    def test_cwd_validation_rejects_malformed_reports_before_querying_origin(self):
+        cases = (None, b'file://host/tmp', 'x' * 8193, '/tmp', 'https://host/tmp',
+                 'file:///tmp', 'file://user@host/tmp', 'file://user:pass@host/tmp',
+                 'file://host:22/tmp', 'file://host/tmp?q=1', 'file://host/tmp#part',
+                 'file://host/tmp/%00', 'file://host/tmp/%7f', 'file://host/tmp/%ff',
+                 'kitty-shell-cwd://host', 'kitty-shell-cwd://bad@host/tmp',
+                 'kitty-shell-cwd://host/tmp/\x00')
+        with patch('kzw.shell_cwd.subprocess.run') as run:
+            for uri in cases:
+                with self.subTest(uri=repr(uri)[:100]), self.assertRaises(ValueError):
+                    shell_cwd.resolve(uri, 'origin')
+            with self.assertRaises(ValueError):
+                shell_cwd.resolve('file://host/tmp', '-origin')
+            run.assert_not_called()
+
+    def test_cwd_host_normalization_and_failed_verification(self):
+        with patch('kzw.shell_cwd.socket.gethostname', return_value='Host.'), \
+             patch('kzw.shell_cwd.socket.getfqdn', return_value='Host.Example.'):
+            for name in ('HOST.', 'host.example', 'localhost'):
+                with self.subTest(name=name):
+                    self.assertEqual(shell_cwd.resolve('file://' + name + '/tmp/a%20b', ''), '/tmp/a b')
+        for failure in (OSError('offline'), subprocess.TimeoutExpired('ssh', 10),
+                        subprocess.CalledProcessError(255, 'ssh')):
+            with self.subTest(failure=type(failure).__name__), \
+                 patch('kzw.shell_cwd.subprocess.run', side_effect=failure), self.assertRaises(type(failure)):
+                shell_cwd.resolve('file://origin/tmp', 'origin')
+
     def test_new_remote_session_quotes_cwd_without_injecting_commands(self):
         cwd = "/tmp/a b';touch /tmp/not-run"
         with patch.dict('os.environ', {}, clear=True), \
@@ -63,3 +90,12 @@ class ShellCwdTests(unittest.TestCase):
         with patch('sys.argv', ['kzw-pane', '--pane', PANE, '--existing', '--stage-new', '--initial-cwd', '/tmp']), \
              patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
             pane.main()
+
+    def test_ssh_mux_noise_is_filtered_but_failures_remain_visible(self):
+        noisy = ('mux_client_request_session: session request failed: Session open refused by peer\n'
+                 'ControlSocket /tmp/example already exists, disabling multiplexing\n'
+                 'Permission denied (publickey).\n')
+        with patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            result = pane.run_attachment(['/bin/sh', '-c', 'printf %s "$1" >&2', 'sh', noisy], {}, True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(stderr.getvalue(), 'Permission denied (publickey).\n')

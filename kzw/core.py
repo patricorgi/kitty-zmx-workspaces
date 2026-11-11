@@ -11,6 +11,11 @@ NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 PANE = re.compile(r"^kzw-[0-9a-f]{32}$")
 FLAG = "kitty-unserialize-data="
 FOCUS_PREFIX = "# kzw-focus "
+# Per-view metadata that must never become part of the authoritative snapshot.
+TRANSIENT_VARS = ("kzw_attach_ended", "kzw_staging", "kzw_command_state", "kzw_shell_cwd",
+                  "kzw_workspace", "kzw_origin", "kzw_directory", "kzw_signal",
+                  "kzw_coordinator", "kzw_marker")
+TRANSIENT_ENV_PREFIX = "--env=KZW_"
 
 
 def check_name(name):
@@ -94,7 +99,9 @@ def rewrite_export(text, panes, pane_executable):
             if not arg.startswith("--"):
                 break
             # Kitty's serializer writes every option as --name=value or a flag.
-            if not arg.startswith(("--var=kzw_attach_ended=", "--var=kzw_staging=", "--var=kzw_command_state=", "--var=kzw_shell_cwd=")):
+            transient = arg.startswith(TRANSIENT_ENV_PREFIX) or any(
+                arg.startswith("--var=" + name + "=") for name in TRANSIENT_VARS)
+            if not transient:
                 options.append(arg)
         pane, host = panes[window_id]
         command = [pane_executable, "--pane", pane, "--host", host, "--existing"]

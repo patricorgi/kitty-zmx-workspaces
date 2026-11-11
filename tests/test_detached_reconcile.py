@@ -46,20 +46,21 @@ class DetachedReconcileTests(unittest.TestCase):
         self.listing.start()
         self.addCleanup(self.listing.stop)
 
-    def test_reconciles_missing_and_abandoned_reservation(self):
-        remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
+    def test_missing_and_abandoned_reservation_are_preserved(self):
+        with self.assertRaisesRegex(ValueError, 'automatic reconciliation is disabled'):
+            remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
         result = self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})
-        self.assertEqual(result['panes'], [A, C])
-        self.assertEqual(result['reservations'], [])
-        self.assertNotIn(B, result['snapshot'])
-        self.assertFalse((self.directory / 'native-pending' / (R + '.json')).exists())
+        self.assertEqual(result['panes'], [A, B, C])
+        self.assertEqual(result['reservations'], [R])
+        self.assertIn(B, result['snapshot'])
+        self.assertTrue((self.directory / 'native-pending' / (R + '.json')).exists())
         self.assertFalse((self.directory / 'reconcile-pending.json').exists())
 
     def test_server_rechecks_absence_and_rolls_back(self):
         req = {'method': 'workspace.reconcile', 'workspace': 'Test', 'revision': 1, 'request_id': 'test',
                'snapshot': 'unchanged', 'panes': [A, C], 'remove': [B], 'cancel_reservations': [R], 'lease_token': TOKEN}
         with patch('kzw.remote.subprocess.run', return_value=subprocess.CompletedProcess([], 0, A + '\n' + B + '\n', '')):
-            with self.assertRaises(Conflict):
+            with self.assertRaisesRegex(ValueError, 'disabled'):
                 self.store.dispatch(req)
         self.assertEqual(self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})['reservations'], [R])
 
@@ -72,7 +73,7 @@ class DetachedReconcileTests(unittest.TestCase):
 
     def test_live_reservation_cannot_be_cancelled(self):
         with patch('kzw.remote.subprocess.run', return_value=subprocess.CompletedProcess([], 0, A + '\n' + C + '\n' + R + '\n', '')):
-            with self.assertRaises(Conflict):
+            with self.assertRaisesRegex(ValueError, 'disabled'):
                 remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
         self.assertEqual(self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})['reservations'], [R])
         self.assertTrue((self.directory / 'native-pending' / (R + '.json')).exists())
@@ -81,21 +82,14 @@ class DetachedReconcileTests(unittest.TestCase):
         self.store.db.execute('INSERT INTO staged_layouts VALUES (?,?,?,?)', ('Test', 1, 'staged', json.dumps([A, B, C, R])))
         req = {'method': 'workspace.reconcile', 'workspace': 'Test', 'revision': 1, 'request_id': 'test',
                'snapshot': 'unchanged', 'panes': [A, C], 'remove': [B], 'cancel_reservations': [R], 'lease_token': TOKEN}
-        with self.assertRaises(Conflict):
+        with self.assertRaisesRegex(ValueError, 'disabled'):
             self.store.dispatch(req)
         self.assertEqual(self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})['reservations'], [R])
 
-    def test_lost_reply_replays_same_request(self):
-        dropped = [False]
-        def call(host, request):
-            result = self.store.dispatch(request)
-            if request['method'] == 'workspace.reconcile' and not dropped[0]:
-                dropped[0] = True
-                raise OSError('lost reply')
-            return result
-        with patch('kzw.remote_client.call', side_effect=call):
-            with self.assertRaises(OSError):
-                remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
-            self.assertTrue((self.directory / 'reconcile-pending.json').exists())
+    def test_uncertain_old_reconciliation_journal_is_not_replayed(self):
+        journal = self.directory / 'reconcile-pending.json'
+        journal.write_text(json.dumps({'workspace': 'Test', 'request': {'remove': [B]}}))
+        with self.assertRaisesRegex(ValueError, 'retained for manual inspection'):
             remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
-        self.assertEqual(self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})['revision'], 2)
+        self.assertTrue(journal.exists())
+        self.assertEqual(self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})['revision'], 1)

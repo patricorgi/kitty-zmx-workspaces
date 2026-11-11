@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 import subprocess
+import shutil
 import sys
 import threading
 import types
@@ -297,7 +298,7 @@ class RemoteClientTests(unittest.TestCase):
         remote_client.acquire_lease(first, "Test", "origin")
         with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             remote_client.reserve_pane(first, PANE, "a" * 32)
-        with self.assertRaisesRegex(ValueError, "incomplete pane creation"):
+        with self.assertRaisesRegex(ValueError, "automatic reconciliation is disabled"):
             remote_client.pull(second, "Test", "origin", "/bin/kzw-pane")
         self.assertFalse((second / "workspace.kitty-session").exists())
         remote_client.release_lease(first)
@@ -357,8 +358,9 @@ class RemoteClientTests(unittest.TestCase):
         def kitty(socket, *args):
             return export if args == ("ls", "--output-format=session") else json.dumps(tree)
         listing = subprocess.CompletedProcess([], 0, PANE + "\n" + second + "\n", "")
+        which = shutil.which
         with patch("kzw.cli.state_dir", return_value=directory), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", side_effect=lambda name, **kw: "/bin/kzw-pane" if name == "kzw-pane" else which(name, **kw)), \
              patch("kzw.cli.query", side_effect=kitty), \
              patch("kzw.cli.zmx_command", return_value=second + "\n"), \
              patch("kzw.remote.subprocess.run", return_value=listing):
@@ -524,7 +526,7 @@ class RemoteClientTests(unittest.TestCase):
         remote_client.create(directory, "Test", "origin")
         remote_client.ensure_current_revision(directory)
         self.store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "newer",
-                             "revision": 1, "snapshot": "newer snapshot", "panes": []})
+                             "revision": 1, "snapshot": "# kzw-empty-workspace\n", "panes": []})
         with self.assertRaisesRegex(ValueError, "revision changed"):
             remote_client.ensure_current_revision(directory)
 
@@ -541,7 +543,7 @@ class RemoteClientTests(unittest.TestCase):
             remote_client.create(directory, "Test", "origin")
         self.assertEqual((directory / "workspace.kitty-session").read_text(), "existing")
 
-    def test_prune_requires_confirmed_absence_on_origin(self):
+    def test_inventory_absence_cannot_authorize_or_journal_layout_removal(self):
         directory = self.directory("first")
         remote_client.create(directory, "Test", "origin")
         remote_client.publish(directory, SNAPSHOT, [PANE])
@@ -551,16 +553,17 @@ class RemoteClientTests(unittest.TestCase):
                 remote_client.publish(directory, "# kzw-empty-workspace\n", [], confirmed_exits=True)
         self.assertTrue(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"])
         absent = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with patch("kzw.remote.subprocess.run", return_value=absent):
+        with patch("kzw.remote.subprocess.run", return_value=absent), self.assertRaisesRegex(ValueError, "disabled"):
             remote_client.publish(directory, "# kzw-empty-workspace\n", [], confirmed_exits=True)
-        self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [])
+        self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [PANE])
+        self.assertNotIn("pending", json.loads((directory / "remote.json").read_text()))
 
     def test_prune_listing_failure_preserves_remote_manifest(self):
         directory = self.directory("first")
         remote_client.create(directory, "Test", "origin")
         remote_client.publish(directory, SNAPSHOT, [PANE])
         with patch("kzw.remote.subprocess.run", side_effect=OSError("zmx unavailable")):
-            with self.assertRaises(OSError):
+            with self.assertRaisesRegex(ValueError, "disabled"):
                 remote_client.publish(directory, "# kzw-empty-workspace\n", [], confirmed_exits=True)
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [PANE])
 

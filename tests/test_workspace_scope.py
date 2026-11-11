@@ -33,6 +33,24 @@ class WorkspaceScopeTests(unittest.TestCase):
         with patch('kzw.cli.subprocess.run', return_value=result), self.assertRaises(ValueError):
             cli.query('/socket', 'ls')
 
+    def test_explicit_os_window_scope_ignores_other_workspaces(self):
+        other = 'kzw-' + 'b' * 32
+        tree = [os_window(1, PANE), os_window(2, other), os_window(3)]
+        result = subprocess.CompletedProcess([], 0, json.dumps(tree), '')
+        with patch('kzw.cli.subprocess.run', return_value=result):
+            self.assertEqual([w['id'] for w in json.loads(cli.query('/socket', 'ls', workspace_os_id=1))], [1])
+            self.assertEqual([w['id'] for w in json.loads(cli.query('/socket', 'ls', workspace_os_id=2))], [2])
+            self.assertEqual(json.loads(cli.query('/socket', 'ls', workspace_os_id=4)), [])
+            with self.assertRaisesRegex(ValueError, 'invalid workspace'):
+                cli.query('/socket', 'ls', workspace_os_id=True)
+
+    def test_scoped_export_rejects_unmanaged_content(self):
+        target = os_window(1, PANE)
+        target['tabs'][0]['windows'].append({'id': 9, 'user_vars': {}})
+        result = subprocess.CompletedProcess([], 0, json.dumps([target, os_window(2, PANE)]), '')
+        with patch('kzw.cli.subprocess.run', return_value=result), self.assertRaisesRegex(ValueError, 'not managed'):
+            cli.query('/socket', 'ls', '--output-format=session', workspace_os_id=1)
+
     def test_unmanaged_pane_inside_workspace_prevents_export(self):
         workspace = os_window(1, PANE)
         workspace['tabs'][0]['windows'].append({'id': 9, 'user_vars': {}})
@@ -67,7 +85,7 @@ class WorkspaceScopeTests(unittest.TestCase):
                  patch('kzw.cli.query', return_value='[]'), patch('kzw.cli.time.sleep'), \
                  patch('kzw.cli.time.monotonic', side_effect=lambda: next(ticks)):
                 broker.return_value.path = root / 'rpc.sock'
-                self.assertEqual(cli.run('Test', 'origin', remote_attached=True), 0)
+                self.assertEqual(cli.run('Test', 'origin', remote_attached=True, new_instance=True), 0)
             child.terminate.assert_not_called()
             child.kill.assert_not_called()
             child.wait.assert_not_called()
@@ -104,6 +122,18 @@ class WorkspaceScopeTests(unittest.TestCase):
                 self.assertEqual(len(scoped), 1)
                 self.assertNotIn(utility, cli.pane_map(scoped))
                 self.assertEqual(cli.pane_map(scoped), {1: (PANE, '')})
+                workspace_os_id = scoped[0]['id']
+                other_pane = 'kzw-' + 'c' * 32
+                other = int(raw('launch', '--type=os-window', '--os-window-state=minimized',
+                                '--var=kzw_pane=' + other_pane, '--var=kzw_host=', '/bin/sh').strip())
+                with self.assertRaisesRegex(ValueError, 'multiple Kitty OS windows'):
+                    cli.query(sock, 'ls')
+                scoped = json.loads(cli.query(sock, 'ls', workspace_os_id=workspace_os_id))
+                self.assertEqual(cli.pane_map(scoped), {1: (PANE, '')})
+                scoped_export = cli.query(sock, 'ls', '--output-format=session', workspace_os_id=workspace_os_id)
+                self.assertEqual(sum(line.startswith('launch ') for line in scoped_export.splitlines()), 1)
+                self.assertNotIn(other_pane, scoped_export)
+                raw('close-window', '--match', f'id:{other}')
                 exported = cli.query(sock, 'ls', '--output-format=session')
                 self.assertEqual(sum(line.startswith('launch ') for line in exported.splitlines()), 1)
                 second_pane = 'kzw-' + 'b' * 32

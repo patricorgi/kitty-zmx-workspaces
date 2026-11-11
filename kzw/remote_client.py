@@ -1,6 +1,7 @@
 """Experimental single-writer remote workspace snapshots over OpenSSH."""
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -24,6 +25,8 @@ DORMANT = "# kzw-dormant-workspace\n"
 ORIGIN = "KZW_ORIGIN"
 EXECUTABLE = "KZW_PANE_EXECUTABLE"
 MAX_MESSAGE = 1024 * 1024
+LEASE_HEARTBEAT_INTERVAL = 5
+LEASE_RPC_TIMEOUT = 8
 _local = threading.local()
 _channel_lock = threading.RLock()
 
@@ -35,8 +38,13 @@ def origin_state_home(host):
 
 class RemoteRejected(ValueError):
     def __init__(self, message, code=None):
-        super().__init__(message)
+        self.message = message
+        super().__init__("remote coordinator: " + message)
         self.code = code
+
+
+class LeaseBusy(BlockingIOError):
+    pass
 
 
 def ssh_command(host):
@@ -133,7 +141,7 @@ def decode_response(data):
     if not isinstance(response, dict) or not response.get("ok"):
         if not isinstance(response, dict):
             raise ValueError("invalid remote coordinator response")
-        raise RemoteRejected("remote coordinator: " + str(response.get("error", "unknown error")), response.get("code"))
+        raise RemoteRejected(str(response.get("error", "unknown error")), response.get("code"))
     if "result" not in response:
         raise ValueError("invalid remote coordinator response")
     return response["result"]
@@ -150,8 +158,15 @@ def call(host, request):
 def direct_call(host, request):
     channels = getattr(_local, "channels", None)
     if channels is None:
-        proc = subprocess.run(coordinator_command(host), input=json.dumps(request, separators=(",", ":")) + "\n",
-                              text=True, capture_output=True, timeout=30, check=True)
+        try:
+            proc = subprocess.run(coordinator_command(host), input=json.dumps(request, separators=(",", ":")) + "\n",
+                                  text=True, capture_output=True, timeout=30, check=True)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("remote coordinator transport timed out; operation outcome may be unknown") from None
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or "").strip().splitlines()
+            message = f"remote coordinator transport exited with status {exc.returncode}; operation outcome may be unknown"
+            raise OSError(message + (": " + detail[-1][:500] if detail else "")) from None
         return decode_response(proc.stdout)
     key = (host, os.environ.get("KZW_REMOTE_STATE_HOME", "") if host else os.environ.get("XDG_STATE_HOME", ""))
     with _channel_lock:
@@ -235,7 +250,7 @@ class ConnectionBroker:
                     result = direct_call(self.host, msg["request"])
                     response = {"ok": True, "result": result}
                 except RemoteRejected as exc:
-                    response = {"ok": False, "error": str(exc), "code": exc.code}
+                    response = {"ok": False, "error": exc.message, "code": exc.code}
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     response = {"transport_error": str(exc)}
                 try:
@@ -341,7 +356,65 @@ def stage_layout(directory, snapshot, panes):
                                  "lease_token": token})
 
 
+@contextmanager
+def lease_lock(directory, blocking=True):
+    """Serialize token changes separately from potentially slow layout captures."""
+    with open(directory / "lease.lock", "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise LeaseBusy("workspace lease is being updated") from None
+        yield
+
+
+def read_lease(directory):
+    lease = json.loads((directory / "lease.json").read_text())
+    if not isinstance(lease.get("token"), str) or not re.fullmatch(r"[0-9a-f]{32}", lease["token"]):
+        raise ValueError("invalid local workspace lease")
+    if lease.get("state_home", "") != origin_state_home(lease["host"]):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    pending = lease.get("recovery_token")
+    if pending is not None and (not isinstance(pending, str) or not re.fullmatch(r"[0-9a-f]{32}", pending)
+                                or pending == lease["token"]):
+        raise ValueError("invalid pending workspace lease recovery")
+    return lease
+
+
+def finish_lease_recovery(directory, lease, request):
+    """A durable token pair identifies the same CAS after an uncertain reply."""
+    request({"method": "workspace.lease.recover", "workspace": lease["workspace"],
+             "previous_token": lease["token"], "token": lease["recovery_token"]})
+    lease["token"] = lease.pop("recovery_token")
+    atomic_write(directory / "lease.json", json.dumps(lease) + "\n")
+
+
+def maintain_lease(directory, request, identity):
+    """Renew or rotate only our own expired lease; never acquire another owner's."""
+    with lease_lock(directory, blocking=False):
+        lease = read_lease(directory)
+        if (lease["host"], lease["workspace"], lease.get("state_home", "")) != identity:
+            raise ValueError("workspace lease origin changed")
+        if "recovery_token" not in lease:
+            try:
+                request({"method": "workspace.lease.renew", "workspace": lease["workspace"], "token": lease["token"]})
+                return False
+            except RemoteRejected:
+                state = request({"method": "workspace.lease.inspect", "workspace": lease["workspace"],
+                                 "token": lease["token"]})["state"]
+                if state != "own-expired":
+                    raise ValueError("workspace lease is no longer ours; reconnect before changing the view") from None
+            lease["recovery_token"] = uuid.uuid4().hex
+            atomic_write(directory / "lease.json", json.dumps(lease) + "\n")
+        finish_lease_recovery(directory, lease, request)
+        return True
+
+
 def acquire_lease(directory, name, host):
+    with lease_lock(directory):
+        return acquire_lease_locked(directory, name, host)
+
+
+def acquire_lease_locked(directory, name, host):
     path = directory / "lease.json"
     config_path = directory / "remote.json"
     if config_path.exists():
@@ -356,6 +429,8 @@ def acquire_lease(directory, name, host):
         if (record.get("host") != host or record.get("workspace") != name or
                 record.get("state_home", "") != origin_state_home(host)):
             raise ValueError("local workspace lease has a conflicting origin")
+        if "recovery_token" in record:
+            finish_lease_recovery(directory, read_lease(directory), lambda req: call(host, req))
         token = lease_token(directory)
         state = call(host, {"method": "workspace.lease.inspect", "workspace": name, "token": token})["state"]
         if state in ("own-expired", "other-expired"):
@@ -381,6 +456,11 @@ def renew_lease(directory):
 
 
 def release_lease(directory):
+    with lease_lock(directory):
+        release_lease_locked(directory)
+
+
+def release_lease_locked(directory):
     path = directory / "lease.json"
     if not path.exists():
         return
@@ -388,37 +468,92 @@ def release_lease(directory):
     if lease.get("state_home", "") != origin_state_home(lease["host"]):
         raise ValueError("remote state directory differs from this workspace's origin")
     token = lease_token(directory)
-    call(lease["host"], {"method": "workspace.lease.release", "workspace": lease["workspace"], "token": token})
+    if "recovery_token" in lease:
+        # The rotation may have committed without its acknowledgement. Release
+        # only whichever of the journaled tokens the server still recognizes.
+        lease = read_lease(directory)
+        for candidate in (lease["recovery_token"], token):
+            state = call(lease["host"], {"method": "workspace.lease.inspect", "workspace": lease["workspace"],
+                                       "token": candidate})["state"]
+            if state in ("own-active", "own-expired"):
+                call(lease["host"], {"method": "workspace.lease.release", "workspace": lease["workspace"],
+                                    "token": candidate})
+                break
+        else:
+            raise ValueError("pending lease recovery was superseded; refusing to release another owner")
+    else:
+        call(lease["host"], {"method": "workspace.lease.release", "workspace": lease["workspace"], "token": token})
     if path.exists() and lease_token(directory) == token:
         path.unlink()
 
 
 def start_lease_heartbeat(directory):
-    lease = json.loads((directory / "lease.json").read_text())
-    token = lease_token(directory)
+    lease = read_lease(directory)
+    identity = (lease["host"], lease["workspace"], lease.get("state_home", ""))
     stop = threading.Event()
+    lock = threading.Lock()
+    active = [None]
 
     def heartbeat():
-        failed = False
-        with persistent_rpc():
-            while not stop.wait(5):
+        failed = None
+        channel = None
+        try:
+            while not stop.is_set():
                 try:
-                    call(lease["host"], {"method": "workspace.lease.renew", "workspace": lease["workspace"], "token": token})
-                    if failed:
+                    # Bypass both the pane broker and the global RPC lock.
+                    # A hung layout RPC must not consume the 30-second lease.
+                    if channel is None:
+                        with lock:
+                            if stop.is_set():
+                                break
+                            channel = Channel(coordinator_command(lease["host"]))
+                            active[0] = channel
+                    recovered = maintain_lease(directory, lambda req: channel.request(req, timeout=LEASE_RPC_TIMEOUT), identity)
+                    if recovered:
+                        print("kzw: workspace lease recovered; pending updates can resume", file=sys.stderr, flush=True)
+                    elif failed:
                         print("kzw: workspace lease renewed", file=sys.stderr, flush=True)
-                    failed = False
+                    failed = None
+                except LeaseBusy:
+                    # Acquisition or release owns the short token-change lock.
+                    pass
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                    if not failed:
+                    if stop.is_set():
+                        break
+                    if isinstance(exc, FileNotFoundError) and not (directory / "lease.json").exists():
+                        break
+                    if str(exc) != failed:
                         print(f"kzw: workspace lease renewal failed; remote mutations are fenced: {exc}",
                               file=sys.stderr, flush=True)
-                    failed = True
+                    failed = str(exc)
+                    if channel is not None:
+                        with lock:
+                            active[0] = None
+                        channel.close()
+                        channel = None
+                if stop.wait(LEASE_HEARTBEAT_INTERVAL):
+                    break
+        finally:
+            with lock:
+                active[0] = None
+            if channel is not None:
+                channel.close()
 
     thread = threading.Thread(target=heartbeat, name="kzw-lease", daemon=True)
     thread.start()
 
     def close():
         stop.set()
-        thread.join(timeout=1)
+        with lock:
+            channel = active[0]
+            if channel is not None and channel.process.poll() is None:
+                try:
+                    channel.process.terminate()
+                except ProcessLookupError:
+                    pass
+        thread.join(timeout=12)
+        if thread.is_alive():
+            raise OSError("workspace heartbeat did not stop; lease retained")
 
     return close
 
@@ -466,9 +601,9 @@ def publish(directory, snapshot, panes, confirmed_exits=False, confirmed_close=F
         removed = old_panes - set(parsed)
         if confirmed_close and removed != set(close_panes or []):
             raise ValueError("remote pane removal differs from confirmed close")
-        if removed and not (confirmed_exits or confirmed_close):
-            raise ValueError("remote pane removal requires a confirmed shell exit")
-        method = ("panes.close" if confirmed_close else "workspace.prune") if removed else "workspace.put"
+        if removed and not confirmed_close:
+            raise ValueError("automatic absence-based removal is disabled; use an explicit managed close")
+        method = "panes.close" if removed else "workspace.put"
         request = {"method": method, "workspace": name, "revision": config["revision"],
                    "request_id": uuid.uuid4().hex, "snapshot": portable, "panes": parsed}
         token = lease_token(directory)
@@ -604,7 +739,7 @@ def inert_legacy_artifacts(directory, ignored_names=()):
         if path.name in ignored_names:
             continue
         info = path.lstat()
-        if path.name in ("lock", "capture.lock", "watcher.changed"):
+        if path.name in ("lock", "capture.lock", "lease.lock", "watcher.changed"):
             if not stat.S_ISREG(info.st_mode) or info.st_size:
                 return False
         elif path.name == "native-pending":
@@ -632,11 +767,11 @@ def create(directory, name, host):
             remote = call(host, {"method": "workspace.get", "workspace": name})
             if remote["exists"] or remote.get("revision", 0) <= config.get("revision", 0):
                 raise ValueError("local workspace already exists; refusing to overwrite it")
-            allowed = {"lock", "capture.lock", "watcher.changed", "remote-status.changed", "remote.json",
+            allowed = {"lock", "capture.lock", "lease.lock", "watcher.changed", "remote-status.changed", "remote.json",
                        "lease.json", "workspace.kitty-session", "panes.json", "bootstrap.kitty-session",
-                       "native-pending"}
+                       "native-pending", "supervisor.log", "supervisor.startup.json"}
             for path in directory.iterdir():
-                if path.name in ("pending-create.json", "pending-close.json", "native-stage.json", "kitty.sock"):
+                if path.name in ("pending-create.json", "pending-close.json", "native-stage.json", "kitty.sock", "view.json"):
                     raise ValueError("local workspace has unfinished operations; refusing to overwrite it")
                 if path.name not in allowed and not re.fullmatch(r"\.retired-[0-9a-f]{32}", path.name):
                     raise ValueError("local workspace contains unknown state; refusing to overwrite it")
@@ -669,88 +804,25 @@ def create(directory, name, host):
 
 
 def reconcile_detached(directory, name, host, executable, remote):
-    """Replay or journal a fenced reconciliation, preserving uncertain work."""
-    from .layout_prune import prune_snapshot
-
+    """Refuse uncertain automatic reconciliation without changing saved state."""
     journal = directory / "reconcile-pending.json"
     if journal.is_symlink():
         raise ValueError("unsafe reconciliation journal")
     if journal.exists():
-        record = json.loads(journal.read_text())
-        if (not isinstance(record, dict) or record.get("workspace") != name or record.get("host") != host or
-                record.get("state_home", "") != origin_state_home(host) or not isinstance(record.get("request"), dict)):
-            raise ValueError("conflicting reconciliation journal")
-    else:
-        if remote.get("staged"):
-            return remote
-        status = call(host, {"method": "workspace.status", "workspace": name})
-        if status.get("revision") != remote.get("revision") or not isinstance(status.get("missing"), list):
-            raise ValueError("workspace changed while checking missing sessions")
-        missing = set(status["missing"])
-        old = set(remote["panes"])
-        reservations = set(remote.get("reservations", []))
-        if not missing.issubset(old) or old.intersection(reservations):
-            raise ValueError("invalid remote session status")
-        if not missing and not reservations:
-            return remote
-        if lease_token(directory) is None:
-            raise ValueError("incomplete pane creation or missing sessions require an active lease for reconciliation")
-        snapshot = prune_snapshot(remote["snapshot"], missing) if missing else remote["snapshot"]
-        _, panes = translate(snapshot, executable, host, False)
-        if set(panes) != old - missing:
-            raise ValueError("pruned layout does not match surviving panes")
-        root = directory / "native-pending"
-        journals = {}
-        if root.is_symlink() or (root.exists() and (not root.is_dir() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077)):
-            raise ValueError("unsafe native creation journal directory")
-        if root.exists():
-            for path in root.iterdir():
-                if path.is_symlink() or not path.is_file() or path.suffix != ".json" or path.stem not in reservations:
-                    raise ValueError("unreconciled native creation journal")
-                text = path.read_text()
-                if json.loads(text) != {"pane": path.stem, "host": host, "workspace": name}:
-                    raise ValueError("native creation journal conflicts with reservation")
-                journals[path.name] = text
-        request = {"method": "workspace.reconcile", "workspace": name, "revision": remote["revision"],
-                   "request_id": uuid.uuid4().hex, "snapshot": snapshot, "panes": panes,
-                   "remove": sorted(missing), "cancel_reservations": sorted(reservations)}
-        record = {"workspace": name, "host": host, "state_home": origin_state_home(host),
-                  "request": request, "journals": journals}
-        atomic_write(journal, json.dumps(record, separators=(",", ":")) + "\n")
-    request = record["request"]
-    if request.get("method") != "workspace.reconcile" or request.get("workspace") != name:
-        raise ValueError("invalid reconciliation journal")
-    token = lease_token(directory)
-    if token is None:
-        raise ValueError("incomplete pane creation or missing sessions require an active lease for reconciliation")
-    request["lease_token"] = token
-    call(host, request)
-    remote = call(host, {"method": "workspace.sync", "workspace": name})
-    if (not remote.get("exists") or remote.get("snapshot") != request.get("snapshot") or
-            sorted(remote.get("panes", [])) != sorted(request.get("panes", [])) or remote.get("reservations") or remote.get("staged")):
-        raise ValueError("workspace changed after reconciliation; retain journal for investigation")
-    local_snapshot, panes = translate(remote["snapshot"], executable, host, False)
-    if local_snapshot == DORMANT:
-        if (directory / "workspace.kitty-session").exists():
-            raise ValueError("dormant remote state conflicts with a local snapshot")
-    else:
-        atomic_write(directory / "workspace.kitty-session", local_snapshot)
-        atomic_write(directory / "panes.json", json.dumps(panes) + "\n")
-    save_config(directory, {"workspace": name, "host": host, "revision": remote["revision"], "panes": panes,
-                            "state_home": origin_state_home(host), "event_cursor": remote["event_cursor"],
-                            "published_hash": snapshot_hash(remote["snapshot"], panes)})
-    journals = record.get("journals")
-    if not isinstance(journals, dict):
-        raise ValueError("invalid reconciliation journal entries")
-    for filename, text in journals.items():
-        if not isinstance(filename, str) or not filename.endswith(".json") or not PANE.fullmatch(filename[:-5]) or not isinstance(text, str):
-            raise ValueError("invalid native reconciliation journal")
-        path = directory / "native-pending" / filename
-        if path.is_symlink() or (path.exists() and (not path.is_file() or path.read_text() != text)):
-            raise ValueError("native creation journal changed after reconciliation")
-        if path.exists():
-            path.unlink()
-    journal.unlink()
+        raise ValueError("pending reconciliation retained for manual inspection")
+    if remote.get("staged"):
+        return remote
+    status = call(host, {"method": "workspace.status", "workspace": name})
+    if status.get("revision") != remote.get("revision") or not isinstance(status.get("missing"), list):
+        raise ValueError("workspace changed while checking missing sessions")
+    missing = set(status["missing"])
+    old = set(remote["panes"])
+    reservations = set(remote.get("reservations", []))
+    if not missing.issubset(old) or old.intersection(reservations):
+        raise ValueError("invalid remote session status")
+    if missing or reservations:
+        raise ValueError("workspace sessions or reservations may be missing; "
+                         "automatic reconciliation is disabled to preserve them")
     return remote
 
 
@@ -764,7 +836,7 @@ def pull(directory, name, host, executable):
             raise ValueError("local workspace has conflicting or pending remote state")
     elif any(directory.iterdir()):
         # The workspace lock is created by the caller before this check.
-        if any(p.name not in ("lock", "lease.json") for p in directory.iterdir()):
+        if any(p.name not in ("lock", "lease.lock", "lease.json") for p in directory.iterdir()):
             raise ValueError("local workspace already exists; refusing to overwrite it")
     remote = call(host, {"method": "workspace.sync", "workspace": name})
     if not remote["exists"]:

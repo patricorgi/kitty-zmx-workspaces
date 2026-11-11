@@ -10,16 +10,19 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 
-from .core import FOCUS_PREFIX, PANE, atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
-from .titles import start_title_monitor
+from .core import FOCUS_PREFIX, FLAG, PANE, atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
+from .titles import TAB_TITLE_TEMPLATE, start_title_monitor
+from . import kitty_instance
 from . import remote_client
 from . import supervisor_window
 
 EMPTY_SNAPSHOT = "# kzw-empty-workspace\n"
+BACKGROUND_COMMANDS = ("start", "attach", "new-pane")
 
 
 def log_pane_event(event, panes):
@@ -57,14 +60,66 @@ def state_dir(name, origin=""):
     return path
 
 
-def query(socket, *args):
+def socket_address(socket):
+    """Accept both a socket path and a full Kitty remote-control address."""
+    text = str(socket)
+    return text if text.startswith(("unix:", "tcp:")) else "unix:" + text
+
+
+def list_os_windows(socket):
+    """Return the unfiltered instance tree used only for window discovery."""
+    output = subprocess.run(["kitty", "@", "--to", socket_address(socket), "ls"],
+                            check=True, capture_output=True, text=True, timeout=5).stdout
+    tree = json.loads(output)
+    if not isinstance(tree, list) or any(not isinstance(item, dict) or type(item.get("id")) is not int
+                                         for item in tree):
+        raise ValueError("invalid Kitty window listing")
+    return tree
+
+
+def view_state(directory):
+    """Read the shared-instance view identity, if this workspace has one."""
+    path = directory / "view.json"
+    if path.is_symlink():
+        raise ValueError("unsafe workspace view state")
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    if (not isinstance(data, dict) or not isinstance(data.get("address"), str) or
+            not data["address"].startswith(("unix:", "tcp:")) or
+            type(data.get("instance_pid")) is not int or data["instance_pid"] <= 0 or
+            type(data.get("os_window_id")) is not int or data["os_window_id"] <= 0 or
+            not isinstance(data.get("panes"), list) or
+            any(not isinstance(pane, str) or not PANE.fullmatch(pane) for pane in data["panes"])):
+        raise ValueError("invalid workspace view state")
+    return data
+
+
+def view_query(directory, *args):
+    """Query only this workspace's OS window inside a possibly shared instance."""
+    view = view_state(directory)
+    if view is None:
+        return query(directory / "kitty.sock", *args)
+    return query(view["address"], *args, workspace_os_id=view["os_window_id"])
+
+
+def query(socket, *args, workspace_os_id=None):
     def raw(*command):
-        return subprocess.run(["kitty", "@", "--to", f"unix:{socket}", *command],
+        return subprocess.run(["kitty", "@", "--to", socket_address(socket), *command],
                               check=True, capture_output=True, text=True, timeout=5).stdout
 
     if args not in (("ls",), ("ls", "--output-format=session")):
         return raw(*args)
     tree = json.loads(raw("ls"))
+    if workspace_os_id is not None:
+        if type(workspace_os_id) is not int or workspace_os_id <= 0:
+            raise ValueError("invalid workspace Kitty OS window ID")
+        tree = [window for window in tree if window.get("id") == workspace_os_id]
+        if len(tree) > 1:
+            raise ValueError("duplicate workspace Kitty OS window ID")
     matches = []
     for os_window in tree:
         managed = [w for tab in os_window.get("tabs", []) for w in tab.get("windows", [])
@@ -92,6 +147,186 @@ def query(socket, *args):
     if not isinstance(response, dict) or response.get("os_window_id") != os_id or not isinstance(response.get("session"), str):
         raise ValueError("invalid scoped Kitty session response")
     return response["session"]
+
+
+def workspace_context(name, directory, host="", remote_attached=False, rpc_socket=None, marker=None):
+    """Describe a workspace consistently through process env and window vars."""
+    directory = Path(directory)
+    origin = host if remote_attached else ""
+    signal = str(directory / "watcher.changed")
+    env = {
+        "KZW_HOST": host,
+        "KZW_WORKSPACE": name,
+        "KZW_WORKSPACE_ORIGIN": origin,
+        "KZW_WORKSPACE_COORDINATOR": "1" if remote_attached else "",
+        "KZW_WORKSPACE_DIRECTORY": str(directory),
+        "KZW_CHANGE_SIGNAL": signal,
+    }
+    variables = {
+        "kzw_workspace": name,
+        "kzw_origin": origin,
+        "kzw_directory": str(directory),
+        "kzw_signal": signal,
+        "kzw_coordinator": "1" if remote_attached else "",
+    }
+    if rpc_socket:
+        env["KZW_RPC_SOCKET"] = str(rpc_socket)
+    if os.environ.get("KZW_DEBUG") == "1":
+        env["KZW_DEBUG"] = "1"
+    if marker is not None:
+        encoded = json.dumps(marker, separators=(",", ":"))
+        env["KZW_INHERIT_MARKER"] = encoded
+        variables["kzw_marker"] = encoded
+    return env, variables
+
+
+def inject_session_context(text, env, variables):
+    """Add only per-launch context so a shared instance can identify the view."""
+    options = ["--var=" + key + "=" + value for key, value in variables.items()]
+    options += ["--env=" + key + "=" + value for key, value in env.items()]
+    lines = []
+    for line in text.splitlines():
+        if line.startswith("launch "):
+            args = shlex.split(line)
+            index = 2 if len(args) > 1 and args[1].startswith(FLAG) else 1
+            line = shlex.join(args[:index] + options + args[index:])
+        lines.append(line)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def session_panes(text):
+    """Read the exact managed pane identities a session file will launch."""
+    panes = []
+    for line in text.splitlines():
+        if not line.startswith("launch "):
+            continue
+        args = shlex.split(line)
+        for index, arg in enumerate(args[:-1]):
+            if arg == "--pane":
+                panes.append(args[index + 1])
+                break
+    if (not panes or any(not isinstance(pane, str) or not PANE.fullmatch(pane) for pane in panes) or
+            len(set(panes)) != len(panes)):
+        raise ValueError("workspace session does not name its managed panes")
+    return set(panes)
+
+
+def write_runtime_session(directory, source, env, variables):
+    """Write a per-attach session copy; never modify the authoritative snapshot."""
+    rendered = inject_session_context(source.read_text(), env, variables)
+    fd, path = tempfile.mkstemp(prefix=".session-", suffix=".kitty-session", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return Path(path), session_panes(rendered)
+
+
+def identify_os_window(address, before_ids, expected):
+    """Select only the newly created OS window carrying this exact pane set."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        candidates = []
+        for os_window in list_os_windows(address):
+            if os_window.get("id") in before_ids:
+                continue
+            panes = set()
+            for tab in os_window.get("tabs", []):
+                for window in tab.get("windows", []):
+                    pane = window.get("user_vars", {}).get("kzw_pane")
+                    if isinstance(pane, str) and PANE.fullmatch(pane):
+                        panes.add(pane)
+            if panes == expected:
+                candidates.append(os_window.get("id"))
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise ValueError("multiple new Kitty OS windows match the workspace; refusing to attach")
+        time.sleep(0.1)
+    raise ValueError("Kitty did not create the workspace OS window; check the Kitty log and configuration")
+
+
+def view_marker(window):
+    """Read the inherited appearance marker from a managed window, if any."""
+    text = window.get("user_vars", {}).get("kzw_marker", "") if isinstance(window, dict) else ""
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, list) else None
+
+
+def write_view(directory, address, instance_pid, os_window_id, panes):
+    data = {"address": address, "instance_pid": instance_pid,
+            "os_window_id": os_window_id, "panes": sorted(panes)}
+    atomic_write(directory / "view.json", json.dumps(data, separators=(",", ":")) + "\n")
+    atomic_write(directory / "kitty.sock", "")
+
+
+def remove_view(directory):
+    for item in ("view.json", "kitty.sock"):
+        try:
+            (directory / item).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def view_alive(directory, view):
+    """A view is live only when its exact OS window still owns managed panes.
+
+    An unreachable instance whose process is still running is unknown, not
+    stale: refuse to replace it with a second window.
+    """
+    if view is None:
+        return False
+    try:
+        tree = list_os_windows(view["address"])
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        try:
+            os.kill(view["instance_pid"], 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass
+        raise ValueError("cannot verify the existing Kitty workspace view; close its window "
+                         "or use --new-kitty-instance") from exc
+    for os_window in tree:
+        if os_window.get("id") != view["os_window_id"]:
+            continue
+        panes = set()
+        for tab in os_window.get("tabs", []):
+            for window in tab.get("windows", []):
+                pane = window.get("user_vars", {}).get("kzw_pane")
+                if isinstance(pane, str) and PANE.fullmatch(pane):
+                    panes.add(pane)
+        if panes & set(view["panes"]):
+            return True
+        raise ValueError("existing Kitty workspace window has changed; refusing to replace an uncertain view")
+    return False
+
+
+def startup_status(ok, error=None, directory=None):
+    path = os.environ.get("KZW_STARTUP_STATUS")
+    if not path:
+        return
+    data = {"ok": bool(ok)}
+    if error is not None:
+        data["error"] = str(error)
+    if directory is not None:
+        data["directory"] = str(directory)
+    try:
+        atomic_write(Path(path), json.dumps(data, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
 
 
 @contextmanager
@@ -373,12 +608,11 @@ def recover_remote_managed_creation(directory, name, host, executable):
 
 
 def capture_locked(directory, executable, allow_removals=False, expected_panes=None, confirmed_exits=False, confirmed_close=False, close_panes=None):
-    socket = directory / "kitty.sock"
-    before_tree = json.loads(query(socket, "ls"))
+    before_tree = json.loads(view_query(directory, "ls"))
     before = pane_map(before_tree)
     focus = focused_pane(before_tree)
-    export = query(socket, "ls", "--output-format=session")
-    after_tree = json.loads(query(socket, "ls"))
+    export = view_query(directory, "ls", "--output-format=session")
+    after_tree = json.loads(view_query(directory, "ls"))
     after = pane_map(after_tree)
     if before != after or focus != focused_pane(after_tree):
         raise ValueError("panes or focus changed while taking snapshot")
@@ -387,7 +621,7 @@ def capture_locked(directory, executable, allow_removals=False, expected_panes=N
     snapshot = FOCUS_PREFIX + json.dumps({"pane": focus}, separators=(",", ":")) + "\n"
     snapshot += rewrite_export(export, after, executable)
     # Layout itself can change without the window IDs changing.
-    if query(socket, "ls", "--output-format=session") != export:
+    if view_query(directory, "ls", "--output-format=session") != export:
         raise ValueError("layout changed while taking snapshot")
     target = directory / "workspace.kitty-session"
     metadata = directory / "panes.json"
@@ -407,8 +641,8 @@ def capture_locked(directory, executable, allow_removals=False, expected_panes=N
                 live_by_host[host] = set(zmx_command(host, "list", "--short").splitlines())
             if pane not in live_by_host[host]:
                 raise ValueError("new pane session is missing or not yet ready")
-        if added and (pane_map(json.loads(query(socket, "ls"))) != after or
-                      query(socket, "ls", "--output-format=session") != export):
+        if added and (pane_map(json.loads(view_query(directory, "ls"))) != after or
+                      view_query(directory, "ls", "--output-format=session") != export):
             raise ValueError("layout changed while taking snapshot")
     if (directory / "remote.json").exists():
         if allow_removals and not (confirmed_exits or confirmed_close):
@@ -446,14 +680,16 @@ def capture_stable_locked(directory, executable):
             time.sleep(0.1)
 
 
-def restore_focus(socket, pane):
-    tree = json.loads(query(socket, "ls"))
+def restore_focus(socket, pane, view_directory=None):
+    run_query = ((lambda *args: view_query(view_directory, *args)) if view_directory is not None
+                 else (lambda *args: query(socket, *args)))
+    tree = json.loads(run_query("ls"))
     panes = pane_map(tree)
     matches = [window_id for window_id, (name, _) in panes.items() if name == pane]
     if len(matches) != 1:
         raise ValueError("saved focused pane is missing or ambiguous; refusing to change focus")
-    query(socket, "focus-window", "--match", f"id:{matches[0]}")
-    if focused_pane(json.loads(query(socket, "ls"))) != pane:
+    run_query("focus-window", "--match", f"id:{matches[0]}")
+    if focused_pane(json.loads(run_query("ls"))) != pane:
         raise ValueError("Kitty did not restore the saved focused pane")
 
 
@@ -464,6 +700,7 @@ def detach(name, origin=""):
     executable = shutil.which("kzw-pane")
     if not executable:
         raise ValueError("kzw-pane not found on PATH")
+    view = view_state(directory)
     # Serialize with the supervisor so it cannot overwrite the final snapshot
     # while the windows are being torn down. Failure to save means no close.
     with capture_lock(directory):
@@ -472,12 +709,26 @@ def detach(name, origin=""):
         count = capture_stable_locked(directory, executable)
         if (directory / "remote.json").exists():
             remote_client.ensure_current_revision(directory)
-        tree = json.loads(query(directory / "kitty.sock", "ls"))
+        tree = json.loads(view_query(directory, "ls"))
         mapped = pane_map(tree)
         if {pane for pane, _ in mapped.values()} != set(json.loads((directory / "panes.json").read_text())):
             raise ValueError("workspace changed after final snapshot; refusing to detach")
         ids = sorted(mapped)
-        query(directory / "kitty.sock", "close-window", "--match", " or ".join(f"id:{wid}" for wid in ids))
+        view_query(directory, "close-window", "--match", " or ".join(f"id:{wid}" for wid in ids))
+    # A shared-view supervisor owns the marker files and exits once its OS
+    # window is gone. Waiting here makes an immediate re-attach reliable.
+    if view is not None:
+        for _ in range(100):
+            try:
+                if view_state(directory) is None:
+                    break
+            except ValueError:
+                break
+            time.sleep(0.1)
+        try:
+            kitty_instance.tab_style(view["address"], view["instance_pid"], "restore")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
     print(f"Detached {name!r}; saved focus and {count} panes")
 
 
@@ -511,7 +762,7 @@ def local_empty_retirable(directory):
     """Recognize only an empty workspace without any uncertain operations."""
     if (directory / "remote.json").exists():
         return False
-    for name in ("pending-create.json", "pending-close.json", "native-stage.json", "bootstrap.kitty-session"):
+    for name in ("pending-create.json", "pending-close.json", "native-stage.json", "bootstrap.kitty-session", "view.json"):
         path = directory / name
         if path.exists() or path.is_symlink():
             return False
@@ -537,97 +788,13 @@ def retire_local_empty(directory):
 
 
 def synchronize_exits(directory, executable, remote_hint=()):
-    """Remove only panes whose host confirms the session is absent."""
-    socket = directory / "kitty.sock"
-    tree = json.loads(query(socket, "ls"))
-    candidates = exited_windows(tree)
-    # A wrapper can fail before its first attach (reservation, staging, or
-    # authentication). Its absent session is not evidence of a shell exit.
-    pending_root = directory / "native-pending"
-    candidates = {wid: value for wid, value in candidates.items()
-                  if not (pending_root / (value[0] + ".json")).exists()}
-    hinted_ids = set()
-    if remote_hint and (directory / "remote.json").exists():
-        for wid, value in pane_map(tree).items():
-            if value[0] in remote_hint:
-                candidates[wid] = value
-                hinted_ids.add(wid)
-    if not candidates:
-        return 0
-    live_by_host = {}
-    remote_missing = None
-    if (directory / "remote.json").exists():
-        # The origin decides which sessions belong to this workspace and
-        # whether they are absent. Failed RPC/listing is unknown, not exited.
-        remote_missing = set(remote_client.status(directory)["missing"])
-    for _, host in candidates.values():
-        if remote_missing is not None:
-            continue
-        if host not in live_by_host:
-            try:
-                live_by_host[host] = set(zmx_command(host, "list", "--short").splitlines())
-            except (OSError, subprocess.SubprocessError):
-                # Unknown is not exited. Do not guess when the network is down.
-                continue
-    gone = {wid: value for wid, value in candidates.items()
-            if (value[0] in remote_missing if remote_missing is not None else
-                value[1] in live_by_host and value[0] not in live_by_host[value[1]])}
-    if not gone:
-        return 0
-    with capture_lock(directory):
-        if (directory / "pending-close.json").exists() or (directory / "pending-create.json").exists():
-            return 0
-        if (directory / "remote.json").exists():
-            remote_client.renew_lease(directory)
-            remote_client.ensure_current_revision(directory)
-        current_tree = json.loads(query(socket, "ls"))
-        current = pane_map(current_tree)
-        ended = exited_windows(current_tree)
-        # Don't act on a replaced window or lose unverified disappeared panes.
-        if any(current.get(wid) != value or (wid not in hinted_ids and ended.get(wid) != value)
-               for wid, value in gone.items()):
-            return 0
-        metadata = directory / "panes.json"
-        if metadata.exists():
-            old = set(json.loads(metadata.read_text()))
-            if not old.issubset({pane for pane, _ in current.values()}):
-                raise ValueError("unverified pane removal; refusing exit synchronization")
-        expected = {wid: value for wid, value in current.items() if wid not in gone}
-        journals = native_journals(directory, gone.values())
-        if not expected:
-            # Commit the explicit empty state before closing the last view.
-            if (directory / "remote.json").exists():
-                remote_client.publish(directory, EMPTY_SNAPSHOT, [], confirmed_exits=True)
-            atomic_write(directory / "workspace.kitty-session", EMPTY_SNAPSHOT)
-            atomic_write(metadata, "[]\n")
-        for wid in gone:
-            query(socket, "close-window", "--match", f"id:{wid}")
-        if expected:
-            for _ in range(50):
-                try:
-                    remaining = pane_map(json.loads(query(socket, "ls")))
-                    if remaining == expected:
-                        capture_locked(directory, executable, allow_removals=True, expected_panes=expected,
-                                       confirmed_exits=True)
-                        break
-                except (ValueError, subprocess.SubprocessError):
-                    pass
-                time.sleep(0.1)
-            else:
-                raise ValueError("could not save layout after confirmed shell exits")
-        remove_native_journals(journals)
-        if not expected:
-            retire_local_empty(directory)
-        for os_window in current_tree:
-            for tab in os_window.get("tabs", []):
-                ids = {window["id"] for window in tab.get("windows", [])}
-                removed = ids & gone.keys()
-                if removed and ids == removed:
-                    log_pane_event("tab_destroyed", [gone[wid][0] for wid in removed])
-                else:
-                    for wid in sorted(removed):
-                        log_pane_event("pane_destroyed", [gone[wid][0]])
-    return len(gone)
+    """Preserve sessions when attachment or zmx-list observations are uncertain.
+
+    zmx inventory describes existence in the queried origin namespace. It does
+    not authorize layout removal, and a disconnected wrapper is only UI state.
+    Managed closes remain the explicit path for terminating selected sessions.
+    """
+    return 0
 
 
 def cleanup_close_locked(directory):
@@ -701,8 +868,7 @@ def close_target(name, kind, target_id, origin="", confirmed_selection=None):
         capture_stable_locked(directory, executable)
         if remote:
             remote_client.ensure_current_revision(directory)
-        socket = directory / "kitty.sock"
-        tree = json.loads(query(socket, "ls"))
+        tree = json.loads(view_query(directory, "ls"))
         panes = pane_map(tree)
         if kind == "pane":
             if target_id not in panes:
@@ -739,15 +905,15 @@ def close_target(name, kind, target_id, origin="", confirmed_selection=None):
             atomic_write(directory / "panes.json", "[]\n")
             record["phase"] = "layout-saved"
             atomic_write(pending, json.dumps(record) + "\n")
-            query(socket, command, "--match", f"id:{target_id}")
+            view_query(directory, command, "--match", f"id:{target_id}")
             closed = cleanup_close_locked(directory)
             log_pane_event("tab_destroyed" if kind == "tab" else "pane_destroyed", closed)
             return
-        query(socket, command, "--match", f"id:{target_id}")
+        view_query(directory, command, "--match", f"id:{target_id}")
         # Kitty closes asynchronously. Check identity as well as count, and
         # never interpret an unrelated close as permission to destroy it.
         for _ in range(50):
-            remaining = pane_map(json.loads(query(socket, "ls")))
+            remaining = pane_map(json.loads(view_query(directory, "ls")))
             if set(remaining) == expected and all(remaining[k] == panes[k] for k in expected):
                 break
             time.sleep(0.1)
@@ -762,6 +928,7 @@ def close_target(name, kind, target_id, origin="", confirmed_selection=None):
     log_pane_event("tab_destroyed" if kind == "tab" else "pane_destroyed", closed)
 
 
+@remote_client.persistent_rpc()
 def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri=""):
     """Serialize managed creation with closes and retain uncertain attempts."""
     if kind not in ("right", "below", "split", "tab") or not PANE.fullmatch(expected_pane):
@@ -785,8 +952,8 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
         capture_locked(directory, executable)
         if (directory / "remote.json").exists():
             remote_client.ensure_current_revision(directory)
-        socket = directory / "kitty.sock"
-        before = pane_map(json.loads(query(socket, "ls")))
+        tree = json.loads(view_query(directory, "ls"))
+        before = pane_map(tree)
         if window_id not in before or before[window_id][0] != expected_pane:
             raise ValueError("creation target changed; nothing created")
         if origin and host != origin:
@@ -801,12 +968,18 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
             remote_client.reserve_pane(directory, pane, record["request_id"])
         elif pane in zmx_command(host, "list", "--short").splitlines():
             raise ValueError("pane ID already belongs to a live zmx session")
-        options = ["--type=tab"] if kind == "tab" else ["--next-to", f"id:{window_id}",
+        target_window = next((window for os_window in tree for tab in os_window.get("tabs", [])
+                              for window in tab.get("windows", []) if window.get("id") == window_id), None)
+        env_context, var_context = workspace_context(
+            name, directory, host, bool(origin), marker=view_marker(target_window))
+        context_options = (["--var=" + key + "=" + value for key, value in var_context.items()] +
+                           ["--env=" + key + "=" + value for key, value in env_context.items()])
+        options = ["--type=tab", "--tab-title=..."] if kind == "tab" else ["--next-to", f"id:{window_id}",
                                                          "--location=" + {"right": "hsplit", "below": "vsplit", "split": "split"}[kind]]
         command = [executable, "--pane", pane, "--host", host, "--stage-new"]
         if cwd:
             command += ["--initial-cwd", cwd]
-        result = query(socket, "launch", "--match", f"id:{window_id}", *options, *command)
+        result = view_query(directory, "launch", "--match", f"id:{window_id}", *options, *context_options, *command)
         try:
             new_id = int(result.strip())
         except ValueError:
@@ -817,7 +990,7 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
         expected[new_id] = (pane, host)
         for _ in range(100):
             try:
-                current = pane_map(json.loads(query(socket, "ls")))
+                current = pane_map(json.loads(view_query(directory, "ls")))
                 if current == expected:
                     capture_locked(directory, executable, expected_panes=expected)
                     pending.unlink()
@@ -891,17 +1064,16 @@ def resume_partial_close_locked(directory, record, pending):
     executable = shutil.which("kzw-pane")
     if not executable:
         raise ValueError("kzw-pane not found on PATH")
-    socket = directory / "kitty.sock"
-    tree = json.loads(query(socket, "ls"))
+    tree = json.loads(view_query(directory, "ls"))
     current = pane_map(tree)
     if current == before:
         if kind == "tab":
             tabs = [tab for os_window in tree for tab in os_window.get("tabs", []) if tab.get("id") == target_id]
             if len(tabs) != 1 or {window["id"] for window in tabs[0].get("windows", [])} != selected:
                 raise ValueError("tab changed since confirmation; close journal retained")
-        query(socket, "close-window" if kind == "pane" else "close-tab", "--match", f"id:{target_id}")
+        view_query(directory, "close-window" if kind == "pane" else "close-tab", "--match", f"id:{target_id}")
         for _ in range(50):
-            current = pane_map(json.loads(query(socket, "ls")))
+            current = pane_map(json.loads(view_query(directory, "ls")))
             if current == expected:
                 break
             time.sleep(0.1)
@@ -957,7 +1129,7 @@ def retry_create(name, origin=""):
         if (not isinstance(pane, str) or not PANE.fullmatch(pane) or not isinstance(host, str) or
                 (host and (host.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host)))):
             raise ValueError("invalid pending pane creation")
-        current = pane_map(json.loads(query(directory / "kitty.sock", "ls")))
+        current = pane_map(json.loads(view_query(directory, "ls")))
         metadata = directory / "panes.json"
         if not metadata.is_file() and record.get("kind") != "bootstrap":
             raise ValueError("no complete saved pane manifest; inspect the pending creation manually")
@@ -1146,7 +1318,7 @@ def finish_bootstrap(directory, executable):
         if (record.get("kind") != "bootstrap" or record.get("phase") != "launching" or
                 not isinstance(pane, str) or not PANE.fullmatch(pane) or not isinstance(host, str)):
             raise ValueError("invalid bootstrap creation journal")
-        current = pane_map(json.loads(query(directory / "kitty.sock", "ls")))
+        current = pane_map(json.loads(view_query(directory, "ls")))
         if len(current) != 1 or set(current.values()) != {(pane, host)}:
             raise ValueError("waiting for the reserved bootstrap pane")
         if pane not in zmx_command(host, "list", "--short").splitlines():
@@ -1169,13 +1341,20 @@ def kitty_launch_command(args, env):
     forwarded = {key: value for key, value in env.items()
                  if key.startswith("KZW_") or key in ("PATH", "PYTHONPATH", "XDG_STATE_HOME", "KITTY_CONFIG_DIRECTORY", "ZMX_DIR", "SHELL")}
     command = ["/usr/bin/open", "-g", "-j", "-n", "-W", "-a", "/Applications/kitty.app"]
+    # Launch Services reads macos-launch-services-cmdline before -c NONE can
+    # take effect, so isolate the test instance in an empty config directory.
+    config = Path(tempfile.mkdtemp(prefix="kzw-kitty-config-"))
+    (config / "macos-launch-services-cmdline").write_text("")
+    (config / "kitty.conf").write_text("")
+    forwarded["KITTY_CONFIG_DIRECTORY"] = str(config)
     for key in sorted(forwarded):
         command.extend(["--env", key + "=" + forwarded[key]])
-    return command + ["--args", *args[1:]]
+    return command + ["--args", "-c", "NONE", *args[1:]]
 
 
 @remote_client.persistent_rpc()
-def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session=None, create_empty=False, appearance=None):
+def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session=None, create_empty=False,
+        appearance=None, new_instance=False):
     directory = state_dir(name, host) if remote_attached else state_dir(name)
     if (directory / "remote.json").exists() and not remote_attached:
         raise ValueError("coordinator workspace: use kzw attach NAME (add --host for a remote origin)")
@@ -1199,8 +1378,16 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         sock = directory / "kitty.sock"
         # The lock proves no kzw supervisor is using this workspace. Refuse a
         # stale socket rather than unlinking anything we cannot verify is ours.
-        if sock.exists():
-            raise ValueError(f"socket already exists: {sock}; check for a running Kitty before removing it")
+        view = view_state(directory)
+        if sock.exists() or view is not None:
+            if view is not None and not view_alive(directory, view):
+                remove_view(directory)
+            else:
+                raise ValueError(f"socket already exists: {sock}; check for a running Kitty before removing it")
+        shared = None
+        if not new_instance:
+            shared = kitty_instance.context()
+            kitty_instance.probe(shared["address"])
         if not remote_attached:
             recover_local_managed_creation(directory, pane_executable)
         recover_local_native_stage(directory, pane_executable)
@@ -1222,66 +1409,54 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             raise ValueError("new-pane requires an empty workspace")
         if empty and not create_empty and bootstrap_session is None:
             print(f"Workspace {name!r} has no live panes")
+            startup_status(True, directory=directory)
             return 0
-        env = os.environ.copy()
-        env["KZW_HOST"] = host
-        env["KZW_WORKSPACE"] = name
-        env["KZW_WORKSPACE_ORIGIN"] = host if remote_attached else ""
-        env["KZW_WORKSPACE_COORDINATOR"] = "1" if remote_attached else ""
-        env["KZW_WORKSPACE_DIRECTORY"] = str(directory)
-        env["KZW_CHANGE_SIGNAL"] = str(directory / "watcher.changed")
-        # Mask Kitty's automatic wrapper title until the process monitor has
-        # identified the actual foreground program, including on new tabs.
-        args = ["kitty", "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only",
-                "-o", f"shell={pane_executable}", "-o", "enabled_layouts=splits,tall,stack",
-                 "-o", "tab_title_template={title.replace('kzw-pane', '…')}  {fmt.nobold}{fmt.noitalic}{index}",
-                 "-o", "active_tab_title_template={title.replace('kzw-pane', '…')}  {fmt.nobold}{fmt.noitalic}{index}",
-                 "-o", f"watcher={Path(__file__).with_name('watcher.py')}"]
-        kitten = Path(__file__).with_name("close_kitten.py")
-        create_kitten = Path(__file__).with_name("create_kitten.py")
-        detach_kitten = Path(__file__).with_name("detach_kitten.py")
-        args += ["-o", f"map super+w kitten {kitten} pane",
-                 "-o", f"map kitty_mod+w kitten {kitten} pane",
-                 "-o", f"map kitty_mod+q kitten {kitten} tab",
-                 "-o", f"map super+shift+w kitten {detach_kitten}",
-                 "-o", f"map super+enter kitten {create_kitten} split",
-                 "-o", f"map kitty_mod+enter kitten {create_kitten} right",
-                 "-o", f"map kitty_mod+alt+enter kitten {create_kitten} below",
-                 "-o", "map kitty_mod+up scroll_to_prompt -1",
-                 "-o", "map kitty_mod+down scroll_to_prompt 1",
-                 "-o", f"map super+t kitten {create_kitten} tab",
-                 "-o", f"map kitty_mod+t kitten {create_kitten} tab"]
-        for number in range(1, 11):
-            args += ["-o", f"map super+{number % 10} goto_tab {number}"]
-        if appearance is not None:
-            args.extend(appearance["options"])
-            if appearance["marker"] is not None:
-                env["KZW_INHERIT_MARKER"] = json.dumps(appearance["marker"], separators=(",", ":"))
-                print("kzw: inherited marker initializes asynchronously; verify masking in every pane before sharing", file=sys.stderr)
-            else:
-                env.pop("KZW_INHERIT_MARKER", None)
+        if shared is not None:
+            # A shared instance is configured by its owner. Do not load
+            # instance-wide options or shortcuts into it.
+            marker = appearance["marker"] if appearance is not None else None
+            env, variables = workspace_context(name, directory, host, remote_attached, marker=marker)
         else:
-            env.pop("KZW_INHERIT_MARKER", None)
+            env = os.environ.copy()
+            env.pop("KZW_BACKGROUND_SUPERVISOR", None)
+            env.pop("KZW_STARTUP_STATUS", None)
+            env["KZW_HOST"] = host
+            env["KZW_WORKSPACE"] = name
+            env["KZW_WORKSPACE_ORIGIN"] = host if remote_attached else ""
+            env["KZW_WORKSPACE_COORDINATOR"] = "1" if remote_attached else ""
+            env["KZW_WORKSPACE_DIRECTORY"] = str(directory)
+            env["KZW_CHANGE_SIGNAL"] = str(directory / "watcher.changed")
+            variables = None
         focus = saved_focus(snapshot.read_text()) if snapshot.exists() else None
         if bootstrap_session is not None:
-            args += ["--session", str(bootstrap_session)]
+            session = bootstrap_session
             bootstrap = True
         elif create_empty:
-            args += ["--session", str(prepare_bootstrap(directory, name, host, pane_executable, allow_empty=True))]
+            session = prepare_bootstrap(directory, name, host, pane_executable, allow_empty=True)
             bootstrap = True
         elif snapshot.exists():
-            args += ["--session", str(snapshot)]
+            session = snapshot
             bootstrap = False
         else:
-            args += ["--session", str(prepare_bootstrap(directory, name, host, pane_executable))]
+            session = prepare_bootstrap(directory, name, host, pane_executable)
             bootstrap = True
         broker = remote_client.ConnectionBroker(host, name) if remote_attached else None
         if broker:
             env["KZW_RPC_SOCKET"] = str(broker.path)
         else:
             env.pop("KZW_RPC_SOCKET", None)
+        runtime_session = None
+        child = None
+        view_written = False
+        view_gone = False
         try:
-            title_stop = start_title_monitor(sock, query)
+            def list_tree():
+                return view_query(directory, "ls")
+
+            def set_title(tab_id, title):
+                view_query(directory, "set-tab-title", "--match", f"id:{tab_id}", title)
+
+            title_stop = start_title_monitor(list_tree, set_title)
         except Exception:
             if broker:
                 broker.close()
@@ -1296,15 +1471,81 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         try:
             if bootstrap:
                 mark_bootstrap_launching(directory)
-            child = subprocess.Popen(kitty_launch_command(args, env), env=env, stdin=subprocess.DEVNULL)
+            if shared is not None:
+                if variables is None:
+                    raise ValueError("shared Kitty view has no workspace metadata")
+                runtime_session, expected = write_runtime_session(directory, session, env, variables)
+                before_ids = {window.get("id") for window in list_os_windows(shared["address"])}
+                result = subprocess.run(kitty_instance.launch_command(shared["group"], runtime_session),
+                                        env=os.environ.copy(), stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=120)
+                if result.returncode:
+                    detail = (result.stderr or result.stdout or "").strip()
+                    raise ValueError("Kitty did not accept the shared workspace window" +
+                                     (": " + detail.splitlines()[-1] if detail else ""))
+                os_window_id = identify_os_window(shared["address"], before_ids, expected)
+                write_view(directory, shared["address"], shared["pid"], os_window_id, expected)
+                view_written = True
+                try:
+                    kitty_instance.tab_style(shared["address"], shared["pid"], "apply")
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    print(f"kzw: tab index unavailable in this Kitty instance: {exc}",
+                          file=sys.stderr, flush=True)
+                try:
+                    os.unlink(runtime_session)
+                except OSError:
+                    pass
+                runtime_session = None
+            else:
+                # Mask Kitty's automatic wrapper title until the process monitor has
+                # identified the actual foreground program, including on new tabs.
+                args = ["kitty", "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only",
+                        "-o", f"shell={pane_executable}", "-o", "enabled_layouts=splits,tall,stack",
+                        "-o", "macos_quit_when_last_window_closed=yes",
+                        "-o", "tab_title_template=" + TAB_TITLE_TEMPLATE,
+                        "-o", "active_tab_title_template=" + TAB_TITLE_TEMPLATE,
+                        "-o", f"watcher={Path(__file__).with_name('watcher.py')}"]
+                kitten = Path(__file__).with_name("close_kitten.py")
+                create_kitten = Path(__file__).with_name("create_kitten.py")
+                detach_kitten = Path(__file__).with_name("detach_kitten.py")
+                args += ["-o", f"map super+w kitten {kitten} pane",
+                         "-o", f"map kitty_mod+w kitten {kitten} pane",
+                         "-o", f"map kitty_mod+q kitten {kitten} tab",
+                         "-o", f"map super+shift+w kitten {detach_kitten}",
+                         "-o", f"map super+enter kitten {create_kitten} split",
+                         "-o", f"map kitty_mod+enter kitten {create_kitten} right",
+                         "-o", f"map kitty_mod+alt+enter kitten {create_kitten} below",
+                         "-o", "map kitty_mod+up scroll_to_prompt -1",
+                         "-o", "map kitty_mod+down scroll_to_prompt 1",
+                         "-o", f"map super+t kitten {create_kitten} tab",
+                         "-o", f"map kitty_mod+t kitten {create_kitten} tab"]
+                for number in range(1, 11):
+                    args += ["-o", f"map super+{number % 10} goto_tab {number}"]
+                if appearance is not None:
+                    args.extend(appearance["options"])
+                    if appearance["marker"] is not None:
+                        env["KZW_INHERIT_MARKER"] = json.dumps(appearance["marker"], separators=(",", ":"))
+                        print("kzw: inherited marker initializes asynchronously; verify masking in every pane before sharing",
+                              file=sys.stderr)
+                    else:
+                        env.pop("KZW_INHERIT_MARKER", None)
+                else:
+                    env.pop("KZW_INHERIT_MARKER", None)
+                args += ["--session", str(session)]
+                child = subprocess.Popen(kitty_launch_command(args, env), env=env, stdin=subprocess.DEVNULL)
         except Exception:
             status_stop()
             title_stop.set()
             if broker:
                 broker.close()
+            if runtime_session is not None:
+                try:
+                    os.unlink(runtime_session)
+                except OSError:
+                    pass
             raise
-        print(f"Workspace {name!r} started. Keep this supervisor running; close Kitty to detach.", flush=True)
         last_error = None
+        reported_started = False
         pending_focus = focus
         change_signal = directory / "watcher.changed"
         last_signal = None
@@ -1318,22 +1559,20 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         workspace_observed = False
         empty_since = None
         next_view_check = 0.0
-        source_window = supervisor_window.source_window()
+        source_window = None if shared is not None else supervisor_window.source_window()
         minimize_attempted = False
         try:
-            while child.poll() is None:
+            while child is None or child.poll() is None:
                 try:
-                    if bootstrap:
-                        if time.monotonic() >= next_bootstrap:
-                            next_bootstrap = time.monotonic() + 1
-                            finish_bootstrap(directory, pane_executable)
-                            bootstrap = False
-                        if bootstrap:
-                            time.sleep(0.1)
-                            continue
-                    if workspace_observed and time.monotonic() >= next_view_check:
+                    # Check for a vanished view even while the first capture is
+                    # still pending, so a closed window cannot strand us here.
+                    if (view_written or workspace_observed) and time.monotonic() >= next_view_check:
                         next_view_check = time.monotonic() + 1
-                        current = json.loads(query(sock, "ls"))
+                        if view_written:
+                            current = [window for window in list_os_windows(shared["address"])
+                                       if window.get("id") == os_window_id]
+                        else:
+                            current = json.loads(view_query(directory, "ls"))
                         native = directory / "native-pending"
                         unfinished = ((directory / "pending-create.json").exists() or (directory / "pending-close.json").exists() or
                                       (native.exists() and (not native.is_dir() or any(native.iterdir()))))
@@ -1343,11 +1582,25 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                             elif time.monotonic() - empty_since >= 2:
                                 # The workspace view is gone, but Kitty may still
                                 # own unrelated utility windows. Never close them.
+                                view_gone = True
                                 break
                         else:
                             empty_since = None
+                    if bootstrap:
+                        if time.monotonic() >= next_bootstrap:
+                            next_bootstrap = time.monotonic() + 1
+                            finish_bootstrap(directory, pane_executable)
+                            bootstrap = False
+                        if bootstrap:
+                            time.sleep(0.1)
+                            continue
+                    if not reported_started:
+                        startup_status(True, directory=directory)
+                        print(f"Workspace {name!r} started. Keep this supervisor running; close Kitty to detach.",
+                              flush=True)
+                        reported_started = True
                     if pending_focus:
-                        restore_focus(sock, pending_focus)
+                        restore_focus(sock, pending_focus, view_directory=directory)
                         pending_focus = None
                     try:
                         signal = change_signal.stat().st_mtime_ns
@@ -1393,7 +1646,13 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                     if message != last_error:
                         print(f"kzw: snapshot deferred: {message}", file=sys.stderr, flush=True)
                         last_error = message
-                time.sleep(0.1)
+                try:
+                    time.sleep(0.1)
+                except KeyboardInterrupt:
+                    if child is not None:
+                        raise
+                    print("kzw: supervisor still running; use kzw detach to close the workspace.",
+                          file=sys.stderr, flush=True)
         except KeyboardInterrupt:
             print("\nkzw: supervisor stopped; Kitty remains open, but snapshots have stopped.", file=sys.stderr)
             # Do not release the lock while Kitty still owns the workspace.
@@ -1410,7 +1669,14 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                         supervisor_window.change(source_window, "restore")
                     except (OSError, ValueError, subprocess.SubprocessError) as exc:
                         print(f"kzw: restore the supervisor window from the Dock: {exc}", file=sys.stderr, flush=True)
-    return child.returncode if child.returncode is not None else 0
+                if view_written and view_gone:
+                    remove_view(directory)
+                if view_written and shared is not None:
+                    try:
+                        kitty_instance.tab_style(shared["address"], shared["pid"], "restore")
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        pass
+    return child.returncode if child is not None and child.returncode is not None else 0
 
 
 def create_remote(name, host):
@@ -1482,7 +1748,7 @@ def rename_workspace(name, destination, host=""):
                 except BlockingIOError:
                     raise ValueError("workspace is attached locally; detach before renaming") from None
             source, target = paths
-            if any((source / item).exists() for item in ("kitty.sock", "pending-create.json", "pending-close.json", "native-stage.json")):
+            if any((source / item).exists() for item in ("kitty.sock", "view.json", "pending-create.json", "pending-close.json", "native-stage.json")):
                 raise ValueError("workspace has an active view or unfinished local operations")
             native = source / "native-pending"
             if native.exists() and (native.is_symlink() or not native.is_dir() or any(native.iterdir())):
@@ -1551,7 +1817,7 @@ def kill_workspace(name, host):
         if not host and (directory / "workspace.kitty-session").exists() and not (directory / "remote.json").exists():
             raise ValueError("kill currently supports coordinator workspaces only; this is a legacy workspace")
         if any((directory / item).exists() for item in
-               ("kitty.sock", "pending-close.json", "pending-create.json", "native-stage.json")):
+               ("kitty.sock", "view.json", "pending-close.json", "pending-create.json", "native-stage.json")):
             raise ValueError("workspace may be active or has unfinished local operations")
         pending = directory / "native-pending"
         if pending.exists() and (not pending.is_dir() or any(pending.iterdir())):
@@ -1576,7 +1842,7 @@ def kill_workspace(name, host):
     print(f"Workspace {name!r} termination scheduled; the coordinator will retire it after verified cleanup")
 
 
-def attach_remote(name, host, create_empty=False, appearance=None):
+def attach_remote(name, host, create_empty=False, appearance=None, new_instance=False):
     directory = state_dir(name, host)
     executable = shutil.which("kzw-pane")
     if not executable:
@@ -1586,7 +1852,11 @@ def attach_remote(name, host, create_empty=False, appearance=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("workspace is already running") from None
-        if (directory / "kitty.sock").exists() or (directory / "pending-close.json").exists():
+        view = view_state(directory)
+        if view is not None and not view_alive(directory, view):
+            remove_view(directory)
+            view = None
+        if view is not None or (directory / "kitty.sock").exists() or (directory / "pending-close.json").exists():
             raise ValueError("local workspace may still be active or has a pending close")
         pending = directory / "pending-create.json"
         recovering_bootstrap = False
@@ -1598,22 +1868,26 @@ def attach_remote(name, host, create_empty=False, appearance=None):
         remote_client.acquire_lease(directory, name, host)
         stop_heartbeat = lambda: None
         appearance_arg = {"appearance": appearance} if appearance is not None else {}
+        run_arg = {"new_instance": True} if new_instance else {}
         try:
             stop_heartbeat = remote_client.start_lease_heartbeat(directory)
             if recovering_managed:
                 if create_empty:
                     raise ValueError("a pane creation is already pending")
                 recover_remote_managed_creation(directory, name, host, executable)
-                return run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg)
+                return run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg, **run_arg)
             if recovering_bootstrap:
                 if create_empty:
                     raise ValueError("a bootstrap is already pending; attach to recover it")
                 if reconcile_bootstrap_commit(directory, name, host, executable):
-                    return run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg)
+                    return run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg, **run_arg)
                 session = recover_bootstrap(directory, name, host, executable)
-                return run(name, host, remote_attached=True, existing_lock=lock, bootstrap_session=session, **appearance_arg)
+                return run(name, host, remote_attached=True, existing_lock=lock, bootstrap_session=session,
+                           **appearance_arg, **run_arg)
             remote_client.pull(directory, name, host, executable)
-            return run(name, host, remote_attached=True, existing_lock=lock, create_empty=True, **appearance_arg) if create_empty else run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg)
+            return (run(name, host, remote_attached=True, existing_lock=lock, create_empty=True,
+                        **appearance_arg, **run_arg) if create_empty else
+                    run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg, **run_arg))
         finally:
             stop_heartbeat()
             try:
@@ -1650,6 +1924,21 @@ def inspect_remote(name, host, as_json=False):
         print("panes: " + (", ".join(result["panes"]) or "(none)"))
         print("focused_pane: " + (result["focused_pane"] or "(none)"))
         print("layout (portable Kitty session):\n" + result["snapshot"], end="")
+
+
+def inspect_inventory(host, as_json=False):
+    result = remote_client.call(host, {"method": "session.inventory"})
+    if as_json:
+        print(json.dumps(result, separators=(",", ":")), flush=True)
+    else:
+        sample = result["observation"]
+        print("inventory: " + ("available" if result["available"] else "unknown — " + result["error"]))
+        print("source: " + json.dumps(sample["source"], sort_keys=True))
+        for session in result["sessions"]:
+            owner = session["workspace"] or session["assignment"]
+            roles = ",".join(ref["role"] for ref in session["references"])
+            print(f"{session['id']}\t{session['presence']}\t{owner}\t{roles}")
+    return 0 if result["available"] else 1
 
 
 def events_remote(name, host, after=None, once=False, as_json=False):
@@ -1705,6 +1994,65 @@ def events_remote(name, host, after=None, once=False, as_json=False):
                 return
 
 
+def background_command(args):
+    return (args.command in BACKGROUND_COMMANDS or
+            (args.command == "create" and getattr(args, "attach", False)))
+
+
+def background_directory(args):
+    if args.command == "start":
+        return state_dir(args.name)
+    if args.command == "new-pane" and not getattr(args, "host", ""):
+        return state_dir(args.name)
+    return state_dir(args.name, getattr(args, "host", ""))
+
+
+def spawn_background(args):
+    """Re-exec the attach as a detached supervisor and report startup status."""
+    directory = background_directory(args)
+    status = directory / "supervisor.startup.json"
+    log = directory / "supervisor.log"
+    if status.is_symlink():
+        raise ValueError("unsafe supervisor startup state")
+    try:
+        status.unlink()
+    except FileNotFoundError:
+        pass
+    env = os.environ.copy()
+    env["KZW_BACKGROUND_SUPERVISOR"] = "1"
+    env["KZW_STARTUP_STATUS"] = str(status)
+    with open(log, "ab") as stream:
+        child = subprocess.Popen([sys.executable, "-m", "kzw.cli", *sys.argv[1:]],
+                                 stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
+                                 start_new_session=True, env=env, close_fds=True)
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        try:
+            data = json.loads(status.read_text())
+        except (FileNotFoundError, OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and data.get("ok") is True:
+            try:
+                status.unlink()
+            except FileNotFoundError:
+                pass
+            print(f"Workspace {args.name!r} started in the background; log: {log}")
+            return 0
+        if isinstance(data, dict) and isinstance(data.get("error"), str):
+            try:
+                status.unlink()
+            except FileNotFoundError:
+                pass
+            print(f"kzw: {data['error']}", file=sys.stderr)
+            return 1
+        if child.poll() is not None:
+            print(f"kzw: supervisor exited before startup; see {log}", file=sys.stderr)
+            return child.returncode or 1
+        time.sleep(0.1)
+    print(f"kzw: supervisor did not report startup within 120s; see {log}", file=sys.stderr)
+    return 1
+
+
 def main():
     parser = argparse.ArgumentParser(prog="kzw")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1720,15 +2068,21 @@ def main():
     start.add_argument("name")
     start.add_argument("--host", default="", help="SSH host for newly created panes")
     start.add_argument("--inherit-appearance", action="store_true", help="copy colors, font size and active function marker from Kitty")
+    start.add_argument("--hold", action="store_true", help="supervise in the foreground instead of the background")
+    start.add_argument("--new-kitty-instance", action="store_true", help="open a separate Kitty instance instead of the current one")
     create_parser = commands.add_parser("create", help="create a dormant remote workspace")
     create_parser.add_argument("name")
     create_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
     create_parser.add_argument("--attach", action="store_true", help="attach immediately after creating the workspace")
     create_parser.add_argument("--inherit-appearance", action="store_true", help="copy Kitty appearance when used with --attach")
+    create_parser.add_argument("--hold", action="store_true", help="supervise in the foreground instead of the background")
+    create_parser.add_argument("--new-kitty-instance", action="store_true", help="open a separate Kitty instance instead of the current one")
     attach_parser = commands.add_parser("attach", help="attach a remote workspace")
     attach_parser.add_argument("name")
     attach_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
     attach_parser.add_argument("--inherit-appearance", action="store_true", help="copy colors, font size and active function marker from Kitty")
+    attach_parser.add_argument("--hold", action="store_true", help="supervise in the foreground instead of the background")
+    attach_parser.add_argument("--new-kitty-instance", action="store_true", help="open a separate Kitty instance instead of the current one")
     inspect_parser = commands.add_parser("inspect", help="inspect the authoritative coordinator layout")
     inspect_parser.add_argument("name")
     inspect_parser.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
@@ -1744,6 +2098,8 @@ def main():
     new_pane_parser.add_argument("--host", default="", help="remote workspace origin")
     new_pane_parser.add_argument("--shell-host", default="", help="SSH host for a local-state workspace's new shell")
     new_pane_parser.add_argument("--inherit-appearance", action="store_true", help="copy colors, font size and active function marker from Kitty")
+    new_pane_parser.add_argument("--hold", action="store_true", help="supervise in the foreground instead of the background")
+    new_pane_parser.add_argument("--new-kitty-instance", action="store_true", help="open a separate Kitty instance instead of the current one")
     save = commands.add_parser("save", help="save a live workspace explicitly")
     save.add_argument("name")
     save.add_argument("--allow-removals", action="store_true")
@@ -1788,16 +2144,25 @@ def main():
     create_managed.add_argument("--cwd-uri", default="")
     list_parser = commands.add_parser("list", help="list saved workspaces")
     list_parser.add_argument("--host", default="")
+    inventory_parser = commands.add_parser("inventory", help="join all origin zmx sessions to server layout metadata")
+    inventory_parser.add_argument("--host", default="", help="remote origin; omit for local coordinator")
+    inventory_parser.add_argument("--json", action="store_true")
     server_stop = commands.add_parser("server-stop", help="stop the remote workspace coordinator")
     server_stop.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
     args = parser.parse_args()
     try:
+        if (not getattr(args, "hold", False) and os.environ.get("KZW_BACKGROUND_SUPERVISOR") != "1"
+                and background_command(args)):
+            return spawn_background(args)
+        run_arg = {"new_instance": True} if getattr(args, "new_kitty_instance", False) else {}
         appearance_arg = {}
         if getattr(args, "inherit_appearance", False):
             if args.command == "create" and not args.attach:
                 raise ValueError("--inherit-appearance requires --attach when creating a workspace")
             from .appearance import capture
             appearance_arg["appearance"] = capture()
+        if args.command == "create" and getattr(args, "new_kitty_instance", False) and not args.attach:
+            raise ValueError("--new-kitty-instance requires --attach when creating a workspace")
         if args.command == "sessions":
             if args.sessions_command == "bash-hook":
                 sys.stdout.write(Path(__file__).with_name("bash_hook.sh").read_text())
@@ -1813,12 +2178,12 @@ def main():
                 directory = state_dir(args.name)
                 config = directory / "remote.json"
                 if config.is_file() and json.loads(config.read_text()).get("host") == "":
-                    return attach_remote(args.name, "", **appearance_arg)
-            return run(args.name, args.host, **appearance_arg)
+                    return attach_remote(args.name, "", **appearance_arg, **run_arg)
+            return run(args.name, args.host, **appearance_arg, **run_arg)
         if args.command == "create":
             create_remote(args.name, args.host)
             if args.attach:
-                return attach_remote(args.name, args.host, **appearance_arg)
+                return attach_remote(args.name, args.host, **appearance_arg, **run_arg)
             return 0
         if args.command == "kill":
             kill_workspace(args.name, args.host)
@@ -1827,10 +2192,12 @@ def main():
             rename_workspace(args.name, args.destination, args.host)
             return 0
         if args.command == "attach":
-            return attach_remote(args.name, args.host, **appearance_arg)
+            return attach_remote(args.name, args.host, **appearance_arg, **run_arg)
         if args.command == "inspect":
             inspect_remote(args.name, args.host, args.json)
             return 0
+        if args.command == "inventory":
+            return inspect_inventory(args.host, args.json)
         if args.command == "events":
             events_remote(args.name, args.host, args.after, args.once, args.json)
             return 0
@@ -1840,8 +2207,9 @@ def main():
             if not args.host and not args.shell_host:
                 config = state_dir(args.name) / "remote.json"
                 if config.is_file() and json.loads(config.read_text()).get("host") == "":
-                    return attach_remote(args.name, "", create_empty=True, **appearance_arg)
-            return attach_remote(args.name, args.host, create_empty=True, **appearance_arg) if args.host else run(args.name, args.shell_host, create_empty=True, **appearance_arg)
+                    return attach_remote(args.name, "", create_empty=True, **appearance_arg, **run_arg)
+            return (attach_remote(args.name, args.host, create_empty=True, **appearance_arg, **run_arg) if args.host
+                    else run(args.name, args.shell_host, create_empty=True, **appearance_arg, **run_arg))
         if args.command == "server-stop":
             if input("Stop the workspace server? Connected clients must detach first. [y/N] ").strip().lower() != "y":
                 print("Cancelled")
@@ -1903,8 +2271,10 @@ def main():
             print(name)
         return 0
     except KeyboardInterrupt:
+        startup_status(False, "interrupted")
         return 130
     except (OSError, EOFError, ValueError, subprocess.SubprocessError) as exc:
+        startup_status(False, exc)
         print(f"kzw: {exc}", file=sys.stderr)
         return 1
 

@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import socket
 import sqlite3
 import stat
@@ -31,6 +33,101 @@ class Conflict(ValueError):
 
 class SessionNotReady(Conflict):
     pass
+
+
+def layout_sessions(snapshot, panes):
+    """Validate the session-ID join at the authority, not only in the UI client.
+
+    Keep this stdlib-only: this module is also shipped as a standalone SSH server.
+    Kitty's serialized layout retains topology/sizes; these locations index its
+    leaves by persistent zmx ID. Serialized window IDs are layout-local only.
+    """
+    if (not isinstance(snapshot, str) or not isinstance(panes, list) or
+            any(not isinstance(pane, str) or not PANE.fullmatch(pane) for pane in panes) or
+            len(panes) != len(set(panes))):
+        raise ValueError("invalid layout session manifest")
+    if snapshot in ("# kzw-dormant-workspace\n", "# kzw-empty-workspace\n"):
+        if panes:
+            raise ValueError("empty layout conflicts with pane manifest")
+        return {}
+    found, windows, focus = {}, set(), None
+    states = {}
+    tab, split = 0, 0
+    for raw in snapshot.splitlines():
+        line = raw.strip()
+        directive = line.split(maxsplit=1)[0] if line else ""
+        if line.startswith("# kzw-focus "):
+            value = json.loads(line[len("# kzw-focus "):])
+            if focus is not None or not isinstance(value, dict) or value.get("pane") not in panes:
+                raise ValueError("invalid layout focus")
+            focus = value["pane"]
+        elif directive == "new_tab":
+            if tab and not split:
+                raise ValueError("layout contains an empty tab")
+            tab, split = tab + 1, 0
+        elif directive == "set_layout_state":
+            if not tab or tab in states or len(line.split(maxsplit=1)) != 2:
+                raise ValueError("invalid tab layout state")
+            states[tab] = json.loads(line.split(maxsplit=1)[1])
+        elif directive == "new_os_window":
+            raise ValueError("workspace layout must describe one OS window")
+        elif directive == "launch":
+            args = shlex.split(line)
+            command = args[-6:]
+            if (not tab or len(args) < 8 or not args[1].startswith("kitty-unserialize-data=") or
+                    command[:2] != ["KZW_PANE_EXECUTABLE", "--pane"] or
+                    not PANE.fullmatch(command[2]) or command[3:] != ["--host", "KZW_ORIGIN", "--existing"]):
+                raise ValueError("layout contains an unmanaged launch")
+            pane = command[2]
+            data = json.loads(args[1][len("kitty-unserialize-data="):])
+            wid = data.get("id") if isinstance(data, dict) else None
+            if type(wid) is not int or wid in windows or "cmd_at_shell_startup" in data:
+                raise ValueError("invalid serialized layout window")
+            if pane in found:
+                raise ValueError("duplicate layout session ID")
+            for option in args[2:-6]:
+                if not option.startswith("--"):
+                    raise ValueError("invalid layout launch option")
+                if option.startswith("--var=kzw_pane=") and option != "--var=kzw_pane=" + pane:
+                    raise ValueError("layout pane identity disagrees with session ID")
+                if option.startswith("--var=kzw_host=") and option != "--var=kzw_host=KZW_ORIGIN":
+                    raise ValueError("layout origin disagrees with session origin")
+            split += 1
+            found[pane] = {"tab": tab, "pane": split, "serialized_window_id": wid}
+            windows.add(wid)
+    if not found or not split or set(found) != set(panes):
+        raise ValueError("layout and pane manifest disagree")
+    for pane, location in found.items():
+        location["focused"] = pane == focus
+    for tab, state in states.items():
+        all_windows = state.get("all_windows") if isinstance(state, dict) else None
+        groups = all_windows.get("window_groups") if isinstance(all_windows, dict) else None
+        if not isinstance(groups, list) or any(not isinstance(group, dict) or
+                type(group.get("id")) is not int or not isinstance(group.get("window_ids"), list) or
+                not group["window_ids"] for group in groups):
+            raise ValueError("invalid layout window groups")
+        group_ids = [group["id"] for group in groups]
+        if len(set(group_ids)) != len(group_ids):
+            raise ValueError("duplicate layout window group")
+        grouped = [wid for group in groups for wid in group["window_ids"]]
+        expected = [loc["serialized_window_id"] for loc in found.values() if loc["tab"] == tab]
+        if any(type(wid) is not int for wid in grouped) or sorted(grouped) != sorted(expected):
+            raise ValueError("layout topology and session windows disagree")
+        if state.get("class") == "Splits":
+            stack, leaves = [state.get("pairs")], []
+            while stack:
+                node = stack.pop()
+                if type(node) is int:
+                    leaves.append(node)
+                elif isinstance(node, dict) and "one" in node:
+                    stack.append(node["one"])
+                    if "two" in node:
+                        stack.append(node["two"])
+                else:
+                    raise ValueError("invalid split layout tree")
+            if sorted(leaves) != sorted(group_ids):
+                raise ValueError("split tree and session groups disagree")
+    return found
 
 
 class Store:
@@ -87,8 +184,109 @@ class Store:
                 revision INTEGER NOT NULL, result TEXT NOT NULL,
                 PRIMARY KEY(workspace, id)
             );
+            CREATE TABLE IF NOT EXISTS zmx_inventory (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                generation INTEGER NOT NULL, observed_at REAL NOT NULL,
+                source TEXT NOT NULL, sessions TEXT NOT NULL
+            );
         """)
         self.zmx = zmx
+
+    def zmx_environment(self):
+        env = os.environ.copy()
+        env.pop("ZMX_SESSION", None)
+        env.pop("ZMX_SESSION_PREFIX", None)
+        env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
+        return env
+
+    def inventory_source(self, env):
+        selector = next((key for key in ("ZMX_DIR", "XDG_RUNTIME_DIR", "TMPDIR") if env.get(key)), None)
+        return {"host": socket.gethostname(), "uid": os.getuid(),
+                "executable": shutil.which(self.zmx, path=env["PATH"]) or self.zmx,
+                "socket_selector": selector, "socket_base": os.path.abspath(env[selector] if selector else "/tmp")}
+
+    def read_inventory(self):
+        """One full, unprefixed zmx inventory, pinned to its origin namespace.
+
+        Serialize sampling with publication so a slow old response cannot replace
+        a newer observation. A failed query leaves the last successful sample.
+        Callers already in a mutation transaction own its commit/rollback.
+        """
+        own_transaction = not self.db.in_transaction
+        if own_transaction:
+            self.db.execute("BEGIN IMMEDIATE")
+        try:
+            env = self.zmx_environment()
+            source = self.inventory_source(env)
+            previous = self.db.execute("SELECT generation,source FROM zmx_inventory WHERE singleton=1").fetchone()
+            if previous and json.loads(previous[1]) != source:
+                raise Conflict("zmx inventory origin changed; retained inventory and layouts require investigation")
+            listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
+                                     text=True, env=env, timeout=10, check=True)
+            sessions = listing.stdout.splitlines()
+            if any(not session or "\x00" in session for session in sessions) or len(sessions) != len(set(sessions)):
+                raise ValueError("invalid flattened zmx inventory")
+            result = {"generation": previous[0] + 1 if previous else 1, "observed_at": time.time(),
+                      "source": source, "sessions": sorted(sessions)}
+            self.db.execute("INSERT OR REPLACE INTO zmx_inventory VALUES (1,?,?,?,?)",
+                            (result["generation"], result["observed_at"], json.dumps(source), json.dumps(result["sessions"])))
+            if own_transaction:
+                self.db.execute("COMMIT")
+            return result
+        except Exception:
+            if own_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
+    def inventory(self):
+        """Account for every live session, plus retained absent/unknown references."""
+        error = None
+        try:
+            sample = self.read_inventory()
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            error = str(exc)
+            row = self.db.execute("SELECT generation,observed_at,source,sessions FROM zmx_inventory WHERE singleton=1").fetchone()
+            sample = ({"generation": row[0], "observed_at": row[1], "source": json.loads(row[2]),
+                       "sessions": json.loads(row[3])} if row else
+                      {"generation": 0, "observed_at": None, "source": None, "sessions": []})
+        live = set(sample["sessions"])
+        claims = {pane: [] for pane in live}
+        workspaces = {}
+        self.db.execute("BEGIN")
+        try:
+            for name, revision, snapshot, encoded in self.db.execute("SELECT name,revision,snapshot,panes FROM workspaces ORDER BY name"):
+                panes = json.loads(encoded)
+                workspace = {"revision": revision, "snapshot": snapshot, "panes": panes}
+                workspaces[name] = workspace
+                try:
+                    locations = layout_sessions(snapshot, panes)
+                except ValueError as exc:
+                    # Old/corrupt records remain inspectable, never silently repaired.
+                    workspace["layout_error"] = str(exc)
+                    locations = {}
+                for pane in panes:
+                    claims.setdefault(pane, []).append({"workspace": name, "role": "layout", "location": locations.get(pane)})
+            for name, revision, snapshot, encoded in self.db.execute("SELECT workspace,revision,snapshot,panes FROM staged_layouts"):
+                workspaces[name]["staged"] = {"revision": revision, "snapshot": snapshot, "panes": json.loads(encoded)}
+                for pane in json.loads(encoded):
+                    claims.setdefault(pane, []).append({"workspace": name, "role": "staged"})
+            for table, role in (("reservations", "reserved"), ("cleanup", "closing")):
+                for name, pane in self.db.execute(f"SELECT workspace,pane FROM {table}"):
+                    claims.setdefault(pane, []).append({"workspace": name, "role": role})
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        sessions = []
+        for pane, references in sorted(claims.items()):
+            owners = {ref["workspace"] for ref in references}
+            sessions.append({"id": pane, "presence": "unknown" if error is not None else "live" if pane in live else "missing",
+                             "last_seen_live": pane in live, "workspace": next(iter(owners)) if len(owners) == 1 else None,
+                             "assignment": "conflict" if len(owners) > 1 else "assigned" if owners else "unassigned",
+                             "references": references})
+        return {"available": error is None, "error": error,
+                "query_source": self.inventory_source(self.zmx_environment()), "observation": sample,
+                "sessions": sessions, "workspaces": workspaces}
 
     def close(self):
         self.db.close()
@@ -96,6 +294,11 @@ class Store:
     def observe_detached(self):
         """Journal status even when no client is connected; never prune here."""
         names = [row[0] for row in self.db.execute("SELECT name FROM workspaces ORDER BY name")]
+        if not names:
+            try:
+                self.read_inventory()
+            except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
+                pass
         for name in names:
             try:
                 if self.db.execute("SELECT 1 FROM cleanup WHERE workspace=?", (name,)).fetchone():
@@ -107,7 +310,7 @@ class Store:
                 continue
 
     def retire_if_empty(self, name, status):
-        """Retire only an established, fully absent, quiescent workspace."""
+        """Retire an explicitly killed workspace after cleanup and lease release."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
@@ -118,26 +321,18 @@ class Store:
             if panes != set(status["confirmed_missing"]) or status["live"]:
                 self.db.execute("COMMIT")
                 return False
-            # A dormant workspace has never contained a session. Preserve it.
-            established = self.db.execute(
-                "SELECT 1 FROM workspace_events WHERE workspace=? AND "
-                "((kind='layout.updated' AND json_extract(data,'$.added[0]') IS NOT NULL) OR "
-                "(kind='workspace.renamed' AND json_extract(data,'$.to')=? AND json_extract(data,'$.panes[0]') IS NOT NULL)) AND seq > "
-                "COALESCE((SELECT MAX(seq) FROM workspace_events WHERE workspace=? AND "
-                "(kind='workspace.retired' OR (kind='workspace.renamed' AND json_extract(data,'$.from')=?))),0) LIMIT 1",
-                (name, name, name, name)).fetchone()
             busy = any(self.db.execute(query, (name,)).fetchone() for query in (
                 "SELECT 1 FROM leases WHERE workspace=? AND expires > strftime('%s','now')",
                 "SELECT 1 FROM reservations WHERE workspace=?",
                 "SELECT 1 FROM staged_layouts WHERE workspace=?",
                 "SELECT 1 FROM cleanup WHERE workspace=?"))
             killing = self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone()
-            if (not established and not killing) or busy:
+            # Inventory describes existence, not permission to discard layout.
+            if not killing or busy:
                 self.db.execute("COMMIT")
                 return False
             revision = row[0] + 1
-            self.add_event(name, revision, "workspace.retired", {"reason": "managed_kill" if killing else "confirmed_absence",
-                                                                   "panes": sorted(panes)})
+            self.add_event(name, revision, "workspace.retired", {"reason": "managed_kill", "panes": sorted(panes)})
             self.db.execute("INSERT OR REPLACE INTO retired_workspaces VALUES (?,?)", (name, revision))
             self.db.execute("DELETE FROM workspace_kills WHERE workspace=?", (name,))
             for table in ("workspaces", "leases", "observed_sessions", "session_presence"):
@@ -169,6 +364,8 @@ class Store:
         if method == "workspace.list":
             rows = self.db.execute("SELECT name,revision FROM workspaces ORDER BY name").fetchall()
             return {"workspaces": [{"name": row[0], "revision": row[1]} for row in rows]}
+        if method == "session.inventory":
+            return self.inventory()
         name = req.get("workspace", "")
         if not isinstance(name, str) or not NAME.fullmatch(name):
             raise ValueError("invalid workspace")
@@ -207,10 +404,15 @@ class Store:
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
-        if method in ("workspace.lease.acquire", "workspace.lease.renew", "workspace.lease.release", "workspace.lease.inspect"):
+        if method in ("workspace.lease.acquire", "workspace.lease.renew", "workspace.lease.release",
+                      "workspace.lease.inspect", "workspace.lease.recover"):
             token = req.get("token")
             if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
                 raise ValueError("invalid workspace lease token")
+            if method == "workspace.lease.recover":
+                previous = req.get("previous_token")
+                if not isinstance(previous, str) or not re.fullmatch(r"[0-9a-f]{32}", previous) or previous == token:
+                    raise ValueError("invalid previous workspace lease token")
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 if not self.db.execute("SELECT 1 FROM workspaces WHERE name=?", (name,)).fetchone():
@@ -225,7 +427,18 @@ class Store:
                              ("-active" if row[1] > now else "-expired"))
                     self.db.execute("COMMIT")
                     return {"state": state}
-                if method == "workspace.lease.acquire":
+                if method == "workspace.lease.recover":
+                    # A lost acknowledgement can be retried, but an expired
+                    # successor is acknowledged without reviving it. A later
+                    # recovery must rotate that token again. Explicit release
+                    # (expires=0) and any intervening owner always fence us.
+                    if row and row[0] == token and row[1] > 0:
+                        self.db.execute("COMMIT")
+                        return {"held": row[1] > now, "ttl": max(0, row[1] - now)}
+                    if not row or row[0] != previous or not 0 < row[1] <= now:
+                        raise Conflict("lease recovery refused: previous lease is active, released, or superseded")
+                    self.db.execute("UPDATE leases SET token=?,expires=? WHERE workspace=?", (token, now + 30, name))
+                elif method == "workspace.lease.acquire":
                     if row and row[0] == token and row[1] > now:
                         self.db.execute("COMMIT")
                         return {"held": True, "ttl": max(0, row[1] - now)}
@@ -260,6 +473,7 @@ class Store:
                     not isinstance(panes, list) or any(not isinstance(p, str) or not PANE.fullmatch(p) for p in panes) or
                     len(set(panes)) != len(panes)):
                 raise ValueError("invalid staged workspace layout")
+            layout_sessions(snapshot, panes)
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 self.check_lease(name, req.get("lease_token"))
@@ -364,13 +578,7 @@ class Store:
                     raise Conflict("pane is awaiting cleanup")
                 if self.db.execute("SELECT 1 FROM reservations WHERE pane=?", (pane,)).fetchone():
                     raise Conflict("pane is already reserved")
-                env = os.environ.copy()
-                env.pop("ZMX_SESSION", None)
-                env.pop("ZMX_SESSION_PREFIX", None)
-                env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
-                listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
-                                         text=True, env=env, timeout=10, check=True)
-                if pane in listing.stdout.splitlines():
+                if pane in self.read_inventory()["sessions"]:
                     raise Conflict("pane ID already belongs to a live zmx session")
                 self.db.execute("INSERT INTO reservations VALUES (?,?)", (pane, name))
                 self.add_event(name, revision, "pane.reserved", {"pane": pane})
@@ -399,13 +607,8 @@ class Store:
             if row is None:
                 raise ValueError("workspace does not exist")
             panes = set(json.loads(row[1]))
-            env = os.environ.copy()
-            env.pop("ZMX_SESSION", None)
-            env.pop("ZMX_SESSION_PREFIX", None)
-            env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
-            listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
-                                     text=True, env=env, timeout=10, check=True)
-            live = panes.intersection(listing.stdout.splitlines())
+            inventory = self.read_inventory()
+            live = panes.intersection(inventory["sessions"])
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 latest = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
@@ -422,7 +625,10 @@ class Store:
                     present = 1 if pane in live else 0
                     if pane in seen and presence.get(pane) != present:
                         self.db.execute("INSERT OR REPLACE INTO session_presence VALUES (?,?,?)", (name, pane, present))
-                        self.add_event(name, row[0], "session.live" if present else "session.missing", {"pane": pane})
+                        self.add_event(name, row[0], "session.live" if present else "session.missing",
+                                       {"pane": pane, "inventory_generation": inventory["generation"],
+                                        "observed_at": inventory["observed_at"], "source": inventory["source"],
+                                        "listed_sessions": inventory["sessions"]})
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
@@ -457,6 +663,9 @@ class Store:
         if (not isinstance(cancellations, list) or any(not isinstance(p, str) or not PANE.fullmatch(p) for p in cancellations) or
                 len(cancellations) != len(set(cancellations)) or (cancellations and method != "workspace.reconcile")):
             raise ValueError("invalid reservation cancellation")
+        if method in ("workspace.prune", "workspace.reconcile") and (removals or cancellations):
+            raise ValueError("automatic absence-based reconciliation is disabled; workspace state retained")
+        layout_sessions(snapshot, panes)
         if method == "workspace.reconcile" and not isinstance(req.get("lease_token"), str):
             raise ValueError("workspace reconciliation requires a lease")
         # The same durable intent may be retried by a newly fenced lease owner.
@@ -491,17 +700,6 @@ class Store:
                 reservations = {r[0] for r in self.db.execute("SELECT pane FROM reservations WHERE workspace=?", (name,))}
                 if reservations != set(cancellations) or self.db.execute("SELECT 1 FROM staged_layouts WHERE workspace=?", (name,)).fetchone():
                     raise Conflict("reservations or staged layout changed before reconciliation")
-            if method in ("workspace.prune", "workspace.reconcile"):
-                # An attachment/host failure is not a shell exit. Confirm on
-                # the origin itself before forgetting any session.
-                env = os.environ.copy()
-                env.pop("ZMX_SESSION", None)
-                env.pop("ZMX_SESSION_PREFIX", None)
-                env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
-                listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
-                                         text=True, env=env, timeout=10, check=True)
-                if (removed | set(cancellations)).intersection(listing.stdout.splitlines()):
-                    raise Conflict("a reconciled zmx session is still alive")
             added = current - old
             if method == "workspace.recover-stage":
                 staged = self.db.execute("SELECT revision,snapshot,panes FROM staged_layouts WHERE workspace=?", (name,)).fetchone()
@@ -512,14 +710,9 @@ class Store:
             if added:
                 # Registration is ownership, not merely a view observation.
                 # Never adopt a session that the origin cannot confirm exists.
-                env = os.environ.copy()
-                env.pop("ZMX_SESSION", None)
-                env.pop("ZMX_SESSION_PREFIX", None)
-                env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
-                listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
-                                         text=True, env=env, timeout=10, check=True)
+                inventory = self.read_inventory()
                 required = current if method == "workspace.recover-stage" else added
-                if not required.issubset(set(listing.stdout.splitlines())):
+                if not required.issubset(inventory["sessions"]):
                     raise SessionNotReady("new pane session is missing or not yet ready")
             # Never share ownership: closing one workspace must not kill a pane
             # referenced by another workspace or awaiting cleanup.
@@ -633,12 +826,8 @@ class Store:
             if row is None:
                 raise ValueError("workspace does not exist")
             pending = [r[0] for r in self.db.execute("SELECT pane FROM cleanup WHERE workspace=?", (name,))]
-            env = os.environ.copy()
-            env.pop("ZMX_SESSION", None)
-            env.pop("ZMX_SESSION_PREFIX", None)
-            env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
-            result = subprocess.run([self.zmx, "list", "--short"], capture_output=True, text=True, env=env, timeout=10, check=True)
-            live = set(result.stdout.splitlines())
+            env = self.zmx_environment()
+            live = set(self.read_inventory()["sessions"])
             failed = []
             for pane in pending:
                 if pane in live:
@@ -646,9 +835,7 @@ class Store:
                     if result.returncode:
                         failed.append(pane)
                         continue
-                    verification = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
-                                                  text=True, env=env, timeout=10, check=True)
-                    if pane in verification.stdout.splitlines():
+                    if pane in self.read_inventory()["sessions"]:
                         failed.append(pane)
                         continue
                 self.db.execute("DELETE FROM cleanup WHERE workspace=? AND pane=?", (name, pane))

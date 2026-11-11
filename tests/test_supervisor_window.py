@@ -46,7 +46,7 @@ class SupervisorWindowTests(unittest.TestCase):
                  patch("kzw.cli.supervisor_window.change", side_effect=change_error) as change, \
                  patch("kzw.cli.time.sleep"):
                 broker.return_value.path = path / "rpc.sock"
-                self.assertEqual(cli.run("Test", "origin", remote_attached=True), 0)
+                self.assertEqual(cli.run("Test", "origin", remote_attached=True, new_instance=True), 0)
                 return change.call_args_list
 
     def test_minimizes_only_after_capture_and_restores(self):

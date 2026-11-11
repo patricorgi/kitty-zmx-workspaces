@@ -9,6 +9,10 @@ import threading
 
 from .core import PANE
 
+# The same template is used by private instances and by the tab-style kitten
+# that temporarily configures a shared instance.
+TAB_TITLE_TEMPLATE = "{title.replace('kzw-pane', '…')}  {fmt.nobold}{fmt.noitalic}{index}"
+
 
 def parse_process_details(zmx_list, ps_output):
     """Map session names to foreground process names using their PTY's tpgid.
@@ -126,8 +130,12 @@ def command_states(tree):
     return result
 
 
-def refresh(socket, query, stop=None):
-    tree = json.loads(query(socket, "ls"))
+def refresh(list_tree, set_title, stop=None):
+    if not callable(list_tree):
+        socket, query = list_tree, set_title
+        list_tree = lambda: query(socket, "ls")
+        set_title = lambda tab_id, title: query(socket, "set-tab-title", "--match", f"id:{tab_id}", title)
+    tree = json.loads(list_tree())
     before = active_panes(tree)
     before_panes = tab_panes(tree)
     hosts = {}
@@ -141,7 +149,7 @@ def refresh(socket, query, stop=None):
     if stop is not None and stop.is_set():
         return
     # Focus can change while SSH is running. Never set a title for a stale pane.
-    tree = json.loads(query(socket, "ls"))
+    tree = json.loads(list_tree())
     after = active_panes(tree)
     after_panes = tab_panes(tree)
     states = command_states(tree)
@@ -162,16 +170,16 @@ def refresh(socket, query, stop=None):
             names.append(name or "?")
         desired = " │ ".join(names)
         if known and desired != title:
-            query(socket, "set-tab-title", "--match", f"id:{tab_id}", desired)
+            set_title(tab_id, desired)
 
 
-def start_title_monitor(socket, query, interval=2.0):
+def start_title_monitor(list_tree, set_title, interval=2.0):
     stop = threading.Event()
 
     def run():
         while not stop.is_set():
             try:
-                refresh(socket, query, stop)
+                refresh(list_tree, set_title, stop)
             except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
                 pass  # Socket/startup races are expected; retry on next pass.
             stop.wait(interval)
