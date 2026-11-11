@@ -82,14 +82,19 @@ def options_object(boss):
     return options
 
 
+def refresh_tab_bars(boss):
+    # Reapplying the existing options rebuilds macOS shortcuts from a keymap
+    # Kitty has already stripped of native-menu bindings (including Cmd+V).
+    # Only the tab bar caches these templates; leave the rest of Kitty alone.
+    for manager in boss.os_window_map.values():
+        manager.tab_bar.apply_options()
+        manager.mark_tab_bar_dirty()
+
+
 def apply(options, boss):
     options.tab_title_template = TEMPLATE
     options.active_tab_title_template = TEMPLATE
-    if hasattr(boss, "apply_new_options"):
-        boss.apply_new_options(options)
-    else:  # pragma: no cover - older Kitty
-        for manager in boss.os_window_map.values():
-            manager.refresh_active_tab_bar()
+    refresh_tab_bars(boss)
 
 
 @result_handler(no_ui=True)
@@ -117,10 +122,6 @@ def handle_result(args, answer, target_window_id, boss):
             # Preserve any runtime configuration change made while attached.
             if getattr(options, name) == TEMPLATE:
                 setattr(options, name, originals[name])
-        if hasattr(boss, "apply_new_options"):
-            boss.apply_new_options(options)
-        else:  # pragma: no cover - older Kitty
-            for manager in boss.os_window_map.values():
-                manager.refresh_active_tab_bar()
+        refresh_tab_bars(boss)
         path.unlink()
         return "restored"

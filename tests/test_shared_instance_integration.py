@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -135,6 +136,64 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
     def tab_style(self):
         output = self.raw("kitten", str(self.probe))
         return json.loads(output)
+
+    def test_tab_styling_preserves_shortcuts_and_paste_across_repeated_apply_restore(self):
+        if sys.platform != "darwin":
+            self.skipTest("native macOS shortcuts are required")
+        from kzw.titles import TAB_TITLE_TEMPLATE as TEMPLATE
+
+        self.baseline = self.sessions()
+        probe = str(REPO / "tests" / "kitty_shortcuts_probe.py")
+        style = str(REPO / "kzw" / "tab_style_kitten.py")
+        state = str(self.tmp / "Test-style.json")
+        window = json.loads(self.raw("ls"))[0]["tabs"][0]["windows"][0]
+        match = "id:" + str(window["id"])
+        token = secrets.token_hex(16)
+        self.raw("set-tab-title", "--match", "window_id:" + str(window["id"]), "Test")
+        self.raw("set-user-vars", "--match", match, "kzw_paste_probe=" + token)
+        reader = self.tmp / "paste_reader.py"
+        reader.write_text(
+            "import os, tty\n"
+            "tty.setraw(0)\n"
+            "os.write(1, b'\\x1b[?2004l\\r\\nPASTE_READY\\r\\n')\n"
+            "pending = b''\n"
+            "while True:\n"
+            "    chunk = os.read(0, 4096)\n"
+            "    if not chunk: break\n"
+            "    pending += chunk\n"
+            "    while b'kzw-paste-probe' in pending:\n"
+            "        pending = pending.split(b'kzw-paste-probe', 1)[1]\n"
+            "        os.write(1, b'RECEIVED:kzw-paste-probe\\r\\n')\n")
+        self.raw("send-text", "--match", match, "exec " + shlex.join([sys.executable, "-u", str(reader)]) + "\n")
+
+        def wait_for(text, count=1):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if self.raw("get-text", "--match", match).count(text) >= count:
+                    return
+                time.sleep(0.1)
+            self.fail("disposable paste reader did not receive " + text + ": " + self.raw("get-text", "--match", match)[-2000:])
+
+        # Require a complete output line, not the echoed Python command.
+        wait_for("\nPASTE_READY\n")
+        before = json.loads(self.raw("kitten", probe))
+        self.assertEqual(before["global"]["paste_from_clipboard"], "SingleKey(mods=8, key=118)")
+        before_tree = json.loads(self.raw("ls"))
+        count = 0
+        for action in ("apply", "apply", "restore", "apply", "restore"):
+            self.raw("kitten", style, action, state)
+            after = json.loads(self.raw("kitten", probe))
+            self.assertEqual(after["global"], before["global"])
+            self.assertEqual(after["modes"], before["modes"])
+            templates = [TEMPLATE, TEMPLATE] if action == "apply" else before["templates"]
+            self.assertEqual(after["templates"], templates)
+            self.assertTrue(all(value == templates for value in after["renderers"].values()))
+            self.assertEqual(json.loads(self.raw("kitten", "--match", match, probe, "paste", token)), {"consumed": True})
+            count += 1
+            wait_for("RECEIVED:kzw-paste-probe", count)
+        after_tree = json.loads(self.raw("ls"))
+        self.assertEqual(after_tree[0]["tabs"][0]["layout_state"], before_tree[0]["tabs"][0]["layout_state"])
+        self.assertEqual(after_tree[0]["tabs"][0]["windows"][0]["pid"], before_tree[0]["tabs"][0]["windows"][0]["pid"])
 
     def test_attach_in_shared_instance_and_detach_only_workspace(self):
         self.baseline = self.sessions()
