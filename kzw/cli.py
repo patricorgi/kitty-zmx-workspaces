@@ -16,7 +16,7 @@ import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 
 from .core import FOCUS_PREFIX, FLAG, PANE, atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
-from .titles import TAB_TITLE_TEMPLATE, start_title_monitor
+from .titles import ACTIVE_TAB_TITLE_TEMPLATE, TAB_TITLE_TEMPLATE, start_title_monitor
 from . import kitty_instance
 from . import remote_client
 from . import supervisor_window
@@ -935,13 +935,6 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
     executable = shutil.which("kzw-pane")
     if not executable:
         raise ValueError("kzw-pane not found on PATH")
-    cwd = ""
-    if cwd_uri:
-        try:
-            from .shell_cwd import resolve
-            cwd = resolve(cwd_uri, host)
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            print(f"kzw: shell working directory unavailable; using default: {exc}", file=sys.stderr, flush=True)
     with capture_lock(directory):
         if (directory / "remote.json").exists():
             remote_client.renew_lease(directory)
@@ -952,10 +945,22 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
             remote_client.ensure_current_revision(directory)
         tree = json.loads(view_query(directory, "ls"))
         before = pane_map(tree)
-        if window_id not in before or before[window_id][0] != expected_pane:
+        if before.get(window_id) != (expected_pane, host):
             raise ValueError("creation target changed; nothing created")
         if origin and host != origin:
             raise ValueError("remote-origin panes must use the origin host")
+        from . import shell_cwd
+        cwd = ""
+        try:
+            cwd = shell_cwd.from_session(expected_pane, host)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            if cwd_uri:
+                try:
+                    cwd = shell_cwd.resolve(cwd_uri, host)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    pass
+            if not cwd:
+                print(f"kzw: source working directory unavailable; using default: {exc}", file=sys.stderr, flush=True)
         pane = "kzw-" + uuid.uuid4().hex
         pending = directory / "pending-create.json"
         record = {"pane": pane, "host": host, "target": expected_pane, "kind": kind,
@@ -977,7 +982,8 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
         command = [executable, "--pane", pane, "--host", host, "--stage-new"]
         if cwd:
             command += ["--initial-cwd", cwd]
-        result = view_query(directory, "launch", "--match", f"id:{window_id}", *options, *context_options, *command)
+        # launch matches tabs: id:N can select an unrelated tab before pane N.
+        result = view_query(directory, "launch", "--match", f"window_id:{window_id}", *options, *context_options, *command)
         try:
             new_id = int(result.strip())
         except ValueError:
@@ -1502,8 +1508,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 args = ["kitty", "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only",
                         "-o", f"shell={pane_executable}", "-o", "enabled_layouts=splits,tall,stack",
                         "-o", "macos_quit_when_last_window_closed=yes",
-                        "-o", "tab_title_template=" + TAB_TITLE_TEMPLATE,
-                        "-o", "active_tab_title_template=" + TAB_TITLE_TEMPLATE,
+                        "-o", f'tab_title_template="{TAB_TITLE_TEMPLATE}"',
+                        "-o", f'active_tab_title_template="{ACTIVE_TAB_TITLE_TEMPLATE}"',
                         "-o", f"watcher={Path(__file__).with_name('watcher.py')}"]
                 kitten = Path(__file__).with_name("close_kitten.py")
                 create_kitten = Path(__file__).with_name("create_kitten.py")

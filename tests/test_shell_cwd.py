@@ -1,17 +1,42 @@
 import io
 import importlib
+import json
+import os
 import subprocess
 import sys
 import types
 import unittest
 from unittest.mock import patch
 
-from kzw import pane, shell_cwd
+from kzw import pane, process_cwd, shell_cwd
 
 PANE = 'kzw-' + 'a' * 32
 
 
 class ShellCwdTests(unittest.TestCase):
+    def test_process_lookup_uses_exact_origin_and_clears_nested_zmx_context(self):
+        payload = {'pane': PANE, 'pid': 123, 'created': '1700000000', 'cwd': "/tmp/a b's"}
+        for host in ('', 'origin'):
+            with self.subTest(host=host), patch.dict(os.environ, {'ZMX_SESSION': 'other', 'ZMX_SESSION_PREFIX': 'other'}), \
+                 patch('kzw.shell_cwd.subprocess.run', return_value=subprocess.CompletedProcess([], 0, json.dumps(payload), '')) as run:
+                self.assertEqual(shell_cwd.from_session(PANE, host), payload['cwd'])
+                command = run.call_args.args[0]
+                if host:
+                    self.assertEqual(command[:6], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', host])
+                    self.assertTrue(command[-1].endswith(PANE))
+                else:
+                    self.assertEqual(command[-1], PANE)
+                self.assertNotIn('ZMX_SESSION', run.call_args.kwargs['env'])
+                self.assertNotIn('ZMX_SESSION_PREFIX', run.call_args.kwargs['env'])
+
+    def test_process_lookup_rejects_wrong_identity_and_invalid_paths(self):
+        payload = {'pane': PANE, 'pid': 123, 'created': '1700000000', 'cwd': '/tmp'}
+        for field, value in (('pane', 'other'), ('pid', True), ('created', ''), ('cwd', '/tmp\ncommand'), ('cwd', 'relative')):
+            with self.subTest(field=field, value=value), \
+                 patch('kzw.shell_cwd.subprocess.run', return_value=subprocess.CompletedProcess([], 0, json.dumps({**payload, field: value}), '')), \
+                 self.assertRaises(ValueError):
+                shell_cwd.from_session(PANE, 'origin')
+
     def test_create_kitten_decodes_kitty_bytes_cwd(self):
         handler = types.ModuleType('kittens.tui.handler')
         handler.result_handler = lambda **kwargs: lambda func: func
@@ -99,3 +124,42 @@ class ShellCwdTests(unittest.TestCase):
             result = pane.run_attachment(['/bin/sh', '-c', 'printf %s "$1" >&2', 'sh', noisy], {}, True)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(stderr.getvalue(), 'Permission denied (publickey).\n')
+
+
+class ProcessCwdTests(unittest.TestCase):
+    def test_inventory_requires_exact_unique_session_identity(self):
+        row = '  name=' + PANE + '\tpid=123\tcreated=456\tstart_dir=/old\n'
+        for output, valid in ((row, True), (row + row, False), ('', False),
+                              (row.replace('pid=123', 'pid=0'), False), (row.replace('created=456', 'other=456'), False)):
+            with self.subTest(output=output), \
+                 patch('kzw.process_cwd.subprocess.run', return_value=subprocess.CompletedProcess([], 0, output, '')):
+                if valid:
+                    self.assertEqual(process_cwd.session_identity(PANE), (123, '456'))
+                else:
+                    with self.assertRaises(ValueError):
+                        process_cwd.session_identity(PANE)
+
+    def test_process_and_session_identity_changes_veto_cwd(self):
+        for session_changed, pid_changed in ((False, False), (True, False), (False, True)):
+            with self.subTest(session=session_changed, process=pid_changed), \
+                 patch('kzw.process_cwd.session_identity', side_effect=[(123, '456'), (124, '457') if session_changed else (123, '456')]), \
+                 patch('kzw.process_cwd.process_identity', side_effect=['start', 'reused' if pid_changed else 'start']), \
+                 patch('kzw.process_cwd.process_cwd', return_value="/tmp/a b's"), \
+                 patch('kzw.process_cwd.os.path.isdir', return_value=True):
+                if session_changed or pid_changed:
+                    with self.assertRaisesRegex(ValueError, 'changed'):
+                        process_cwd.read(PANE)
+                else:
+                    self.assertEqual(process_cwd.read(PANE)['cwd'], "/tmp/a b's")
+
+    def test_deleted_directory_is_unavailable(self):
+        with patch('kzw.process_cwd.session_identity', return_value=(123, '456')), \
+             patch('kzw.process_cwd.process_identity', return_value='start'), \
+             patch('kzw.process_cwd.process_cwd', return_value='/tmp/deleted (deleted)'), \
+             patch('kzw.process_cwd.os.path.isdir', return_value=False), self.assertRaisesRegex(ValueError, 'unavailable'):
+            process_cwd.read(PANE)
+
+    def test_macos_cwd_uses_null_delimited_lsof_path(self):
+        with patch('kzw.process_cwd.sys.platform', 'darwin'), \
+             patch('kzw.process_cwd.subprocess.run', return_value=subprocess.CompletedProcess([], 0, "p123\0\nfcwd\0n/tmp/a b's\0\n", '')):
+            self.assertEqual(process_cwd.process_cwd(123), "/tmp/a b's")

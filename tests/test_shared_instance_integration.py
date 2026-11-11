@@ -140,7 +140,7 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
     def test_tab_styling_preserves_shortcuts_and_paste_across_repeated_apply_restore(self):
         if sys.platform != "darwin":
             self.skipTest("native macOS shortcuts are required")
-        from kzw.titles import TAB_TITLE_TEMPLATE as TEMPLATE
+        from kzw.titles import ACTIVE_TAB_TITLE_TEMPLATE, TAB_TITLE_TEMPLATE
 
         self.baseline = self.sessions()
         probe = str(REPO / "tests" / "kitty_shortcuts_probe.py")
@@ -185,7 +185,7 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
             after = json.loads(self.raw("kitten", probe))
             self.assertEqual(after["global"], before["global"])
             self.assertEqual(after["modes"], before["modes"])
-            templates = [TEMPLATE, TEMPLATE] if action == "apply" else before["templates"]
+            templates = [TAB_TITLE_TEMPLATE, ACTIVE_TAB_TITLE_TEMPLATE] if action == "apply" else before["templates"]
             self.assertEqual(after["templates"], templates)
             self.assertTrue(all(value == templates for value in after["renderers"].values()))
             self.assertEqual(json.loads(self.raw("kitten", "--match", match, probe, "paste", token)), {"consumed": True})
@@ -249,6 +249,71 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         else:
             self.fail("background supervisor did not exit after detach")
         self.assertIsNone(self.instance.poll())
+
+    def test_creation_targets_pane_when_unrelated_tab_has_same_id(self):
+        self.baseline = self.sessions()
+        keep = json.loads(self.raw("ls"))[0]
+        anchor = keep["tabs"][0]["windows"][0]["id"]
+        # Make pane IDs advance ahead of tab IDs before attaching Test.
+        self.raw("launch", "--match", "window_id:" + str(anchor), "/bin/sleep", "600")
+        result = self.kzw("create", "Test", "--attach")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        directory = self.state / "kzw" / "Test"
+        view = json.loads((directory / "view.json").read_text())
+        workspace_id = view["os_window_id"]
+        workspace = next(ow for ow in json.loads(self.raw("ls")) if ow["id"] == workspace_id)
+        source_tab = workspace["tabs"][0]["id"]
+        source = workspace["tabs"][0]["windows"][0]
+        collision = int(self.raw("launch", "--match", "window_id:" + str(anchor), "--type=tab",
+                                 "/bin/sh", "-c", "printf 'KZW_COLLISION_READY\\n'; exec /bin/sleep 600").strip())
+        deadline = time.monotonic() + 10
+        while "KZW_COLLISION_READY" not in self.raw("get-text", "--match", "id:" + str(collision)):
+            if time.monotonic() >= deadline:
+                self.fail("collision tab did not finish starting")
+            time.sleep(0.1)
+        unrelated = next(ow for ow in json.loads(self.raw("ls")) if ow["id"] == keep["id"])
+        self.assertIn(source["id"], [tab["id"] for tab in unrelated["tabs"]])
+        self.assertNotEqual(source_tab, source["id"])
+
+        def identities(ow):
+            return [(t["id"], [(w["id"], w["pid"]) for w in t["windows"]],
+                     t["layout"], t["layout_state"]) for t in ow["tabs"]]
+
+        original = {source["id"]: source["pid"]}
+        for kind in ("tab", "right", "below", "split"):
+            with self.subTest(kind=kind):
+                for _ in range(10):
+                    result = self.kzw("_managed-create", "Test", kind, str(source["id"]),
+                                      source["user_vars"]["kzw_pane"], "--host", "")
+                    # Initial title/layout updates can invalidate the pre-launch
+                    # snapshot. Retry only that rejection before any launch intent.
+                    if (result.stderr.strip() != "kzw: layout changed while taking snapshot" or
+                            (directory / "pending-create.json").exists()):
+                        break
+                    current = next(ow for ow in json.loads(self.raw("ls")) if ow["id"] == workspace_id)
+                    self.assertEqual({w["id"]: w["pid"] for t in current["tabs"] for w in t["windows"]}, original)
+                    time.sleep(0.1)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                tree = json.loads(self.raw("ls"))
+                self.assertEqual({ow["id"] for ow in tree}, {keep["id"], workspace_id})
+                self.assertEqual(identities(next(ow for ow in tree if ow["id"] == keep["id"])),
+                                 identities(unrelated))
+                workspace = next(ow for ow in tree if ow["id"] == workspace_id)
+                windows = {w["id"]: w for t in workspace["tabs"] for w in t["windows"]}
+                self.assertEqual({wid: windows[wid]["pid"] for wid in original}, original)
+                added = set(windows) - set(original)
+                self.assertEqual(len(added), 1)
+                new_id = added.pop()
+                tab = next(t for t in workspace["tabs"] if any(w["id"] == new_id for w in t["windows"]))
+                if kind == "tab":
+                    self.assertNotEqual(tab["id"], source_tab)
+                else:
+                    self.assertEqual(tab["id"], source_tab)
+                original[new_id] = windows[new_id]["pid"]
+                panes = {w["user_vars"]["kzw_pane"] for w in windows.values()}
+                self.assertEqual(set(json.loads((directory / "panes.json").read_text())), panes)
+                self.assertEqual(self.sessions() - self.baseline, panes)
+                self.assertFalse((directory / "pending-create.json").exists())
 
     def test_background_create_attach_inherits_appearance_with_prior_failure_log(self):
         self.baseline = self.sessions()
@@ -438,7 +503,7 @@ class NewInstanceIntegrationTests(unittest.TestCase):
             "    return json.dumps({'tab': get_options().tab_title_template})\n")
         template = json.loads(self.raw("kitten", str(probe)))["tab"]
         self.assertIn("{index}", template)
-        self.assertIn("{fmt.nobold}", template)
+        self.assertIn("{fmt.fg._9399b2}{index}{fmt.fg.tab}", template)
 
         result = self.kzw("detach", "Test")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
