@@ -49,7 +49,7 @@ class TitleTests(unittest.TestCase):
             return json.dumps(tree()) if args == ("ls",) else ""
         with patch("kzw.titles.read_host", return_value={A: "nvim", B: "bash"}):
             refresh(Path("socket"), query)
-        self.assertIn(("set-tab-title", "--match", "id:7", "nvim │ bash"), calls)
+        self.assertIn(("set-tab-title", "--match", "id:7", "nvim · bash"), calls)
         calls.clear()
         states = iter([tree(active=1), tree(active=2)])
         def changing(_socket, *args):
@@ -79,7 +79,7 @@ class TitleTests(unittest.TestCase):
             return json.dumps(data) if args == ("ls",) else ""
         with patch("kzw.titles.read_host", side_effect=lambda host: {A: "bash"} if host == "host" else {}):
             refresh(Path("socket"), query)
-        self.assertIn(("set-tab-title", "--match", "id:7", "bash │ ?"), calls)
+        self.assertIn(("set-tab-title", "--match", "id:7", "bash · ?"), calls)
 
     def test_failed_host_does_not_overwrite_title(self):
         calls = []
@@ -103,7 +103,7 @@ class TitleTests(unittest.TestCase):
                 set_title = Mock()
                 with patch("kzw.titles.read_host", return_value={A: "bash", B: "nvim"}) as read_host:
                     refresh(lambda: json.dumps(data), set_title)
-                set_title.assert_called_once_with(7, "bash" + suffix + " │ nvim")
+                set_title.assert_called_once_with(7, "bash" + suffix + " · nvim")
                 read_host.assert_called_once_with("host")
 
     def test_unchanged_or_cancelled_refresh_never_writes_a_title(self):
@@ -112,7 +112,7 @@ class TitleTests(unittest.TestCase):
                 stop = threading.Event()
                 if stopped:
                     stop.set()
-                listing = Mock(return_value=json.dumps(tree(title="bash │ ?")))
+                listing = Mock(return_value=json.dumps(tree(title="bash · ?")))
                 set_title = Mock()
                 with patch("kzw.titles.read_host", return_value={A: "bash"}):
                     refresh(listing, set_title, stop)

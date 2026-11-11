@@ -109,7 +109,7 @@ class ManagedCreateTests(unittest.TestCase):
             for number in range(1, 11):
                 self.assertIn(f"map super+{number % 10} goto_tab {number}", popen.call_args.args[0])
             for option in ("tab_title_template", "active_tab_title_template"):
-                self.assertIn(f"{option}={{title.replace('kzw-pane', '…')}}  {{fmt.nobold}}{{fmt.noitalic}}{{index}}",
+                self.assertIn(f"{option}={{title.replace('kzw-pane', '…').replace(' │ ', ' · ')}}  {{fmt.nobold}}{{fmt.noitalic}}{{index}}",
                               popen.call_args.args[0])
                 template = next(arg.split("=", 1)[1] for arg in popen.call_args.args[0]
                                 if arg.startswith(option + "="))

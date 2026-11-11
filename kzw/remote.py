@@ -35,6 +35,64 @@ class SessionNotReady(Conflict):
     pass
 
 
+def zmx_exit_receipt(directory, pane):
+    """Read zmx 0.5.0's final PTY teardown, never terminal output.
+
+    In v0.5.0 main.zig, the deleting-socket record follows waitpid(shell, 0).
+    A PTY EOF alone is insufficient (zmx also maps read errors to EOF). Require
+    the complete ordered shutdown suffix and independently absent PID/socket.
+    Reading only the current log rejects rotation through this short suffix;
+    ordinary earlier rotation is fine. A later generation invalidates the suffix.
+    """
+    path = directory / "logs" / (pane + ".log")
+    for parent in (directory, path.parent):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("unsafe zmx log directory")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022:
+            raise ValueError("unsafe zmx session log")
+        stream.seek(max(0, before.st_size - 16384))
+        tail = stream.read(16384)
+        after = os.fstat(stream.fileno())
+    signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+    if signature(before) != signature(after) or signature(after) != signature(path.lstat()):
+        return None
+    # No arbitrary text between the lifecycle records. Warnings are the exact
+    # optional killpg failures from handleKill, not general daemon errors.
+    prefix = rb"\[(\d+)\] \[info\] \(default\): "
+    name = pane.encode()
+    pattern = (prefix + rb"shell exited pty_fd=(\d+)\n" +
+               prefix + rb"kill received session=" + name + rb"\n" +
+               prefix + rb"shutting down daemon session=" + name + rb"\n" +
+               prefix + rb"sending SIGHUP session=" + name + rb" pid=(\d+)\n" +
+               rb"(?:\[\d+\] \[warning\] \(default\): failed to send SIG(?:HUP|KILL) to pty child err=[A-Za-z]+\n)*" +
+               prefix + rb"deleting socket file session=" + name + rb"\n\Z")
+    match = re.search(rb"(?:\A|\n)" + pattern, tail)
+    if match is None:
+        return None
+    exited, fd, killed, shutdown, hup, pid, reaped = map(int, match.groups())
+    if not 0 < exited <= killed <= shutdown <= hup <= reaped or pid <= 1:
+        return None
+    # lexists semantics: a stale, inaccessible or symlink socket is unknown.
+    try:
+        (directory / pane).lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        return None
+    return {"kind": "zmx-0.5.0-reaped", "pane": pane, "shell_pid": pid,
+            "exited_at_ms": exited, "reaped_at_ms": reaped,
+            "lifecycle_sha256": hashlib.sha256(match.group().lstrip(b"\n")).hexdigest()}
+
+
 def layout_sessions(snapshot, panes):
     """Validate the session-ID join at the authority, not only in the UI client.
 
@@ -288,6 +346,32 @@ class Store:
                 "query_source": self.inventory_source(self.zmx_environment()), "observation": sample,
                 "sessions": sessions, "workspaces": workspaces}
 
+    def exit_receipts(self, panes):
+        """Origin-side positive evidence; inventory can veto, never authorize."""
+        sample = self.read_inventory()
+        candidates = set(panes) - set(sample["sessions"])
+        if not candidates:
+            return {}
+        env = self.zmx_environment()
+        version = subprocess.run([self.zmx, "version"], capture_output=True, text=True,
+                                 env=env, timeout=10, check=True)
+        fields = dict(line.split(None, 1) for line in version.stdout.splitlines() if line.strip())
+        directory = Path(env["ZMX_DIR"] if "ZMX_DIR" in env else
+                         str(Path(env["XDG_RUNTIME_DIR"]) / "zmx") if "XDG_RUNTIME_DIR" in env else
+                         str(Path(env.get("TMPDIR", "/tmp")) / ("zmx-" + str(os.getuid()))))
+        if (fields.get("zmx") != "0.5.0" or fields.get("socket_dir") != str(directory) or
+                fields.get("log_dir") != str(directory / "logs")):
+            return {}
+        receipts = {}
+        for pane in sorted(candidates):
+            try:
+                receipt = zmx_exit_receipt(directory, pane)
+            except (OSError, ValueError):
+                continue  # Missing, unreadable or ambiguous evidence is unknown.
+            if receipt is not None:
+                receipts[pane] = {**receipt, "source": sample["source"]}
+        return receipts
+
     def close(self):
         self.db.close()
 
@@ -467,6 +551,25 @@ class Store:
             return {"exists": True, "revision": row[0], "snapshot": row[1], "panes": json.loads(row[2]),
                     "reservations": reservations, "staged": ({"revision": staged[0], "snapshot": staged[1],
                                                                 "panes": json.loads(staged[2])} if staged else None)}
+        if method == "workspace.exits":
+            panes = req.get("panes")
+            if (not isinstance(panes, list) or not panes or
+                    any(not isinstance(p, str) or not PANE.fullmatch(p) for p in panes) or len(panes) != len(set(panes))):
+                raise ValueError("invalid exit candidates")
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                if not isinstance(req.get("lease_token"), str):
+                    raise Conflict("exit reconciliation requires a lease")
+                self.check_lease(name, req["lease_token"])
+                row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
+                if not row or row[0] != req.get("revision") or not set(panes).issubset(json.loads(row[1])):
+                    raise Conflict("exit candidates differ from the owned layout")
+                receipts = self.exit_receipts(panes)
+                self.db.execute("COMMIT")
+                return {"revision": row[0], "receipts": receipts}
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
         if method == "workspace.stage":
             revision, snapshot, panes = req.get("revision"), req.get("snapshot"), req.get("panes")
             if (type(revision) is not int or revision < 0 or not isinstance(snapshot, str) or
@@ -640,7 +743,7 @@ class Store:
             return {"panes": [r[0] for r in rows]}
         if method == "cleanup.retry":
             return self.retry_cleanup(name, req.get("lease_token"))
-        if method not in ("workspace.put", "workspace.recover-stage", "panes.close", "workspace.prune", "workspace.reconcile"):
+        if method not in ("workspace.put", "workspace.recover-stage", "panes.close", "panes.exited", "workspace.prune", "workspace.reconcile"):
             raise ValueError("unknown method")
         request_id = req.get("request_id", "")
         if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
@@ -668,6 +771,10 @@ class Store:
         layout_sessions(snapshot, panes)
         if method == "workspace.reconcile" and not isinstance(req.get("lease_token"), str):
             raise ValueError("workspace reconciliation requires a lease")
+        if method == "panes.exited" and (not isinstance(req.get("lease_token"), str) or
+                                        not isinstance(req.get("exit_receipts"), dict) or
+                                        set(req["exit_receipts"]) != set(removals)):
+            raise ValueError("exit removal requires a lease and exact origin receipts")
         # The same durable intent may be retried by a newly fenced lease owner.
         # Authorization is checked separately before looking up the operation.
         intent = {key: value for key, value in req.items() if key != "lease_token"}
@@ -696,6 +803,13 @@ class Store:
                     raise ValueError("workspace.put cannot remove panes")
             elif (not removed and not (method == "workspace.reconcile" and cancellations)) or removed != old - current or current - old:
                 raise ValueError("close/prune must remove exactly the specified existing panes")
+            if method == "panes.exited":
+                if any(self.db.execute("SELECT 1 FROM " + table + " WHERE workspace=?", (name,)).fetchone()
+                       for table in ("reservations", "staged_layouts", "cleanup")):
+                    raise Conflict("unfinished workspace operation blocks exit removal")
+                if self.exit_receipts(removed) != req["exit_receipts"]:
+                    raise Conflict("session exit evidence is missing or changed; layout retained")
+                self.check_lease(name, req["lease_token"])
             if method == "workspace.reconcile":
                 reservations = {r[0] for r in self.db.execute("SELECT pane FROM reservations WHERE workspace=?", (name,))}
                 if reservations != set(cancellations) or self.db.execute("SELECT 1 FROM staged_layouts WHERE workspace=?", (name,)).fetchone():
@@ -741,13 +855,14 @@ class Store:
             staged = self.db.execute("SELECT snapshot,panes FROM staged_layouts WHERE workspace=?", (name,)).fetchone()
             if staged and staged[0] == snapshot and set(json.loads(staged[1])) == current:
                 self.db.execute("DELETE FROM staged_layouts WHERE workspace=?", (name,))
-            reason = {"panes.close": "managed_close", "workspace.prune": "confirmed_absence",
+            reason = {"panes.close": "managed_close", "panes.exited": "confirmed_exit", "workspace.prune": "confirmed_absence",
                       "workspace.reconcile": "confirmed_absence",
                       "workspace.recover-stage": "stage_recovery"}.get(method, "snapshot")
             self.add_event(name, new_revision, "layout.updated", {"panes": sorted(current),
                                                                   "added": sorted(added), "removed": sorted(removed),
                                                                   "pending_cleanup": sorted(removed) if method == "panes.close" else [],
                                                                   "reason": reason,
+                                                                  **({"exit_receipts": req["exit_receipts"]} if method == "panes.exited" else {}),
                                                                   **({"cancelled_reservations": sorted(cancellations)} if cancellations else {})})
             if method == "panes.close":
                 for pane in removed:

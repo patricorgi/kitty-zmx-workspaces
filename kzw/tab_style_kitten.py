@@ -21,7 +21,7 @@ try:  # Kitty 0.50+
 except ImportError:  # pragma: no cover - older Kitty exposes boss.opts
     get_options = None
 
-TEMPLATE = "{title.replace('kzw-pane', '…')}  {fmt.nobold}{fmt.noitalic}{index}"
+TEMPLATE = "{title.replace('kzw-pane', '…').replace(' │ ', ' · ')}  {fmt.nobold}{fmt.noitalic}{index}"
 PANE = re.compile(r"^kzw-[0-9a-f]{32}$")
 ORIGINALS = ("tab_title_template", "active_tab_title_template")
 

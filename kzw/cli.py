@@ -608,6 +608,8 @@ def recover_remote_managed_creation(directory, name, host, executable):
 
 
 def capture_locked(directory, executable, allow_removals=False, expected_panes=None, confirmed_exits=False, confirmed_close=False, close_panes=None):
+    if (directory / "pending-exit.json").exists():
+        raise ValueError("an acknowledged exit is awaiting view cleanup; snapshot deferred")
     before_tree = json.loads(view_query(directory, "ls"))
     before = pane_map(before_tree)
     focus = focused_pane(before_tree)
@@ -762,7 +764,7 @@ def local_empty_retirable(directory):
     """Recognize only an empty workspace without any uncertain operations."""
     if (directory / "remote.json").exists():
         return False
-    for name in ("pending-create.json", "pending-close.json", "native-stage.json", "bootstrap.kitty-session", "view.json"):
+    for name in ("pending-create.json", "pending-close.json", "pending-exit.json", "native-stage.json", "bootstrap.kitty-session", "view.json"):
         path = directory / name
         if path.exists() or path.is_symlink():
             return False
@@ -788,13 +790,9 @@ def retire_local_empty(directory):
 
 
 def synchronize_exits(directory, executable, remote_hint=()):
-    """Preserve sessions when attachment or zmx-list observations are uncertain.
-
-    zmx inventory describes existence in the queried origin namespace. It does
-    not authorize layout removal, and a disconnected wrapper is only UI state.
-    Managed closes remain the explicit path for terminating selected sessions.
-    """
-    return 0
+    """Reconcile positive origin exit evidence, never inventory hints alone."""
+    from .exits import synchronize
+    return synchronize(directory, executable)
 
 
 def cleanup_close_locked(directory):
@@ -971,7 +969,7 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
         target_window = next((window for os_window in tree for tab in os_window.get("tabs", [])
                               for window in tab.get("windows", []) if window.get("id") == window_id), None)
         env_context, var_context = workspace_context(
-            name, directory, host, bool(origin), marker=view_marker(target_window))
+            name, directory, host, (directory / "remote.json").exists(), marker=view_marker(target_window))
         context_options = (["--var=" + key + "=" + value for key, value in var_context.items()] +
                            ["--env=" + key + "=" + value for key, value in env_context.items()])
         options = ["--type=tab", "--tab-title=..."] if kind == "tab" else ["--next-to", f"id:{window_id}",
@@ -1120,7 +1118,7 @@ def retry_create(name, origin=""):
         raise ValueError("kzw-pane not found on PATH")
     with recovery_lease(directory), capture_lock(directory):
         pending = directory / "pending-create.json"
-        if not pending.is_file() or (directory / "pending-close.json").exists():
+        if not pending.is_file() or (directory / "pending-close.json").exists() or (directory / "pending-exit.json").exists():
             raise ValueError("no recoverable pane creation, or a close is pending")
         record = json.loads(pending.read_text())
         pane, host = record.get("pane"), record.get("host")
@@ -1374,6 +1372,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 raise ValueError("workspace is already running") from None
         if (directory / "pending-close.json").exists():
             raise ValueError("a pane close is incomplete; inspect it or run kzw retry-close")
+        if (directory / "pending-exit.json").exists():
+            raise ValueError("session exit reconciliation is incomplete; retain pending-exit.json for recovery")
         pending_create = directory / "pending-create.json"
         sock = directory / "kitty.sock"
         # The lock proves no kzw supervisor is using this workspace. Refuse a
@@ -1575,6 +1575,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                             current = json.loads(view_query(directory, "ls"))
                         native = directory / "native-pending"
                         unfinished = ((directory / "pending-create.json").exists() or (directory / "pending-close.json").exists() or
+                                      (directory / "pending-exit.json").exists() or
                                       (native.exists() and (not native.is_dir() or any(native.iterdir()))))
                         if not current and not unfinished:
                             if empty_since is None:
@@ -1659,6 +1660,11 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             child.wait()
         finally:
             try:
+                if (directory / "pending-exit.json").exists():
+                    try:
+                        synchronize_exits(directory, pane_executable)
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        print(f"kzw: exit cleanup remains pending: {exc}", file=sys.stderr, flush=True)
                 status_stop()
                 title_stop.set()
                 if broker:
@@ -1748,7 +1754,7 @@ def rename_workspace(name, destination, host=""):
                 except BlockingIOError:
                     raise ValueError("workspace is attached locally; detach before renaming") from None
             source, target = paths
-            if any((source / item).exists() for item in ("kitty.sock", "view.json", "pending-create.json", "pending-close.json", "native-stage.json")):
+            if any((source / item).exists() for item in ("kitty.sock", "view.json", "pending-create.json", "pending-close.json", "pending-exit.json", "native-stage.json")):
                 raise ValueError("workspace has an active view or unfinished local operations")
             native = source / "native-pending"
             if native.exists() and (native.is_symlink() or not native.is_dir() or any(native.iterdir())):
@@ -1817,7 +1823,7 @@ def kill_workspace(name, host):
         if not host and (directory / "workspace.kitty-session").exists() and not (directory / "remote.json").exists():
             raise ValueError("kill currently supports coordinator workspaces only; this is a legacy workspace")
         if any((directory / item).exists() for item in
-               ("kitty.sock", "view.json", "pending-close.json", "pending-create.json", "native-stage.json")):
+               ("kitty.sock", "view.json", "pending-close.json", "pending-create.json", "pending-exit.json", "native-stage.json")):
             raise ValueError("workspace may be active or has unfinished local operations")
         pending = directory / "native-pending"
         if pending.exists() and (not pending.is_dir() or any(pending.iterdir())):
@@ -1852,6 +1858,8 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("workspace is already running") from None
+        if (directory / "pending-exit.json").exists():
+            raise ValueError("session exit reconciliation is incomplete; retain pending-exit.json for recovery")
         view = view_state(directory)
         if view is not None and not view_alive(directory, view):
             remove_view(directory)

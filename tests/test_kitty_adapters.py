@@ -28,6 +28,25 @@ def load_adapter(name):
 
 
 class KittyAdapterTests(unittest.TestCase):
+    def test_exit_close_validates_all_wrappers_before_closing_any(self):
+        module = load_adapter("exit")
+        expected = {"id": 7, "os_window_id": 42, "pid": 99, "pane": "kzw-" + "a" * 32, "ended": "1"}
+        for field, bad in (("id", 8), ("os_window_id", 43), ("pid", 100), ("pane", "other"), ("ended", "0"), (None, None)):
+            with self.subTest(field=field):
+                actual = {**expected, **({field: bad} if field else {})}
+                window = types.SimpleNamespace(id=actual["id"], os_window_id=actual["os_window_id"],
+                                               child=types.SimpleNamespace(pid=actual["pid"]),
+                                               user_vars={"kzw_pane": actual["pane"], "kzw_attach_ended": actual["ended"]})
+                boss = Mock(window_id_map={7: window, 88: Mock()})
+                if field:
+                    with self.assertRaises(ValueError):
+                        module.handle_result(["kitten", json.dumps({"7": expected})], None, 7, boss)
+                    boss.mark_window_for_close.assert_not_called()
+                else:
+                    self.assertEqual(json.loads(module.handle_result(["kitten", json.dumps({"7": expected})], None, 7, boss)),
+                                     {"closed": ["7"]})
+                    boss.mark_window_for_close.assert_called_once_with(window)
+
     def test_snapshot_serializes_only_verified_os_window_and_rejects_stale_targets(self):
         module = load_adapter("scoped_session")
         for mode in ("valid", "missing pane", "moved pane", "missing window", "bad args"):
