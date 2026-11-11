@@ -40,7 +40,7 @@ def options():
 
 def boss(panes=()):
     windows = [types.SimpleNamespace(user_vars={"kzw_pane": pane}) for pane in panes]
-    manager = types.SimpleNamespace(tabs=[windows], refresh_active_tab_bar=Mock())
+    manager = types.SimpleNamespace(tabs=[windows], tab_bar=Mock(), mark_tab_bar_dirty=Mock())
     fake = types.SimpleNamespace(os_window_map={1: manager}, apply_new_options=Mock())
     return fake
 
@@ -66,11 +66,14 @@ class TabStyleKittenTests(unittest.TestCase):
             self.assertEqual(opts.tab_title_template, kitten.TEMPLATE)
             self.assertEqual(opts.active_tab_title_template, kitten.TEMPLATE)
             self.assertEqual(opts.active_tab_font_style, (True, True))
-            fake.apply_new_options.assert_called_once_with(opts)
+            fake.apply_new_options.assert_not_called()
+            fake.os_window_map[1].tab_bar.apply_options.assert_called_once_with()
+            fake.os_window_map[1].mark_tab_bar_dirty.assert_called_once_with()
 
             # A second attach must not overwrite the user's originals.
             self.call(kitten, "apply", path, fake)
             self.assertEqual(json.loads(path.read_text()), saved)
+            fake.apply_new_options.assert_not_called()
 
     def test_restore_waits_for_other_managed_views(self):
         kitten, holder = load_kitten()
@@ -95,6 +98,8 @@ class TabStyleKittenTests(unittest.TestCase):
             self.assertIsNone(opts.active_tab_title_template)
             self.assertEqual(opts.active_tab_font_style, (True, True))
             self.assertEqual(opts.inactive_tab_font_style, (False, False))
+            fake.apply_new_options.assert_not_called()
+            self.assertEqual(fake.os_window_map[1].tab_bar.apply_options.call_count, 2)
 
             # Nothing left to restore.
             self.assertEqual(self.call(kitten, "restore", path, fake), "unchanged")
@@ -143,10 +148,10 @@ class TabStyleKittenTests(unittest.TestCase):
             self.assertEqual(list(Path(tmp).glob(".tab-style-*")), [])
             fake.apply_new_options.assert_not_called()
 
-    def test_older_kitty_options_and_refresh_fallback_restore_exactly(self):
+    def test_older_kitty_options_accessor_restores_exactly(self):
         kitten, _ = load_kitten()
         kitten.get_options = None
-        manager = types.SimpleNamespace(tabs=[], refresh_active_tab_bar=Mock())
+        manager = types.SimpleNamespace(tabs=[], tab_bar=Mock(), mark_tab_bar_dirty=Mock())
         fake = types.SimpleNamespace(opts=options(), os_window_map={1: manager})
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "style.json"
@@ -154,7 +159,8 @@ class TabStyleKittenTests(unittest.TestCase):
             self.assertEqual(fake.opts.tab_title_template, kitten.TEMPLATE)
             self.call(kitten, "restore", path, fake)
         self.assertEqual(fake.opts.tab_title_template, "user {title}")
-        self.assertEqual(manager.refresh_active_tab_bar.call_count, 2)
+        self.assertEqual(manager.tab_bar.apply_options.call_count, 2)
+        self.assertEqual(manager.mark_tab_bar_dirty.call_count, 2)
 
 
 if __name__ == "__main__":
