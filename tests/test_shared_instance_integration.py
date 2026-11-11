@@ -250,6 +250,32 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
             self.fail("background supervisor did not exit after detach")
         self.assertIsNone(self.instance.poll())
 
+    def test_background_create_attach_inherits_appearance_with_prior_failure_log(self):
+        self.baseline = self.sessions()
+        unrelated = json.loads(self.raw("ls"))[0]
+        source = unrelated["tabs"][0]["windows"][0]
+        self.env["KITTY_WINDOW_ID"] = str(source["id"])
+        directory = self.state / "kzw" / "Test"
+        directory.mkdir(parents=True)
+        log = directory / "supervisor.log"
+        log.write_text("previous startup failed\n")
+        result = self.kzw("create", "Test", "--attach", "--inherit-appearance")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("started in the background", result.stdout)
+        self.assertTrue(log.read_text().startswith("previous startup failed\n"))
+        view = json.loads((directory / "view.json").read_text())
+        self.assertEqual(view["instance_pid"], self.instance.pid)
+        self.assertEqual(set(view["panes"]), self.sessions() - self.baseline)
+        self.assertEqual(len(view["panes"]), 1)
+        result = self.kzw("list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Test")
+        result = self.kzw("detach", "Test")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        after = json.loads(self.raw("ls"))
+        self.assertEqual([ow["id"] for ow in after], [unrelated["id"]])
+        self.assertEqual(after[0]["tabs"][0]["windows"][0]["pid"], source["pid"])
+
     def test_coordinator_ctrl_d_split_nonzero_tab_and_final_pane(self):
         self.baseline = self.sessions()
         unrelated = json.loads(self.raw("ls"))[0]

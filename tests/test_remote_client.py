@@ -231,6 +231,11 @@ class RemoteClientTests(unittest.TestCase):
     def test_create_publish_pull_from_fresh_client(self):
         first = self.directory("first")
         second = self.directory("second")
+        # Background create/attach opens its log before entering either path.
+        # A previous failed launch can leave nonempty diagnostics behind.
+        for directory in (first, second):
+            (directory / "lock").touch()
+            (directory / "supervisor.log").write_text("previous startup failed\n")
         remote_client.create(first, "Test", "origin")
         self.assertEqual(self.store.dispatch({"method": "workspace.list"})["workspaces"][0]["name"], "Test")
         remote_client.publish(first, SNAPSHOT, [PANE])
@@ -242,6 +247,8 @@ class RemoteClientTests(unittest.TestCase):
         self.assertIn("/new/bin/kzw-pane", restored)
         self.assertIn(PANE, restored)
         self.assertEqual(json.loads((second / "panes.json").read_text()), [PANE])
+        for directory in (first, second):
+            self.assertEqual((directory / "supervisor.log").read_text(), "previous startup failed\n")
 
     def test_lost_ack_replayed_without_duplicate_revision(self):
         directory = self.directory("first")
