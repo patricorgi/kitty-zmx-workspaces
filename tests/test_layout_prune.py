@@ -47,6 +47,18 @@ class LayoutPruneTests(unittest.TestCase):
             with self.subTest(case=name), self.assertRaises(ValueError):
                 prune_snapshot(data, missing)
 
+    def test_whole_singleton_tab_needs_no_serialized_split_state(self):
+        pane = 'kzw-' + 'd' * 32
+        single = 'new_tab Last\nlayout tall\n' + shlex.join([
+            'launch', 'kitty-unserialize-data={"id":4}', '--var=kzw_pane=' + pane,
+            'KZW_PANE_EXECUTABLE', '--pane', pane]) + '\n'
+        result = prune_snapshot(snapshot() + single, {pane})
+        self.assertNotIn('new_tab Last', result)
+        self.assertNotIn(pane, result)
+        self.assertEqual([line for line in result.splitlines() if line.startswith('set_layout_state ')],
+                         [line for line in snapshot().splitlines() if line.startswith('set_layout_state ')])
+        self.assertEqual(prune_snapshot(single, {pane}), '# kzw-empty-workspace\n')
+
     @unittest.skipUnless(os.environ.get('KZW_RUN_INTEGRATION') == '1', 'real integration is opt-in')
     def test_pruned_tree_restores_in_hidden_kitty(self):
         if not shutil.which('kitty'):

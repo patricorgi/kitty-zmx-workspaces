@@ -76,8 +76,14 @@ def set_attachment_ended(ended):
 
 
 def report_attachment_ended(retry=False):
-    """Wait for reconciliation, or give it time before retrying SSH."""
+    """Keep the view until the supervisor commits a proven origin-side exit."""
     set_attachment_ended(True)
+    signal = os.environ.get("KZW_CHANGE_SIGNAL")
+    if signal:
+        try:
+            Path(signal).touch()
+        except OSError:
+            pass  # The supervisor also checks periodically.
     threading.Event().wait(5 if retry else None)
 
 

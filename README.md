@@ -108,7 +108,7 @@ See [the authority contract](README.md#sources-of-truth) for synchronization det
 Managed closes ask for confirmation and terminate the selected sessions;
 unmanaged pane and tab closes are unsupported. Automatic splitting uses Kitty's
 `splits` layout; other layouts determine their own placement. Tab titles list
-split processes separated by `│`; `?` means a process is unknown. Tab numbers appear
+split processes separated by `·`; `?` means a process is unknown. Tab numbers appear
 after the title; Kitty may truncate them when space is limited.
 
 ## Limitations
@@ -138,6 +138,7 @@ after the title; Kitty may truncate them when space is limited.
 - Shared Kitty uses its configured shortcuts.
 - Shared tab styling affects the whole instance.
 - SSH channel limits can force extra connections.
+- Auto-close needs zmx 0.5.0 exit evidence.
 
 Run `kzw --help` for more commands.
 

@@ -9,8 +9,8 @@ from .core import FLAG, FOCUS_PREFIX, PANE, saved_focus
 def prune_snapshot(snapshot, missing):
     """Return a pruned snapshot; reject formats whose topology is uncertain.
 
-    This is a pure transformation. Callers must independently verify session
-    absence and commit the result using the coordinator's revision fence.
+    This is a pure transformation. Callers must independently authorize each
+    removal and commit the result using the coordinator's revision fence.
     """
     missing = set(missing)
     if not missing or any(not PANE.fullmatch(p) for p in missing):
@@ -48,6 +48,10 @@ def prune_snapshot(snapshot, missing):
         if not removed_ids:
             output.append(lines)
             surviving.extend(pane for _, pane in launches.values())
+            continue
+        if removed_ids == set(launches):
+            # Kitty omits split state for a singleton tab. Removing an entire
+            # tab needs no inference about its internal layout or split tree.
             continue
         if not launches or len(state_lines) != 1 or layouts != ["layout splits"]:
             raise ValueError("cannot safely prune this Kitty layout")

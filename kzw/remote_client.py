@@ -558,7 +558,8 @@ def start_lease_heartbeat(directory):
     return close
 
 
-def publish(directory, snapshot, panes, confirmed_exits=False, confirmed_close=False, close_panes=None):
+def publish(directory, snapshot, panes, confirmed_exits=False, confirmed_close=False, close_panes=None,
+            exit_receipts=None):
     """Publish with durable replay of requests whose response was lost."""
     config_path = directory / "remote.json"
     if not config_path.exists():
@@ -568,12 +569,17 @@ def publish(directory, snapshot, panes, confirmed_exits=False, confirmed_close=F
     if config.get("state_home", "") != origin_state_home(host):
         raise ValueError("remote state directory differs from this workspace's origin")
     portable, parsed = translate(snapshot, "", host, True)
+    if exit_receipts is not None and (not isinstance(exit_receipts, dict) or not exit_receipts or confirmed_close):
+        raise ValueError("invalid exit publication")
     if sorted(panes) != parsed:
         raise ValueError("snapshot and remote pane manifest disagree")
     desired = snapshot_hash(portable, parsed)
     while True:
         pending = config.get("pending")
         if pending:
+            if exit_receipts is not None and (pending["request"]["method"] != "panes.exited" or
+                                             pending["request"].get("exit_receipts") != exit_receipts):
+                raise ValueError("pending remote operation differs from confirmed exit")
             if confirmed_close and (pending["request"]["method"] != "panes.close" or
                                     set(pending["request"].get("remove", [])) != set(close_panes or [])):
                 raise ValueError("pending remote operation differs from confirmed close")
@@ -601,9 +607,11 @@ def publish(directory, snapshot, panes, confirmed_exits=False, confirmed_close=F
         removed = old_panes - set(parsed)
         if confirmed_close and removed != set(close_panes or []):
             raise ValueError("remote pane removal differs from confirmed close")
-        if removed and not confirmed_close:
+        if exit_receipts is not None and removed != set(exit_receipts):
+            raise ValueError("remote removal differs from origin exit receipts")
+        if removed and not confirmed_close and exit_receipts is None:
             raise ValueError("automatic absence-based removal is disabled; use an explicit managed close")
-        method = "panes.close" if removed else "workspace.put"
+        method = "panes.exited" if exit_receipts is not None else "panes.close" if removed else "workspace.put"
         request = {"method": method, "workspace": name, "revision": config["revision"],
                    "request_id": uuid.uuid4().hex, "snapshot": portable, "panes": parsed}
         token = lease_token(directory)
@@ -611,6 +619,8 @@ def publish(directory, snapshot, panes, confirmed_exits=False, confirmed_close=F
             request["lease_token"] = token
         if removed:
             request["remove"] = sorted(removed)
+        if exit_receipts is not None:
+            request["exit_receipts"] = exit_receipts
         config["pending"] = {"request": request, "hash": desired}
         save_config(directory, config)
 
@@ -634,6 +644,19 @@ def status(directory):
     if config.get("state_home", "") != origin_state_home(config["host"]):
         raise ValueError("remote state directory differs from this workspace's origin")
     return call(config["host"], {"method": "workspace.status", "workspace": config["workspace"]})
+
+
+def exit_receipts(directory, panes):
+    config = json.loads((directory / "remote.json").read_text())
+    if config.get("state_home", "") != origin_state_home(config["host"]):
+        raise ValueError("remote state directory differs from this workspace's origin")
+    result = call(config["host"], {"method": "workspace.exits", "workspace": config["workspace"],
+                                 "revision": config["revision"], "panes": sorted(panes),
+                                 "lease_token": lease_token(directory)})
+    if (result.get("revision") != config["revision"] or not isinstance(result.get("receipts"), dict) or
+            not set(result["receipts"]).issubset(panes)):
+        raise ValueError("invalid origin exit evidence response")
+    return result["receipts"]
 
 
 def ensure_current_revision(directory):

@@ -34,6 +34,8 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         self.zmx_dir = self.tmp / "zmx"
         self.env = os.environ.copy()
         self.env["ZMX_DIR"] = str(self.zmx_dir)
+        self.env["SHELL"] = "/bin/sh"
+        self.env["XDG_STATE_HOME"] = str(self.state)
         self.group = "kzw-it-" + secrets.token_hex(6)
         session = self.tmp / "keep.session"
         # One unmanaged OS window proves that detach only closes our workspace.
@@ -92,6 +94,24 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
                 self.instance.kill()
                 self.instance.wait(timeout=10)
             self.cleanup_sessions()
+            # A failed creation can leave the disposable supervisor waiting on
+            # its journal after Kitty has gone. Identify it by this test's lock.
+            lock = self.state / "kzw" / "Test" / "lock"
+            if lock.exists():
+                holders = subprocess.run(["lsof", "-t", str(lock)], capture_output=True, text=True).stdout.split()
+                for pid in holders:
+                    command = subprocess.run(["ps", "-p", pid, "-o", "command="], capture_output=True, text=True).stdout
+                    if "-m kzw.cli attach Test" not in command and "-m kzw.cli start Test" not in command:
+                        self.fail("unexpected test lock owner " + pid)
+                    os.kill(int(pid), signal.SIGTERM)
+            if (self.state / "kzw" / "coordinator" / "server.sock").exists():
+                for _ in range(20):
+                    stopped = self.kzw("server-stop", input="y\n")
+                    if not stopped.returncode:
+                        break
+                    time.sleep(0.1)
+                if stopped.returncode:
+                    self.fail("isolated test coordinator cleanup failed at " + str(self.tmp) + ": " + stopped.stderr)
             shutil.rmtree(self.tmp, ignore_errors=True)
 
     def raw(self, *args):
@@ -108,9 +128,9 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         if extra:
             subprocess.run(["zmx", "kill", *sorted(extra), "--force"], env=self.env, capture_output=True, text=True, timeout=30)
 
-    def kzw(self, *args, timeout=120):
+    def kzw(self, *args, timeout=120, input=None):
         return subprocess.run([sys.executable, "-m", "kzw.cli", *args], cwd=REPO, env=self.env,
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, timeout=timeout, input=input)
 
     def tab_style(self):
         output = self.raw("kitten", str(self.probe))
@@ -171,6 +191,68 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
             self.fail("background supervisor did not exit after detach")
         self.assertIsNone(self.instance.poll())
 
+    def test_coordinator_ctrl_d_split_nonzero_tab_and_final_pane(self):
+        self.baseline = self.sessions()
+        unrelated = json.loads(self.raw("ls"))[0]
+        result = self.kzw("create", "Test")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.kzw("attach", "Test")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        directory = self.state / "kzw" / "Test"
+
+        def panes():
+            return {w["user_vars"]["kzw_pane"]: w for ow in json.loads(self.raw("ls"))
+                    for tab in ow["tabs"] for w in tab["windows"] if w.get("user_vars", {}).get("kzw_pane")}
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if predicate():
+                    return
+                time.sleep(0.1)
+            self.fail("exit lifecycle timed out: " + (directory / "supervisor.log").read_text()[-4000:])
+
+        def manifest():
+            return set(json.loads((directory / "panes.json").read_text()))
+
+        first = next(iter(panes()))
+        for kind in ("right", "tab"):
+            anchor = panes()[first]
+            result = self.kzw("_managed-create", "Test", kind, str(anchor["id"]), first)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        wait_for(lambda: len(manifest()) == 3 and manifest() == self.sessions() and len(panes()) == 3)
+        original = panes()
+        split, tab = sorted(set(original) - {first}, key=lambda p: original[p]["id"])
+
+        # Kill only the disposable pane's local zmx client, never its daemon.
+        children = subprocess.check_output(["ps", "-axo", "pid=,ppid=,comm="], text=True)
+        clients = [int(line.split()[0]) for line in children.splitlines()
+                   if len(line.split()) >= 3 and int(line.split()[1]) == original[split]["pid"]
+                   and Path(line.split()[2]).name == "zmx"]
+        self.assertEqual(len(clients), 1)
+        os.kill(clients[0], signal.SIGKILL)
+        wait_for(lambda: panes()[split]["user_vars"].get("kzw_attach_ended") == "1")
+        self.assertEqual(manifest(), set(original))
+        self.assertEqual(self.sessions(), set(original))
+        wait_for(lambda: panes()[split]["user_vars"].get("kzw_attach_ended") == "0")
+
+        elapsed = []
+        for pane, text in ((split, "\x04"), (tab, "exit 7\r"), (first, "\x04")):
+            started = time.monotonic()
+            self.raw("send-text", "--match", "id:" + str(original[pane]["id"]), text)
+            wait_for(lambda: pane not in panes() and pane not in manifest() and
+                     not (directory / "pending-exit.json").exists())
+            elapsed.append(round(time.monotonic() - started, 2))
+            for survivor, window in panes().items():
+                self.assertEqual(window["pid"], original[survivor]["pid"])
+        wait_for(lambda: not (directory / "view.json").exists())
+        self.assertEqual(self.sessions(), self.baseline)
+        self.assertEqual((directory / "workspace.kitty-session").read_text(), "# kzw-empty-workspace\n")
+        remaining = json.loads(self.raw("ls"))
+        self.assertEqual([w["id"] for w in remaining], [unrelated["id"]])
+        self.assertEqual(remaining[0]["tabs"][0]["windows"][0]["pid"], unrelated["tabs"][0]["windows"][0]["pid"])
+        print("Confirmed split/tab/final exit close latency (s):", elapsed)
+
 
 @unittest.skipUnless(os.environ.get("KZW_RUN_INTEGRATION") == "1", "real integration is opt-in")
 class NewInstanceIntegrationTests(unittest.TestCase):
@@ -219,6 +301,15 @@ class NewInstanceIntegrationTests(unittest.TestCase):
         extra = self.sessions() - self.baseline
         if extra:
             subprocess.run(["zmx", "kill", *sorted(extra), "--force"], env=self.env, capture_output=True, text=True, timeout=30)
+        if (self.state / "kzw" / "coordinator" / "server.sock").exists():
+            for _ in range(20):
+                stopped = subprocess.run([sys.executable, "-m", "kzw.cli", "server-stop"], cwd=REPO, env=self.env,
+                                         input="y\n", capture_output=True, text=True, timeout=30)
+                if not stopped.returncode:
+                    break
+                time.sleep(0.1)
+            if stopped.returncode:
+                self.fail("isolated coordinator cleanup failed at " + str(self.tmp) + ": " + stopped.stderr)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def sessions(self):
@@ -279,6 +370,29 @@ class NewInstanceIntegrationTests(unittest.TestCase):
             time.sleep(0.1)
         else:
             self.fail("separate-instance supervisor did not exit")
+
+    def test_coordinator_final_exit_closes_private_instance_and_finishes_journal(self):
+        self.env["SHELL"] = "/bin/sh"
+        for args in (("create", "Test"), ("attach", "Test", "--new-kitty-instance")):
+            result = self.kzw(*args)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tree = json.loads(self.raw("ls"))
+        window = tree[0]["tabs"][0]["windows"][0]
+        self.raw("send-text", "--match", "id:" + str(window["id"]), "\x04")
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if (self.directory / "workspace.kitty-session").read_text() == "# kzw-empty-workspace\n" and not (self.directory / "pending-exit.json").exists():
+                with open(self.directory / "lock", "a+") as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        break
+            time.sleep(0.1)
+        else:
+            self.fail("private final exit did not finish: " + (self.directory / "supervisor.log").read_text()[-4000:])
+        self.assertEqual(self.sessions(), self.baseline)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from .core import PANE
 
 # The same template is used by private instances and by the tab-style kitten
 # that temporarily configures a shared instance.
-TAB_TITLE_TEMPLATE = "{title.replace('kzw-pane', '…')}  {fmt.nobold}{fmt.noitalic}{index}"
+TAB_TITLE_TEMPLATE = "{title.replace('kzw-pane', '…').replace(' │ ', ' · ')}  {fmt.nobold}{fmt.noitalic}{index}"
 
 
 def parse_process_details(zmx_list, ps_output):
@@ -168,7 +168,7 @@ def refresh(list_tree, set_title, stop=None):
                 if pane_id == pane and pane in states:
                     name += " · " + states[pane]
             names.append(name or "?")
-        desired = " │ ".join(names)
+        desired = " · ".join(names)
         if known and desired != title:
             set_title(tab_id, desired)
 
