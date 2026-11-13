@@ -76,6 +76,10 @@ class ExitTests(unittest.TestCase):
         if args == ("ls", "--output-format=session"):
             return "\n".join(line for line in self.source.splitlines() if not line.startswith("# kzw-focus ")) + "\n"
         self.assertEqual(args[0], "kitten")
+        if args[3].endswith("/scoped_session_kitten.py"):
+            self.assertEqual(args[-2:], ("5", "--with-tree"))
+            export = "\n".join(line for line in self.source.splitlines() if not line.startswith("# kzw-focus ")) + "\n"
+            return json.dumps({"os_window_id": 5, "tree": self.tree, "session": export})
         targets = json.loads(args[-1])
         # At the instant of UI mutation both the authoritative and cached
         # layouts must already exclude the exact ended sessions.
@@ -107,6 +111,7 @@ class ExitTests(unittest.TestCase):
 
     def test_positive_exit_commits_before_exact_view_close_without_kill(self):
         self.ended(B)
+        self.requests.clear()
         self.assertEqual(self.sync(), 1)
         remote = self.request({"method": "workspace.get", "workspace": "Test"})
         self.assertEqual(remote["panes"], [A, C])
@@ -118,6 +123,50 @@ class ExitTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT * FROM cleanup").fetchall(), [])
         event = json.loads(self.store.db.execute("SELECT data FROM workspace_events ORDER BY seq DESC LIMIT 1").fetchone()[0])
         self.assertEqual(event["reason"], "confirmed_exit")
+        self.assertEqual([r["method"] for r in self.requests if r["method"] in ("workspace.put", "panes.exited")],
+                         ["panes.exited"])
+
+    def test_exit_uses_latest_atomic_layout_without_intermediate_publication(self):
+        self.ended(B)
+        self.source = self.source.replace("new_tab Test", "new_tab Latest")
+        self.requests.clear()
+        self.assertEqual(self.sync(), 1)
+        self.assertIn("new_tab Latest", (self.directory / "workspace.kitty-session").read_text())
+        self.assertNotIn("workspace.put", [r["method"] for r in self.requests])
+
+    def test_atomic_capture_rejects_changed_or_incomplete_view_without_committing(self):
+        self.ended(B)
+        initial = self.request({"method": "workspace.get", "workspace": "Test"})
+        for mode in ("wrong scope", "replaced wrapper", "reconnected", "changed host", "unmanaged", "missing launch", "missing focus"):
+            with self.subTest(mode=mode):
+                def invalid(directory, *args):
+                    result = self.kitty(directory, *args)
+                    if args[0] == "kitten" and args[3].endswith("/scoped_session_kitten.py"):
+                        data = json.loads(result)
+                        ow = data["tree"][0]
+                        window = ow["tabs"][0]["windows"][1]
+                        if mode == "wrong scope":
+                            ow["id"] += 1
+                        elif mode == "replaced wrapper":
+                            window["pid"] += 1
+                        elif mode == "reconnected":
+                            window["user_vars"]["kzw_attach_ended"] = "0"
+                        elif mode == "changed host":
+                            window["user_vars"]["kzw_host"] = "other-host"
+                        elif mode == "unmanaged":
+                            window["user_vars"] = {}
+                        elif mode == "missing launch":
+                            data["session"] = "new_tab Empty\n"
+                        else:
+                            window["is_active"] = False
+                        return json.dumps(data)
+                    return result
+                with patch("kzw.cli.view_query", side_effect=invalid), self.assertRaises(ValueError):
+                    self.sync()
+                self.assertEqual(self.request({"method": "workspace.get", "workspace": "Test"}), initial)
+                self.assertEqual((self.directory / "workspace.kitty-session").read_text(), self.source)
+                self.assertFalse((self.directory / "pending-exit.json").exists())
+                self.assertFalse(self.closes)
 
     def test_multiple_and_final_exits_save_empty_without_closing_unrelated_views(self):
         self.ended(A, B, C)
@@ -190,7 +239,7 @@ class ExitTests(unittest.TestCase):
 
         def lost(directory, *args):
             result = self.kitty(directory, *args)
-            if args[0] == "kitten":
+            if args[0] == "kitten" and args[3].endswith("/exit_kitten.py"):
                 raise OSError("Kitty reply lost")
             return result
 
@@ -217,7 +266,7 @@ class ExitTests(unittest.TestCase):
     def test_pending_exit_does_not_close_replaced_or_reconnected_wrapper(self):
         self.ended(B)
         with patch("kzw.cli.view_query", side_effect=lambda d, *a: (_ for _ in ()).throw(OSError("close failed"))
-                   if a[0] == "kitten" else self.kitty(d, *a)), self.assertRaises(OSError):
+                   if a[0] == "kitten" and a[3].endswith("/exit_kitten.py") else self.kitty(d, *a)), self.assertRaises(OSError):
             self.sync()
         self.tree[0]["tabs"][0]["windows"][1]["pid"] += 1
         with self.assertRaisesRegex(ValueError, "identity changed"):
@@ -254,7 +303,7 @@ class ExitTests(unittest.TestCase):
     def test_stale_revision_and_foreign_owner_cannot_close_even_after_commit(self):
         self.ended(B)
         with patch("kzw.cli.view_query", side_effect=lambda d, *a: (_ for _ in ()).throw(OSError("close failed"))
-                   if a[0] == "kitten" else self.kitty(d, *a)), self.assertRaises(OSError):
+                   if a[0] == "kitten" and a[3].endswith("/exit_kitten.py") else self.kitty(d, *a)), self.assertRaises(OSError):
             self.sync()
         self.store.db.execute("UPDATE workspaces SET revision=revision+1")
         with self.assertRaisesRegex(ValueError, "revision"):
@@ -272,7 +321,7 @@ class ExitTests(unittest.TestCase):
             if closed:
                 raise OSError("Kitty has exited")
             result = self.kitty(directory, *args)
-            if args[0] == "kitten":
+            if args[0] == "kitten" and args[3].endswith("/exit_kitten.py"):
                 closed.append(True)
                 raise OSError("last-window reply lost")
             return result

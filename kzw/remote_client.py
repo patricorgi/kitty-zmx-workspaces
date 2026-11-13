@@ -671,7 +671,7 @@ def ensure_current_revision(directory):
         raise ValueError("remote workspace revision changed; reconnect before changing the view")
 
 
-def start_status_monitor(directory):
+def start_status_monitor(directory, on_metrics=None):
     """Wake the supervisor when the origin reports an observed session missing."""
     config = json.loads((directory / "remote.json").read_text())
     if config.get("state_home", "") != origin_state_home(config["host"]):
@@ -695,9 +695,13 @@ def start_status_monitor(directory):
                     if stop.is_set():
                         continue
                 known, notified = None, None
+                next_metrics = 0.0
                 while not stop.is_set():
-                    current = channel.request({"method": "workspace.watch", "workspace": name,
-                                               "known": known, "timeout": 2}, timeout=15)
+                    request = {"method": "workspace.watch", "workspace": name, "known": known, "timeout": 2}
+                    if on_metrics is not None:
+                        request["host_metrics"] = True
+                    current = channel.request(request, timeout=15)
+                    metrics = current.pop("host_metrics", None) if isinstance(current, dict) else None
                     if (not isinstance(current, dict) or type(current.get("revision")) is not int or
                             not isinstance(current.get("live"), list) or not isinstance(current.get("missing"), list) or
                             not isinstance(current.get("confirmed_missing"), list) or
@@ -729,6 +733,12 @@ def start_status_monitor(directory):
                         notified = notice
                     cursor = next_cursor
                     known = current
+                    if on_metrics is not None and time.monotonic() >= next_metrics:
+                        next_metrics = time.monotonic() + 5
+                        try:
+                            on_metrics(metrics)
+                        except (OSError, ValueError, subprocess.SubprocessError):
+                            pass  # Display failures must not interrupt lifecycle monitoring.
             except (OSError, ValueError, subprocess.SubprocessError):
                 if not stop.is_set():
                     stop.wait(1)

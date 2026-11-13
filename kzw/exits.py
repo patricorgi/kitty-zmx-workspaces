@@ -7,7 +7,7 @@ import subprocess
 from contextlib import nullcontext
 
 from . import remote_client
-from .core import atomic_write, pane_map
+from .core import FOCUS_PREFIX, atomic_write, focused_pane, pane_map, rewrite_export
 from .layout_prune import prune_snapshot
 
 
@@ -40,6 +40,29 @@ def current_windows(directory, targets):
         raise
 
 
+def snapshot_for_exit(directory, executable, tree):
+    """Capture the current complete layout and identities in one Kitty callback."""
+    from . import cli
+    mapping, views = pane_map(tree), windows(tree)
+    if len(tree) != 1 or type(tree[0].get("id")) is not int:
+        raise ValueError("ambiguous workspace view during exit capture")
+    os_id = tree[0]["id"]
+    kitten = str(Path(__file__).with_name("scoped_session_kitten.py"))
+    response = json.loads(cli.view_query(directory, "kitten", "--match", "id:" + str(next(iter(mapping))),
+                                         kitten, str(os_id), "--with-tree"))
+    current = response.get("tree") if isinstance(response, dict) else None
+    if (not isinstance(current, list) or len(current) != 1 or not isinstance(current[0], dict) or
+            current[0].get("id") != os_id or response.get("os_window_id") != os_id or
+            not isinstance(response.get("session"), str)):
+        raise ValueError("invalid atomic exit snapshot")
+    if pane_map(current) != mapping or windows(current) != views:
+        raise ValueError("workspace view changed while preparing exit removal")
+    current[0]["last_focused"] = True
+    focus = focused_pane(current)
+    return FOCUS_PREFIX + json.dumps({"pane": focus}, separators=(",", ":")) + "\n" + rewrite_export(
+        response["session"], mapping, executable)
+
+
 def synchronize(directory, executable, locked=False):
     from . import cli
     if not (directory / "remote.json").is_file():
@@ -69,12 +92,10 @@ def synchronize(directory, executable, locked=False):
             receipts = remote_client.exit_receipts(directory, candidates)
             if not receipts:
                 return 0
-            # Capture every split before pruning the selected leaves. This may
-            # advance the revision; publication validates the receipts again.
-            cli.capture_locked(directory, executable, expected_panes=mapping)
-            source = (directory / "workspace.kitty-session").read_text()
-            if windows(json.loads(cli.view_query(directory, "ls"))) != views:
-                raise ValueError("workspace view changed while preparing exit removal")
+            # Journal the latest complete layout with the proven leaves pruned.
+            # No intermediate publication or repeated layout reads are needed;
+            # the origin validates the final layout and exit evidence together.
+            source = snapshot_for_exit(directory, executable, tree)
             snapshot = prune_snapshot(source, receipts)
             data = {"snapshot": snapshot, "panes": sorted(set(config["panes"]) - set(receipts)),
                     "receipts": receipts, "targets": {k: w for k, w in views.items() if w["pane"] in receipts},

@@ -20,6 +20,13 @@ def handle_result(args, answer, target_window_id, boss):
     tab = boss.tab_for_id(window.tab_id)
     if tab is None:
         return
+    if (window.user_vars.get("kzw_utility") == "condor-queue" and not window.user_vars.get("kzw_pane")
+            and not window.user_vars.get("kzw_workspace")):
+        if len(list(tab)) != 1:
+            boss.show_error("Cannot close", "The utility tab contains additional panes.")
+            return
+        boss.mark_window_for_close(window)
+        return
     selected = [window] if kind == "pane" else list(tab)
     selection = {str(w.id): [w.user_vars.get("kzw_pane", ""), w.user_vars.get("kzw_host", "")]
                  for w in selected}

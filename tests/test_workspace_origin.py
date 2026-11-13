@@ -95,6 +95,49 @@ class WorkspaceOriginTests(unittest.TestCase):
         call.assert_called_once_with("", {"method": "workspace.get", "workspace": "Test"})
         acquire.assert_not_called()
 
+    def test_kill_retires_only_a_proven_dead_view_under_a_free_supervisor_lock(self):
+        directory = cli.state_dir("Test", "origin")
+        pane = "kzw-" + "a" * 32
+        for alive in (False, True, None):
+            with self.subTest(alive=alive):
+                cli.write_view(directory, "unix:/old-kitty", 42, 1, [pane])
+                with patch("kzw.cli.view_alive", return_value=alive,
+                           side_effect=ValueError("unknown") if alive is None else None), \
+                     patch("kzw.cli.remote_client.call", side_effect=[
+                         {"exists": True, "revision": 3, "panes": [pane]}, {}, {"remaining": []}]) as call, \
+                     patch("kzw.cli.remote_client.acquire_lease"), \
+                     patch("kzw.cli.remote_client.lease_token", return_value="lease"), \
+                     patch("kzw.cli.remote_client.release_lease"), patch("builtins.input", return_value="y"):
+                    if alive is False:
+                        cli.kill_workspace("Test", "origin")
+                        self.assertFalse((directory / "view.json").exists())
+                        self.assertEqual([c.args[1]["method"] for c in call.call_args_list],
+                                         ["workspace.get", "workspace.kill", "cleanup.retry"])
+                    else:
+                        with self.assertRaises(ValueError):
+                            cli.kill_workspace("Test", "origin")
+                        self.assertTrue((directory / "view.json").exists())
+                        call.assert_not_called()
+
+    def test_kill_does_not_clear_dead_view_with_pending_operation_or_supervisor_lock(self):
+        directory = cli.state_dir("Test", "origin")
+        cli.write_view(directory, "unix:/old-kitty", 42, 1, ["kzw-" + "a" * 32])
+        with patch("kzw.cli.view_alive", return_value=False) as alive, \
+             patch("kzw.cli.remote_client.call") as call:
+            for filename in ("pending-create.json", "pending-close.json", "pending-exit.json", "native-stage.json"):
+                pending = directory / filename
+                pending.write_text("{}")
+                with self.assertRaisesRegex(ValueError, "unfinished"):
+                    cli.kill_workspace("Test", "origin")
+                pending.unlink()
+                self.assertTrue((directory / "view.json").exists())
+            with open(directory / "lock", "a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(ValueError, "attached locally"):
+                    cli.kill_workspace("Test", "origin")
+            alive.assert_not_called()
+            call.assert_not_called()
+
     def test_rename_recovers_lost_acknowledgement(self):
         from kzw.remote import Store
         store = Store(Path(self.temp.name) / "server.sqlite")
