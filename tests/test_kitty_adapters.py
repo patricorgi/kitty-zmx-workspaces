@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 
-def load_adapter(name):
+def load_adapter(name, path=None, native_loader=False):
     handler = types.ModuleType("kittens.tui.handler")
     handler.result_handler = lambda **kwargs: lambda function: function
     session = types.ModuleType("kitty.session")
@@ -21,13 +21,23 @@ def load_adapter(name):
     with patch.dict(sys.modules, {"kittens": types.ModuleType("kittens"), "kittens.tui": types.ModuleType("kittens.tui"),
                                   "kittens.tui.handler": handler, "kitty": types.ModuleType("kitty"),
                                   "kitty.session": session, "kitty.fast_data_types": native}):
-        spec = importlib.util.spec_from_file_location("adapter_" + name, Path(__file__).parents[1] / "kzw" / (name + "_kitten.py"))
+        path = path or Path(__file__).parents[1] / "kzw" / (name + "_kitten.py")
+        if native_loader:
+            module = types.ModuleType("kitten")
+            exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
+            return module
+        spec = importlib.util.spec_from_file_location("adapter_" + name, path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     return module
 
 
 class KittyAdapterTests(unittest.TestCase):
+    def test_snapshot_kitten_loads_without_a_dunder_file_as_in_real_kitty(self):
+        module = load_adapter("scoped_session", native_loader=True)
+        self.assertTrue(callable(module.handle_result))
+        self.assertFalse(hasattr(module, "__file__"))
+
     def test_exit_close_validates_all_wrappers_before_closing_any(self):
         module = load_adapter("exit")
         expected = {"id": 7, "os_window_id": 42, "pid": 99, "pane": "kzw-" + "a" * 32, "ended": "1"}
@@ -51,7 +61,7 @@ class KittyAdapterTests(unittest.TestCase):
         module = load_adapter("scoped_session")
         for mode in ("valid", "missing pane", "moved pane", "missing window", "bad args"):
             with self.subTest(mode=mode):
-                selected = Mock()
+                selected = Mock(tabs=[])
                 selected.serialize_state_as_session.return_value = iter(["new_tab Test", "layout splits"])
                 unrelated = Mock()
                 window = types.SimpleNamespace(os_window_id=99 if mode == "moved pane" else 42)
@@ -82,6 +92,21 @@ class KittyAdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.handle_result(["kitten"], None, 1234, boss)
         boss.call_remote_control.assert_not_called()
+
+    def test_atomic_snapshot_pairs_layout_with_only_its_workspace_tree(self):
+        module = load_adapter("scoped_session")
+        selected, unrelated = Mock(tabs=[]), Mock()
+        selected.serialize_state_as_session.return_value = iter(["new_tab Test", "layout splits"])
+        window = types.SimpleNamespace(os_window_id=42)
+        trees = [{"id": i, "tabs": [{"id": i}]} for i in (42, 99)]
+        boss = Mock(window_id_map={7: window}, os_window_map={42: selected, 99: unrelated})
+        boss.list_os_windows.side_effect = lambda tab_filter: (
+            ow for ow in trees if tab_filter(types.SimpleNamespace(os_window_id=ow["id"])))
+        result = json.loads(module.handle_result(["kitten", "42", "--with-tree"], None, 7, boss))
+        self.assertEqual(result, {"os_window_id": 42, "session": "new_tab Test\nlayout splits", "tree": trees[:1]})
+        unrelated.serialize_state_as_session.assert_not_called()
+        with self.assertRaises(ValueError):
+            module.handle_result(["kitten", "42", "--unknown"], None, 7, boss)
 
     def test_minimize_restore_use_source_os_window_and_invalid_requests_do_nothing(self):
         module = load_adapter("supervisor_window")

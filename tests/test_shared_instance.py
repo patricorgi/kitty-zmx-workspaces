@@ -377,7 +377,7 @@ class SharedSupervisorTests(unittest.TestCase):
         class EndTest(BaseException):
             pass
 
-        for mode in ("restore", "bootstrap", "launch-rejected", "disconnected"):
+        for mode in ("restore", "bootstrap", "launch-rejected", "disconnected", "instance-exited", "utility-tab"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp, ExitStack() as patches:
                 directory = Path(tmp)
                 source = directory / ("bootstrap.kitty-session" if mode == "bootstrap" else "workspace.kitty-session")
@@ -394,8 +394,12 @@ class SharedSupervisorTests(unittest.TestCase):
                     if not launched:
                         return [utility]
                     if (directory / "view.json").exists() and state["gone"]:
-                        if mode == "disconnected":
+                        if mode in ("disconnected", "instance-exited"):
                             raise OSError("temporary Kitty control failure")
+                        if mode == "utility-tab":
+                            retained = {"id": 42, "tabs": [{"id": 8, "windows": [{"id": 9, "user_vars": {
+                                "kzw_utility": "condor-queue", "kzw_utility_source": "7", "kzw_utility_pane": PANE_A}}]}]}
+                            return [utility, retained]
                         return [utility]
                     return [utility, view_window(42, [PANE_A])]
 
@@ -436,6 +440,7 @@ class SharedSupervisorTests(unittest.TestCase):
                     "capture": {"side_effect": capture}, "subprocess.run": {"side_effect": launch},
                     "subprocess.Popen": {"side_effect": AssertionError("shared attachment must not spawn a private Kitty")},
                     "time.monotonic": {"side_effect": itertools.count().__next__}, "time.sleep": {"side_effect": sleep},
+                    "os.kill": {"side_effect": ProcessLookupError if mode == "instance-exited" else None},
                 }
                 mocks = {target: patches.enter_context(patch("kzw.cli." + target, **kwargs)) for target, kwargs in replacements.items()}
                 patches.enter_context(patch.dict(os.environ, {}, clear=True))

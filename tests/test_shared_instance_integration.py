@@ -137,6 +137,111 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         output = self.raw("kitten", str(self.probe))
         return json.loads(output)
 
+    def test_managed_queue_tab_is_listed_saved_and_resumed(self):
+        from kzw.core import saved_focus
+        from kzw.sessions import snapshot_tabs
+        picker = Path(os.environ.get("KZW_TEST_QUEUE_SCRIPT", Path.home() / "dotfiles/scripts/tmux_condor_queue.sh"))
+        if not picker.is_file() or not shutil.which("fzf"):
+            self.skipTest("dotfiles queue picker and fzf are required")
+        self.baseline = self.sessions()
+        created = self.kzw("create", "Test", "--attach")
+        self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
+        directory = self.state / "kzw" / "Test"
+        view = json.loads((directory / "view.json").read_text())
+        os_id = view["os_window_id"]
+
+        def windows():
+            return {w["id"]: w for ow in json.loads(self.raw("ls")) for t in ow["tabs"] for w in t["windows"]}
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                result = predicate()
+                if result:
+                    return result
+                time.sleep(0.1)
+            self.fail("managed queue tab condition timed out: " + self.raw("ls"))
+
+        source = next(w for w in windows().values() if w.get("user_vars", {}).get("kzw_pane"))
+        pane = source["user_vars"]["kzw_pane"]
+        sessions = self.sessions()
+        # Only this disposable Kitty gets a fake home and a read-only Condor
+        # fixture. No real queue or user shell configuration is touched.
+        home = self.tmp / "queue home"
+        scripts = home / "dotfiles" / "scripts"
+        tools = home / "bin"
+        scripts.mkdir(parents=True)
+        tools.mkdir()
+        shutil.copyfile(picker, scripts / "tmux_condor_queue.sh")
+        (home / "sample.out").write_text("KZW_QUEUE_TEST_LOG\n")
+        (home / "sample.err").write_text("KZW_QUEUE_TEST_ERROR\n")
+        row = "\t".join(["123", "0", "test", "2", "1700000000", "sample.out", "sample.err", str(home), "worker", "1700000000"])
+        condor = tools / "condor_q"
+        condor.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(row) + "\n")
+        condor.chmod(0o700)
+        (tools / "fzf").symlink_to(shutil.which("fzf"))
+        (home / ".bash_profile").write_text("export PATH=" + shlex.quote(str(tools)) + ':"$PATH"\n')
+        self.raw("env", "HOME=" + str(home))
+
+        def open_picker():
+            self.raw("kitten", "--match", "id:" + str(source["id"]), str(REPO / "kzw/utility_kitten.py"))
+            queue = wait_for(lambda: next((w for w in windows().values()
+                                          if w.get("user_vars", {}).get("kzw_pane") not in (None, "", pane)), None))
+            match = "id:" + str(queue["id"])
+            wait_for(lambda: "Condor queue>" in self.raw("get-text", "--match", match))
+            wait_for(lambda: not (directory / "pending-create.json").exists())
+            return queue, match
+
+        queue, match = open_picker()
+        saved = self.kzw("save", "Test")
+        self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+        snapshot = (directory / "workspace.kitty-session").read_text()
+        queue_pane = queue["user_vars"]["kzw_pane"]
+        self.assertEqual(sum(line.startswith("launch ") for line in snapshot.splitlines()), 2)
+        self.assertNotIn("_queue", snapshot)
+        self.assertNotIn("kzw_utility", snapshot)
+        self.assertNotIn("--initial-program", snapshot)
+        self.assertEqual(saved_focus(snapshot), queue_pane)
+        self.assertEqual(windows()[source["id"]]["pid"], source["pid"])
+        self.assertEqual(self.sessions(), sessions | {queue_pane})
+        state = self.kzw("inspect", "Test", "--json")
+        self.assertEqual(state.returncode, 0, state.stderr)
+        state = json.loads(state.stdout)
+        self.assertEqual(snapshot_tabs(state["snapshot"], state["panes"]), [[pane], [queue_pane]])
+        self.raw("send-text", "--match", match, "\r")
+        # The same log is already visible in fzf's preview. Wait for less's
+        # follow-mode prompt before interrupting, rather than racing fzf.
+        wait_for(lambda: "Waiting for data" in self.raw("get-text", "--match", match))
+        self.assertIn("KZW_QUEUE_TEST_LOG", self.raw("get-text", "--match", match))
+        self.raw("send-text", "--match", match, "\x03")
+        time.sleep(0.2)
+        self.raw("send-text", "--match", match, "q")
+        wait_for(lambda: "Condor queue>" in self.raw("get-text", "--match", match))
+        self.raw("send-text", "--match", match, "\x1b")
+        wait_for(lambda: queue["id"] not in windows())
+        wait_for(lambda: self.sessions() == sessions)
+        workspace = next(ow for ow in json.loads(self.raw("ls")) if ow["id"] == os_id)
+        self.assertTrue(workspace["tabs"][0]["is_active"])
+        self.assertEqual(windows()[source["id"]]["pid"], source["pid"])
+
+        queue, match = open_picker()
+        queue_pane = queue["user_vars"]["kzw_pane"]
+        detached = self.kzw("detach", "Test")
+        self.assertEqual(detached.returncode, 0, detached.stdout + detached.stderr)
+        wait_for(lambda: not (directory / "view.json").exists())
+        self.assertNotIn(queue["id"], windows())
+        self.assertEqual(self.sessions(), sessions | {queue_pane})
+        attached = self.kzw("attach", "Test")
+        self.assertEqual(attached.returncode, 0, attached.stdout + attached.stderr)
+        managed = [w for w in windows().values() if w.get("user_vars", {}).get("kzw_pane")]
+        self.assertEqual([w["user_vars"]["kzw_pane"] for w in managed], [pane, queue_pane])
+        self.assertFalse(any(w.get("user_vars", {}).get("kzw_utility") for w in windows().values()))
+        queue = next(w for w in managed if w["user_vars"]["kzw_pane"] == queue_pane)
+        match = "id:" + str(queue["id"])
+        wait_for(lambda: "Condor queue>" in self.raw("get-text", "--match", match))
+        self.raw("send-text", "--match", match, "\x1b")
+        wait_for(lambda: queue["id"] not in windows())
+
     def test_tab_styling_preserves_shortcuts_and_paste_across_repeated_apply_restore(self):
         if sys.platform != "darwin":
             self.skipTest("native macOS shortcuts are required")

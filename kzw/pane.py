@@ -194,6 +194,7 @@ def main():
     parser.add_argument("--existing", action="store_true", help="refuse to create a missing session")
     parser.add_argument("--stage-new", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--initial-cwd", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--initial-program", choices=("condor-queue",), default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
     pane = args.pane or "kzw-" + uuid.uuid4().hex
     coordinated = bool(os.environ.get("KZW_WORKSPACE_ORIGIN") or os.environ.get("KZW_WORKSPACE_COORDINATOR") == "1")
@@ -205,6 +206,8 @@ def main():
     if args.initial_cwd and (args.existing or not args.stage_new or not args.initial_cwd.startswith('/') or
                              any(ord(c) < 32 or ord(c) == 127 for c in args.initial_cwd)):
         parser.error("invalid initial working directory")
+    if args.initial_program and (args.existing or not args.stage_new or not args.pane):
+        parser.error("initial program requires an explicitly staged new pane")
     for key, value in (("kzw_pane", pane), ("kzw_host", args.host)):
         encoded = base64.b64encode(value.encode()).decode()
         sys.stdout.write(f"\x1b]1337;SetUserVar={key}={encoded}\x07")
@@ -242,7 +245,16 @@ def main():
             remote_command += f'zmx list --short | grep -F -x -- {pane} >/dev/null || {{ echo "kzw: session {pane} is missing or unavailable" >&2; exit 1; }}; '
         remote_command += f'exec zmx attach {pane}'
         local_command = ["zmx", "attach", pane]
-        if args.initial_cwd and not existing:
+        if args.initial_program and not existing:
+            from .utility import queue_session_command
+            shell_args = queue_session_command()
+            if args.initial_cwd:
+                shell_args = ['/bin/sh', '-c',
+                              'cd -- "$1" || printf "kzw: cannot enter requested directory; using default\\n" >&2; '
+                              'shift; exec "$@"', 'kzw-program', args.initial_cwd, *shell_args]
+            remote_command += ' ' + shlex.join(shell_args)
+            local_command += shell_args
+        elif args.initial_cwd and not existing:
             shell_command = 'cd -- "$1" || printf "kzw: cannot enter requested directory; using default\\n" >&2; exec "${SHELL:-/bin/sh}" -l'
             shell_args = ['/bin/sh', '-c', shell_command, 'kzw-shell', args.initial_cwd]
             remote_command += ' ' + shlex.join(shell_args)

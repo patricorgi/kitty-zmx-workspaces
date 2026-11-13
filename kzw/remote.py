@@ -27,6 +27,88 @@ REQUEST = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 MAX_REQUEST = 1024 * 1024
 
 
+class HostMetrics:
+    """One in-memory, demand-driven sample for all clients of this coordinator."""
+
+    interval = 5.0
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.previous = None
+        self.sample = None
+        self.sampled = None
+        self.libc = None
+
+    def counters(self):
+        if sys.platform.startswith("linux"):
+            with open("/proc/stat") as stream:
+                fields = stream.readline().split()
+            if fields[0] != "cpu" or len(fields) < 5:
+                raise ValueError("invalid aggregate CPU counters")
+            ticks = [int(value) for value in fields[1:9]]
+            # Guest times are already included in user/nice; iowait is not busy.
+            total = sum(ticks)
+            idle = ticks[3] + (ticks[4] if len(ticks) > 4 else 0)
+            with open("/proc/meminfo") as stream:
+                memory = {key: int(value.split()[0]) for key, value in
+                          (line.split(":", 1) for line in stream)}
+            return total, idle, memory["MemTotal"], memory["MemAvailable"]
+        if sys.platform == "darwin":
+            import ctypes
+            if self.libc is None:
+                self.libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+                self.libc.mach_host_self.restype = ctypes.c_uint
+                self.host_port = self.libc.mach_host_self()
+
+            def statistics(flavor):
+                values = (ctypes.c_uint32 * 64)()
+                count = ctypes.c_uint(64)
+                if self.libc.host_statistics(self.host_port, flavor, values, ctypes.byref(count)):
+                    raise OSError("host statistics unavailable")
+                return list(values)[:count.value]
+
+            def sysctl(name):
+                value = ctypes.c_uint64()
+                size = ctypes.c_size_t(ctypes.sizeof(value))
+                if self.libc.sysctlbyname(name, ctypes.byref(value), ctypes.byref(size), None, 0):
+                    raise OSError("memory size unavailable")
+                return value.value
+
+            cpu = statistics(3)  # HOST_CPU_LOAD_INFO: user, system, idle, nice
+            vm = statistics(2)   # HOST_VM_INFO: free, active, inactive, wired, ...
+            if len(cpu) < 4 or len(vm) < 4:
+                raise ValueError("incomplete host statistics")
+            # Inactive pages are reclaimable. This is an availability estimate,
+            # not macOS's memory-pressure indicator or a sum of process RSS.
+            return sum(cpu[:4]), cpu[2], sysctl(b"hw.memsize"), (vm[0] + vm[2]) * os.sysconf("SC_PAGE_SIZE")
+        raise OSError("host metrics are unsupported on this platform")
+
+    def get(self):
+        with self.lock:
+            now = time.monotonic()
+            if self.sampled is None or now - self.sampled >= self.interval:
+                cpu = ram = None
+                try:
+                    total, idle, memory, available = self.counters()
+                    if memory <= 0 or not 0 <= available <= memory or not 0 <= idle <= total:
+                        raise ValueError("invalid machine counters")
+                    ram = round(100 * (memory - available) / memory, 1)
+                    if self.previous is not None:
+                        delta = total - self.previous[0]
+                        idle_delta = idle - self.previous[1]
+                        if delta > 0 and 0 <= idle_delta <= delta:
+                            cpu = round(100 * (delta - idle_delta) / delta, 1)
+                    self.previous = (total, idle)
+                except (OSError, ValueError, KeyError, IndexError):
+                    self.previous = None
+                self.sample = {"host": socket.gethostname(), "cpu_percent": cpu, "ram_percent": ram}
+                self.sampled = now
+            return {**self.sample, "age_seconds": max(0, now - self.sampled)}
+
+
+HOST_METRICS = HostMetrics()
+
+
 class Conflict(ValueError):
     pass
 
@@ -445,6 +527,8 @@ class Store:
         if not isinstance(req, dict):
             raise ValueError("request must be an object")
         method = req.get("method")
+        if method == "host.metrics":
+            return HOST_METRICS.get()
         if method == "workspace.list":
             rows = self.db.execute("SELECT name,revision FROM workspaces ORDER BY name").fetchall()
             return {"workspaces": [{"name": row[0], "revision": row[1]} for row in rows]}
@@ -703,6 +787,8 @@ class Store:
             while True:
                 current = self.dispatch({"method": "workspace.status", "workspace": name})
                 if current != known or time.monotonic() >= deadline:
+                    if req.get("host_metrics") is True:
+                        current["host_metrics"] = HOST_METRICS.get()
                     return current
                 time.sleep(min(0.25, max(0, deadline - time.monotonic())))
         if method == "workspace.status":
