@@ -54,8 +54,9 @@ class PaneRecoveryTests(unittest.TestCase):
                 errors = [remote_client.RemoteRejected("lease expired"), remote_client.RemoteRejected("lease expired"), None]
                 with patch.dict(os.environ, env, clear=True), \
                      patch("sys.argv", ["kzw-pane", "--pane", PANE, "--host", host, "--existing"]), \
-                     patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO) as stderr, \
-                     patch("kzw.pane.verify_workspace_lease", side_effect=errors), \
+                      patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+                      patch("kzw.ssh_transport.pane_options", return_value=[]), \
+                      patch("kzw.pane.verify_workspace_lease", side_effect=errors), \
                      patch("kzw.pane.run_attachment", return_value=subprocess.CompletedProcess([], 0)) as attach, \
                      patch("kzw.pane.subprocess.run", return_value=subprocess.CompletedProcess([], 0, PANE + "\n")), \
                      patch("kzw.pane.report_attachment_ended") as ended, \

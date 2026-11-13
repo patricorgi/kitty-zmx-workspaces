@@ -62,6 +62,10 @@ For a remote workspace, add `--host HOST` to each command:
 kzw create Demo --host HOST --attach
 ```
 
+Remote panes share a workspace-scoped SSH master when available. Setup is
+serialized before attaching; stale/unavailable sharing falls back to a direct
+connection without stopping other panes. Genuine SSH failures remain visible.
+
 Use `kzw attach Demo --inherit-appearance` to copy the calling Kitty window's
 font size and available colors. Kitty remote control must be enabled for the
 calling window. Active function markers are enabled in workspace panes; other

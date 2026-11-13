@@ -26,23 +26,43 @@ def ssh_diagnostic_visible(line):
 
 
 def run_attachment(cmd, env, remote):
+    if remote:
+        from .ssh_transport import prepare_attachment
+        cmd = prepare_attachment(cmd, env)
     if not remote or env.get("KZW_DEBUG") == "1":
         return subprocess.run(cmd, env=env, check=False)
     read_fd, write_fd = os.pipe()
+    # With master creation disabled, OpenSSH itself falls back to a direct
+    # transport after these mux negotiation errors. Retain the diagnostics if
+    # that fails too; do not show a successful fallback as a broken attachment.
+    fallback = cmd[:5] == ["ssh", "-o", "ControlMaster=no", "-o", "ControlPersist=no"]
+    deferred = []
 
     def forward():
         with os.fdopen(read_fd, "r", encoding="utf-8", errors="replace") as stream:
             for line in stream:
+                if fallback and (line.rstrip() in (
+                        "mux_client_request_session: read from master failed: Broken pipe",
+                        "mux_client_request_session: read from master failed: Connection reset by peer",
+                        "mux_client_request_session: master alive request failed")):
+                    if len(deferred) < 16:
+                        deferred.append(line)
+                        continue
                 if ssh_diagnostic_visible(line):
                     print(line, end="", file=sys.stderr, flush=True)
 
     thread = threading.Thread(target=forward, daemon=True)
     thread.start()
+    result = None
     try:
-        return subprocess.run(cmd, env=env, check=False, stderr=write_fd)
+        result = subprocess.run(cmd, env=env, check=False, stderr=write_fd)
+        return result
     finally:
         os.close(write_fd)
         thread.join(timeout=1)
+        if result is None or result.returncode:
+            for line in deferred:
+                print(line, end="", file=sys.stderr, flush=True)
 
 
 @contextmanager
