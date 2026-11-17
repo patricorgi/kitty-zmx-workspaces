@@ -39,6 +39,8 @@ def run_queue(host=""):
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("KZW_") and key not in ("ZMX_SESSION", "ZMX_SESSION_PREFIX")}
     try:
+        from .network import require
+        require(host)
         status = subprocess.run(queue_command(host), env=env).returncode
     except (OSError, ValueError) as exc:
         print("kzw: " + str(exc), file=sys.stderr)

@@ -10,6 +10,8 @@ import subprocess
 import sys
 import time
 
+from . import network
+
 
 def pane_options(host, env):
     """Return SSH multiplexing options, without changing SSH configuration.
@@ -26,7 +28,8 @@ def pane_options(host, env):
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("unsafe kzw SSH control socket directory")
-    identity = json.dumps([workspace, env.get("KZW_WORKSPACE_ORIGIN", ""), host], separators=(",", ":"))
+    identity = json.dumps([workspace, env.get("KZW_WORKSPACE_ORIGIN", ""), host,
+                           env.get("KZW_WORKSPACE_DIRECTORY", "")], separators=(",", ":"))
     socket_path = root / hashlib.sha256(identity.encode()).hexdigest()[:20]
     # AF_UNIX path limits differ between platforms; fail rather than silently
     # truncating into another workspace's socket.
@@ -54,6 +57,7 @@ def prepare_attachment(command, env):
     shared = [*direct[:6], "ControlPath=" + str(path), *command[7:]]
 
     def run(*args, timeout=3):
+        network.require(host)
         return subprocess.run(["ssh", *args], env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=timeout, check=False)
 
@@ -83,7 +87,8 @@ def prepare_attachment(command, env):
                 return shared if alive() else direct
             # Adding -M after ControlMaster=yes toggles OpenSSH into ask mode.
             result = run("-o", "ControlMaster=yes", "-o", "ControlPersist=60", "-o", "ControlPath=" + str(path),
-                         "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
+                          "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
+                          "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                          "-N", "-f", "-T", host, timeout=15)
             return shared if result.returncode == 0 and alive() else direct
         except (OSError, subprocess.SubprocessError) as exc:

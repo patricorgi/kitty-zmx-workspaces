@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .core import PANE, atomic_write, check_name
+from . import network
 
 DORMANT = "# kzw-dormant-workspace\n"
 ORIGIN = "KZW_ORIGIN"
@@ -59,7 +60,8 @@ def ssh_command(host):
     if state_override and (not state_override.startswith("/") or "\x00" in state_override):
         raise ValueError("KZW_REMOTE_STATE_HOME must be an absolute remote path")
     command = ("XDG_STATE_HOME=" + shlex.quote(state_override) + " " if state_override else "") + "python3 -u -c " + shlex.quote(program)
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command]
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "ControlMaster=no", "-o", "ControlPersist=no", "-o", "ControlPath=none", host, command]
 
 
 def coordinator_command(host):
@@ -75,6 +77,8 @@ class Channel:
     """One ordered RPC stream; a broken stream is never silently replayed."""
 
     def __init__(self, command):
+        if command and Path(command[0]).name == "ssh":
+            network.require(True)
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, bufsize=0)
         os.set_blocking(self.process.stdin.fileno(), False)
@@ -123,6 +127,8 @@ class Channel:
 def persistent_rpc():
     """Reuse a connection in this thread; one-shot CLI commands stay independent."""
     previous = getattr(_local, "channels", None)
+    previous_health = getattr(_local, "connection_health", None)
+    _local.connection_health = None
     _local.channels = {}
     try:
         yield
@@ -131,6 +137,7 @@ def persistent_rpc():
             for channel in _local.channels.values():
                 channel.close()
         _local.channels = previous
+        _local.connection_health = previous_health
 
 
 def decode_response(data):
@@ -156,6 +163,7 @@ def call(host, request):
 
 
 def direct_call(host, request):
+    network.require(host)
     channels = getattr(_local, "channels", None)
     if channels is None:
         try:
@@ -170,13 +178,24 @@ def direct_call(host, request):
         return decode_response(proc.stdout)
     key = (host, os.environ.get("KZW_REMOTE_STATE_HOME", "") if host else os.environ.get("XDG_STATE_HOME", ""))
     with _channel_lock:
+        network.require(host)
         if key not in channels:
             channels[key] = Channel(coordinator_command(host))
+        health = getattr(_local, "connection_health", None)
+        if health is not None:
+            health.begin("rpc", channels[key], 8, threading.Event())
         try:
-            return channels[key].request(request)
+            response = channels[key].request(request)
+            if health is not None:
+                health.success("rpc")
+            return response
         except RemoteRejected:
+            if health is not None:
+                health.success("rpc")
             raise
         except (OSError, ValueError, subprocess.SubprocessError):
+            if health is not None:
+                health.failed("rpc")
             channels.pop(key).close()
             raise
 
@@ -206,6 +225,7 @@ class ConnectionBroker:
         self.host = host
         self.workspace = check_name(workspace)
         self.channels = getattr(_local, "channels", None)
+        self.health = getattr(_local, "connection_health", None)
         if self.channels is None:
             raise ValueError("connection broker requires persistent RPC")
         cache = Path.home() / ".cache"
@@ -229,6 +249,7 @@ class ConnectionBroker:
 
     def serve(self):
         _local.channels = self.channels
+        _local.connection_health = self.health
         while not self.stopping.is_set():
             try:
                 client, _ = self.server.accept()
@@ -488,18 +509,27 @@ def release_lease_locked(directory):
 
 
 def start_lease_heartbeat(directory):
+    from .connection import for_directory, forget
+    health = for_directory(directory)
     lease = read_lease(directory)
+    gate = network.get() if lease["host"] else None
+    health.bind_network(gate)
     identity = (lease["host"], lease["workspace"], lease.get("state_home", ""))
     stop = threading.Event()
     lock = threading.Lock()
     active = [None]
+    wake = threading.Event()
 
     def heartbeat():
         failed = None
         channel = None
         try:
             while not stop.is_set():
+                if gate is not None and not gate.wait_online(stop):
+                    break
+                resumed = gate.resumes if gate is not None else None
                 try:
+                    health.begin("lease", channel, LEASE_RPC_TIMEOUT, wake, idle_after=13)
                     # Bypass both the pane broker and the global RPC lock.
                     # A hung layout RPC must not consume the 30-second lease.
                     if channel is None:
@@ -508,7 +538,9 @@ def start_lease_heartbeat(directory):
                                 break
                             channel = Channel(coordinator_command(lease["host"]))
                             active[0] = channel
+                    health.begin("lease", channel, LEASE_RPC_TIMEOUT, wake, idle_after=13)
                     recovered = maintain_lease(directory, lambda req: channel.request(req, timeout=LEASE_RPC_TIMEOUT), identity)
+                    health.success("lease")
                     if recovered:
                         print("kzw: workspace lease recovered; pending updates can resume", file=sys.stderr, flush=True)
                     elif failed:
@@ -518,6 +550,7 @@ def start_lease_heartbeat(directory):
                     # Acquisition or release owns the short token-change lock.
                     pass
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    health.failed("lease")
                     if stop.is_set():
                         break
                     if isinstance(exc, FileNotFoundError) and not (directory / "lease.json").exists():
@@ -531,7 +564,12 @@ def start_lease_heartbeat(directory):
                             active[0] = None
                         channel.close()
                         channel = None
-                if stop.wait(LEASE_HEARTBEAT_INTERVAL):
+                if gate is not None:
+                    gate.wait_retry(LEASE_HEARTBEAT_INTERVAL, wake, stop, since=resumed)
+                else:
+                    wake.wait(LEASE_HEARTBEAT_INTERVAL)
+                wake.clear()
+                if stop.is_set():
                     break
         finally:
             with lock:
@@ -544,6 +582,7 @@ def start_lease_heartbeat(directory):
 
     def close():
         stop.set()
+        wake.set()
         with lock:
             channel = active[0]
             if channel is not None and channel.process.poll() is None:
@@ -554,6 +593,7 @@ def start_lease_heartbeat(directory):
         thread.join(timeout=12)
         if thread.is_alive():
             raise OSError("workspace heartbeat did not stop; lease retained")
+        forget(directory)
 
     return close
 
@@ -683,12 +723,21 @@ def start_status_monitor(directory, on_metrics=None):
     stop = threading.Event()
     lock = threading.Lock()
     active = [None]
+    from .connection import for_directory
+    health = for_directory(directory)
+    gate = network.get() if host else None
+    health.bind_network(gate)
+    wake = threading.Event()
 
     def monitor():
         nonlocal cursor
         while not stop.is_set():
+            if gate is not None and not gate.wait_online(stop):
+                break
+            resumed = gate.resumes if gate is not None else None
             channel = None
             try:
+                health.begin("status", None, 8, wake, idle_after=8)
                 channel = Channel(coordinator_command(host))
                 with lock:
                     active[0] = channel
@@ -697,6 +746,9 @@ def start_status_monitor(directory, on_metrics=None):
                 known, notified = None, None
                 next_metrics = 0.0
                 while not stop.is_set():
+                    if gate is not None and not gate.wait_online(stop):
+                        break
+                    health.begin("status", channel, 8, wake, idle_after=8)
                     request = {"method": "workspace.watch", "workspace": name, "known": known, "timeout": 2}
                     if on_metrics is not None:
                         request["host_metrics"] = True
@@ -712,6 +764,8 @@ def start_status_monitor(directory, on_metrics=None):
                     missing = sorted(set(current["confirmed_missing"]))
                     next_cursor = cursor
                     while not stop.is_set():
+                        if gate is not None and not gate.wait_online(stop):
+                            break
                         page = channel.request({"method": "workspace.events", "workspace": name,
                                                 "after": next_cursor, "limit": 100}, timeout=15)
                         events = page.get("events") if isinstance(page, dict) else None
@@ -733,6 +787,7 @@ def start_status_monitor(directory, on_metrics=None):
                         notified = notice
                     cursor = next_cursor
                     known = current
+                    health.success("status")
                     if on_metrics is not None and time.monotonic() >= next_metrics:
                         next_metrics = time.monotonic() + 5
                         try:
@@ -740,8 +795,13 @@ def start_status_monitor(directory, on_metrics=None):
                         except (OSError, ValueError, subprocess.SubprocessError):
                             pass  # Display failures must not interrupt lifecycle monitoring.
             except (OSError, ValueError, subprocess.SubprocessError):
+                health.failed("status")
                 if not stop.is_set():
-                    stop.wait(1)
+                    if gate is not None:
+                        gate.wait_retry(1, wake, stop, since=resumed)
+                    else:
+                        wake.wait(1)
+                    wake.clear()
             finally:
                 with lock:
                     active[0] = None
@@ -753,6 +813,7 @@ def start_status_monitor(directory, on_metrics=None):
 
     def close():
         stop.set()
+        wake.set()
         with lock:
             channel = active[0]
             if channel is not None and channel.process.poll() is None:

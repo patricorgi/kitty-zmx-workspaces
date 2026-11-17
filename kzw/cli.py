@@ -163,6 +163,7 @@ def workspace_context(name, directory, host="", remote_attached=False, rpc_socke
         "KZW_WORKSPACE_COORDINATOR": "1" if remote_attached else "",
         "KZW_WORKSPACE_DIRECTORY": str(directory),
         "KZW_CHANGE_SIGNAL": signal,
+        "KZW_CONNECTION_DISPLAY": "1",
     }
     variables = {
         "kzw_workspace": name,
@@ -746,6 +747,8 @@ def detach(name, origin=""):
 
 
 def zmx_command(host, *args):
+    from .network import require
+    require(host)
     if host:
         # Host and pane are validated by pane_map; no shell input is accepted.
         import shlex
@@ -1464,7 +1467,10 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         else:
             session = prepare_bootstrap(directory, name, host, pane_executable)
             bootstrap = True
+        from .connection import Display, for_directory
+        remote_client._local.connection_health = for_directory(directory) if remote_attached else None
         broker = remote_client.ConnectionBroker(host, name) if remote_attached else None
+        env["KZW_CONNECTION_DISPLAY"] = "1"
         if broker:
             env["KZW_RPC_SOCKET"] = str(broker.path)
         else:
@@ -1485,13 +1491,13 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             if broker:
                 broker.close()
             raise
+        display = None
         try:
-            def show_metrics(metrics):
-                from .metrics import publish
-                publish(directory, name, host, metrics)
-
-            status_stop = remote_client.start_status_monitor(directory, on_metrics=show_metrics) if remote_attached else lambda: None
+            display = Display(directory, name, host) if remote_attached else None
+            status_stop = remote_client.start_status_monitor(directory, on_metrics=display.metrics) if remote_attached else lambda: None
         except Exception:
+            if display is not None:
+                display.close()
             title_stop.set()
             if broker:
                 broker.close()
@@ -1536,6 +1542,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 kitten = Path(__file__).with_name("close_kitten.py")
                 create_kitten = Path(__file__).with_name("create_kitten.py")
                 detach_kitten = Path(__file__).with_name("detach_kitten.py")
+                retry_kitten = Path(__file__).with_name("retry_kitten.py")
+                args += ["-o", f"map --when-focus-on var:kzw_pane super+shift+r kitten {retry_kitten}"]
                 args += ["-o", f"map super+w kitten {kitten} pane",
                          "-o", f"map kitty_mod+w kitten {kitten} pane",
                          "-o", f"map kitty_mod+q kitten {kitten} tab",
@@ -1566,6 +1574,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 child = subprocess.Popen(kitty_launch_command(args, env), env=env, stdin=subprocess.DEVNULL)
         except Exception:
             status_stop()
+            if display is not None:
+                display.close()
             title_stop.set()
             if broker:
                 broker.close()
@@ -1698,6 +1708,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                     except (OSError, ValueError, subprocess.SubprocessError) as exc:
                         print(f"kzw: exit cleanup remains pending: {exc}", file=sys.stderr, flush=True)
                 status_stop()
+                if display is not None:
+                    display.close()
                 title_stop.set()
                 if broker:
                     broker.close()
@@ -2348,5 +2360,11 @@ def main():
         return 1
 
 
+def entrypoint():
+    from .network import observe
+    with observe():
+        return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint())

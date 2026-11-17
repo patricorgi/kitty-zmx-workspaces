@@ -59,6 +59,8 @@ def parse_processes(zmx_list, ps_output):
 
 def read_process_details(host):
     """Read session/process metadata in one local process or SSH request."""
+    from .network import require
+    require(host)
     script = ("PATH=\"$HOME/.local/bin:$PATH\"; export PATH; "
               "unset ZMX_SESSION ZMX_SESSION_PREFIX; "
               "zmx list || exit; printf '\\n__KZW_PROCESS_LIST__\\n'; "

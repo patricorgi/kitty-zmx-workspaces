@@ -62,15 +62,20 @@ class KittyAdapterTests(unittest.TestCase):
         for mode in ("valid", "missing pane", "moved pane", "missing window", "bad args"):
             with self.subTest(mode=mode):
                 selected = Mock(tabs=[])
-                selected.serialize_state_as_session.return_value = iter(["new_tab Test", "layout splits"])
+                launch = 'launch kitty-unserialize-data=\'{"id":7}\' /bin/kzw-pane'
+                selected.serialize_state_as_session.return_value = iter(["new_tab Test", "layout splits", launch])
                 unrelated = Mock()
-                window = types.SimpleNamespace(os_window_id=99 if mode == "moved pane" else 42)
+                variables = {"kzw_pane": "kzw-" + "a" * 32, "kzw_host": ""}
+                window = types.SimpleNamespace(os_window_id=99 if mode == "moved pane" else 42,
+                                               user_vars=variables)
                 boss = Mock(window_id_map={} if mode == "missing pane" else {7: window},
-                            os_window_map={99: unrelated} if mode == "missing window" else {42: selected, 99: unrelated})
+                             os_window_map={99: unrelated} if mode == "missing window" else {42: selected, 99: unrelated})
+                boss.list_os_windows.return_value = iter([
+                    {"id": 42, "tabs": [{"id": 1, "windows": [{"id": 7, "user_vars": variables}]}]}])
                 args = ["kitten"] if mode == "bad args" else ["kitten", "42"]
                 if mode == "valid":
                     result = json.loads(module.handle_result(args, None, 7, boss))
-                    self.assertEqual(result, {"os_window_id": 42, "session": "new_tab Test\nlayout splits"})
+                    self.assertEqual(result, {"os_window_id": 42, "session": "new_tab Test\nlayout splits\n" + launch})
                     selected.serialize_state_as_session.assert_called_once_with(
                         "", None, module.default_save_as_session_opts.return_value, is_first=True)
                 else:
@@ -96,14 +101,18 @@ class KittyAdapterTests(unittest.TestCase):
     def test_atomic_snapshot_pairs_layout_with_only_its_workspace_tree(self):
         module = load_adapter("scoped_session")
         selected, unrelated = Mock(tabs=[]), Mock()
-        selected.serialize_state_as_session.return_value = iter(["new_tab Test", "layout splits"])
-        window = types.SimpleNamespace(os_window_id=42)
-        trees = [{"id": i, "tabs": [{"id": i}]} for i in (42, 99)]
+        launch = 'launch kitty-unserialize-data=\'{"id":7}\' /bin/kzw-pane'
+        selected.serialize_state_as_session.return_value = iter(["new_tab Test", "layout splits", launch])
+        variables = {"kzw_pane": "kzw-" + "a" * 32, "kzw_host": ""}
+        window = types.SimpleNamespace(os_window_id=42, user_vars=variables)
+        trees = [{"id": i, "tabs": [{"id": i, "windows": [{"id": 7, "user_vars": variables}]}]}
+                 for i in (42, 99)]
         boss = Mock(window_id_map={7: window}, os_window_map={42: selected, 99: unrelated})
         boss.list_os_windows.side_effect = lambda tab_filter: (
             ow for ow in trees if tab_filter(types.SimpleNamespace(os_window_id=ow["id"])))
         result = json.loads(module.handle_result(["kitten", "42", "--with-tree"], None, 7, boss))
-        self.assertEqual(result, {"os_window_id": 42, "session": "new_tab Test\nlayout splits", "tree": trees[:1]})
+        self.assertEqual(result, {"os_window_id": 42, "session": "new_tab Test\nlayout splits\n" + launch,
+                                 "tree": trees[:1]})
         unrelated.serialize_state_as_session.assert_not_called()
         with self.assertRaises(ValueError):
             module.handle_result(["kitten", "42", "--unknown"], None, 7, boss)

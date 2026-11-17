@@ -443,6 +443,7 @@ class SharedSupervisorTests(unittest.TestCase):
                     "os.kill": {"side_effect": ProcessLookupError if mode == "instance-exited" else None},
                 }
                 mocks = {target: patches.enter_context(patch("kzw.cli." + target, **kwargs)) for target, kwargs in replacements.items()}
+                patches.enter_context(patch("kzw.connection.Display"))
                 patches.enter_context(patch.dict(os.environ, {}, clear=True))
                 patches.enter_context(patch("sys.stdout", new_callable=io.StringIO))
                 patches.enter_context(patch("sys.stderr", new_callable=io.StringIO))

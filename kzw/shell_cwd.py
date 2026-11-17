@@ -11,6 +11,7 @@ import sys
 from urllib.parse import unquote, urlsplit
 
 from .core import PANE
+from . import network
 
 
 def from_session(pane, host):
@@ -19,6 +20,7 @@ def from_session(pane, host):
         raise ValueError("invalid source session")
     if host and (host.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host)):
         raise ValueError("invalid origin")
+    network.require(host)
     probe = Path(__file__).with_name("process_cwd.py")
     if host:
         script = ('PATH="$HOME/.local/bin:$PATH"; export PATH; unset ZMX_SESSION ZMX_SESSION_PREFIX; ' +
@@ -65,6 +67,7 @@ def resolve(uri, host):
     if host:
         if host.startswith('-'):
             raise ValueError("invalid origin")
+        network.require(host)
         result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', host,
                                  'hostname; hostname -f 2>/dev/null || :'], capture_output=True, text=True, timeout=10, check=True)
         names = {name.rstrip('.').lower() for name in result.stdout.splitlines() if name}

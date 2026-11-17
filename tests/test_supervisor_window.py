@@ -39,6 +39,7 @@ class SupervisorWindowTests(unittest.TestCase):
                  patch("kzw.cli.mark_bootstrap_launching"), patch("kzw.cli.finish_bootstrap"), \
                  patch("kzw.cli.start_title_monitor", return_value=title_stop), \
                  patch("kzw.cli.remote_client.start_status_monitor", return_value=lambda: None), \
+                 patch("kzw.connection.Display"), \
                  patch("kzw.cli.remote_client.ConnectionBroker") as broker, \
                  patch("kzw.cli.subprocess.Popen", return_value=child), \
                  patch("kzw.cli.synchronize_exits"), patch("kzw.cli.capture", side_effect=capture_error), \

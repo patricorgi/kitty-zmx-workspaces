@@ -52,6 +52,42 @@ class MetricsKittenTests(unittest.TestCase):
         self.assertIsNone(data["ram"])
         self.assertEqual(self.manager.mark_tab_bar_dirty.call_count, 2)
 
+    def test_connection_redraw_is_independent_of_metrics_expiry(self):
+        data = {"workspace": "Test", "origin": "remote", "connection": "reconnecting", "retry": {"token": "one"}}
+        with patch.object(self.module.time, "monotonic", return_value=100):
+            self.assertTrue(self.module.handle_result(["kitten", "2", json.dumps(data)], None, 0, self.boss))
+        record = self.manager._kzw_resource_usage
+        self.assertEqual((record["connection"], record["connection_expires"]), ("reconnecting", 104))
+        callback, delay, repeat = self.fast.add_timer.call_args.args
+        self.assertEqual((delay, repeat), (1, True))
+        callback(11)
+        self.assertEqual(self.manager.mark_tab_bar_dirty.call_count, 2)
+        self.module.handle_result(["kitten", "2", json.dumps(data)], None, 0, self.boss)
+        self.assertEqual(self.fast.add_timer.call_count, 1)
+
+    def test_connection_namespace_must_match_all_panes(self):
+        data = {"workspace": "Test", "origin": "remote", "directory": "/other", "connection": "restoring"}
+        self.assertFalse(self.module.handle_result(["kitten", "2", json.dumps(data)], None, 0, self.boss))
+        self.assertFalse(hasattr(self.manager, "_kzw_resource_usage"))
+
+    def test_connecting_payload_is_kept_and_old_connection_renderer_is_refreshed_once(self):
+        module = types.ModuleType("kitty.tab_bar")
+        old = lambda: None
+        old._equal_margins = old._kzw_connection = True
+        replacement = lambda: None
+        replacement._equal_margins = replacement._kzw_connection = replacement._kzw_connecting = True
+        replacement._kzw_network_pause = True
+        module.load_custom_draw_tab = Mock(return_value=replacement)
+        module.load_custom_draw_tab_module = Mock()
+        self.manager.tab_bar = types.SimpleNamespace(draw_func=old, _kzw_connection_renderer_checked=True)
+        data = {"workspace": "Test", "origin": "remote", "connection": "connecting"}
+        with patch.dict(sys.modules, {"kitty.tab_bar": module}):
+            for _ in range(2):
+                self.assertTrue(self.module.handle_result(["kitten", "2", json.dumps(data)], None, 0, self.boss))
+        self.assertEqual(self.manager._kzw_resource_usage["connection"], "connecting")
+        self.assertIs(self.manager.tab_bar.draw_func, replacement)
+        module.load_custom_draw_tab.assert_called_once_with()
+
     def test_old_expiry_cannot_invalidate_new_sample(self):
         self.update({"cpu_percent": 20, "age_seconds": 0})
         old = self.fast.add_timer.call_args.args[0]

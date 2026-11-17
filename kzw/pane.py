@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -17,6 +18,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .core import PANE, check_name
+from . import network
+from .attachment import NotStarted
+
+_attachment = None
+_retry_network = None
 
 
 def ssh_diagnostic_visible(line):
@@ -26,6 +32,9 @@ def ssh_diagnostic_visible(line):
 
 
 def run_attachment(cmd, env, remote):
+    network.require(remote)
+    if remote and _attachment is not None:
+        return _attachment.run(cmd, env)
     if remote:
         from .ssh_transport import prepare_attachment
         cmd = prepare_attachment(cmd, env)
@@ -104,7 +113,15 @@ def report_attachment_ended(retry=False):
             Path(signal).touch()
         except OSError:
             pass  # The supervisor also checks periodically.
-    threading.Event().wait(5 if retry else None)
+    if retry and _attachment is not None:
+        _attachment.ended()
+        _attachment.network.wait_retry(5, _attachment.wake, _attachment.stop, since=_attachment.resumed)
+        _attachment.wake.clear()
+    elif retry and _retry_network is not None:
+        gate, resumed = _retry_network
+        gate.wait_retry(5, threading.Event(), since=resumed)
+    else:
+        threading.Event().wait(5 if retry else None)
 
 
 def verify_workspace_lease(host):
@@ -188,6 +205,29 @@ def wait_for_native_stage(pane, host):
 
 
 def main():
+    global _attachment, _retry_network
+    handlers = {}
+    if os.environ.get("KZW_CONNECTION_DISPLAY") == "1":
+        def leave(signum, frame):
+            raise SystemExit(128 + signum)
+
+        for signum in (signal.SIGHUP, signal.SIGTERM):
+            handlers[signum] = signal.signal(signum, leave)
+    try:
+        _main()
+    finally:
+        try:
+            if _attachment is not None:
+                _attachment.close()
+                _attachment = None
+        finally:
+            _retry_network = None
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+
+
+def _main():
+    global _attachment, _retry_network
     parser = argparse.ArgumentParser()
     parser.add_argument("--pane")
     parser.add_argument("--host", default=os.environ.get("KZW_HOST", ""))
@@ -226,6 +266,11 @@ def main():
             encoded = base64.b64encode(value.encode()).decode()
             sys.stdout.write(f"\x1b]1337;SetUserVar={key}={encoded}\x07")
     sys.stdout.flush()
+    if args.host and os.environ.get("KZW_CONNECTION_DISPLAY") == "1":
+        from .attachment import Attachment
+        _attachment = Attachment(os.environ.get("KZW_WORKSPACE", ""),
+                                 os.environ.get("KZW_WORKSPACE_ORIGIN", ""), pane,
+                                 os.environ.get("KZW_WORKSPACE_DIRECTORY", ""), existing=args.existing)
     env = os.environ.copy()
     # zmx uses this variable to switch an existing client instead of attaching.
     env.pop("ZMX_SESSION", None)
@@ -240,9 +285,20 @@ def main():
     needs_absence_check = not args.pane and not coordinated and not args.existing
     last_error = None
     while True:
+        if args.host:
+            gate = network.get()
+            if not gate.wait_online(_attachment.stop if _attachment is not None else None):
+                return
+            _retry_network = (gate, gate.resumes)
+            if _attachment is not None:
+                _attachment.resumed = gate.resumes
         remote_command = remote
         if existing:
             remote_command += f'zmx list --short | grep -F -x -- {pane} >/dev/null || {{ echo "kzw: session {pane} is missing or unavailable" >&2; exit 1; }}; '
+        if _attachment is not None:
+            # Explicit origin-side transport acknowledgement, never terminal-output heuristics.
+            # This does not claim that zmx or the application's screen has redrawn.
+            remote_command += _attachment.ready_command
         remote_command += f'exec zmx attach {pane}'
         local_command = ["zmx", "attach", pane]
         if args.initial_program and not existing:
@@ -295,6 +351,8 @@ def main():
                 raise RuntimeError(f"attachment exited with status {result.returncode}")
             last_error = None
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            if isinstance(exc, (network.OfflineError, NotStarted)):
+                attempted_attach = False
             failed = True
             if str(exc) != last_error:
                 print(f"kzw: {exc}; waiting to reconnect", file=sys.stderr, flush=True)
@@ -311,5 +369,10 @@ def main():
             existing = True
 
 
+def entrypoint():
+    with network.observe():
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    entrypoint()

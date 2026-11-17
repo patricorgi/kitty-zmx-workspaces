@@ -9,8 +9,8 @@ description = "Experimental Kitty workspace snapshots for zmx-backed terminals"
 requires-python = ">=3.10"
 
 [project.scripts]
-kzw = "kzw.cli:main"
-kzw-pane = "kzw.pane:main"
+kzw = "kzw.cli:entrypoint"
+kzw-pane = "kzw.pane:entrypoint"
 
 [tool.setuptools]
 packages = ["kzw"]

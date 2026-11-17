@@ -21,12 +21,14 @@ def percent(value):
     return value if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 100 else None
 
 
-def refresh_renderer(manager):
+def refresh_renderer(manager, connection=False):
     bar = getattr(manager, "tab_bar", None)
     draw = getattr(bar, "draw_func", None)
-    if (getattr(draw, "_equal_margins", False) and not getattr(draw, "_kzw_resources", False)
-            and not getattr(bar, "_kzw_renderer_checked", False)):
-        bar._kzw_renderer_checked = True
+    feature = "_kzw_network_pause" if connection else "_kzw_resources"
+    checked = feature + "_renderer_checked"
+    if (getattr(draw, "_equal_margins", False) and not getattr(draw, feature, False)
+            and not getattr(bar, checked, False)):
+        setattr(bar, checked, True)
         try:
             from kitty.tab_bar import load_custom_draw_tab, load_custom_draw_tab_module
             load_custom_draw_tab_module.clear_cached()
@@ -49,6 +51,8 @@ def handle_result(args, answer, target_window_id, boss):
                           window.user_vars.get("kzw_workspace") != data["workspace"] or
                           window.user_vars.get("kzw_origin", "") != data["origin"] for window in windows):
         return False
+    if "directory" in data and any(window.user_vars.get("kzw_directory") != data["directory"] for window in windows):
+        return False
     sample = data.get("metrics")
     sample = sample if isinstance(sample, dict) else {}
     host = data["origin"] or sample.get("host") or "local"
@@ -59,11 +63,25 @@ def handle_result(args, answer, target_window_id, boss):
               "cpu": percent(sample.get("cpu_percent")) if valid else None,
               "ram": percent(sample.get("ram_percent")) if valid else None,
               "expires": time.monotonic() + STALE_AFTER - age if valid else 0}
+    if data.get("connection") in ("", "stalled", "reconnecting", "restoring", "connecting", "offline"):
+        record.update(connection=data["connection"], connection_expires=time.monotonic() + 4,
+                      retry=data.get("retry"), directory=data.get("directory", ""))
+        if getattr(manager, "_kzw_connection_timer", None) is None:
+            reference = weakref.ref(manager)
+
+            def connection_tick(timer_id):
+                current = reference()
+                if current is not None:
+                    current.mark_tab_bar_dirty()
+                else:
+                    remove_timer(timer_id)
+
+            manager._kzw_connection_timer = add_timer(connection_tick, 1, True)
     previous = getattr(manager, "_kzw_resource_usage", {})
     if previous.get("timer") is not None:
         remove_timer(previous["timer"])
     manager._kzw_resource_usage = record
-    refresh_renderer(manager)
+    refresh_renderer(manager, connection="connection" in record)
     if valid:
         reference = weakref.ref(manager)
 

@@ -102,16 +102,21 @@ class UtilityTests(unittest.TestCase):
         module = load_adapter("scoped_session")
         tree = fixture()
         tree[0]["tabs"][1]["windows"][0]["user_vars"].update(kzw_utility_source="7", kzw_utility_pane=A)
-        windows = {w["id"]: Mock(id=w["id"], os_window_id=42, user_vars=w["user_vars"])
+        windows = {w["id"]: Mock(id=w["id"], os_window_id=42, user_vars=w["user_vars"],
+                                 actions_on_close=[], actions_on_focus_change=[], actions_on_removal=[])
                    for tab in tree[0]["tabs"] for w in tab["windows"]}
         manager = Mock(tabs=[[windows[w["id"]] for w in tab["windows"]] for tab in tree[0]["tabs"]])
-        manager.serialize_state_as_session.return_value = ["new_tab First", "new_tab Second", "focus_tab 1"]
+        manager.serialize_state_as_session.return_value = [
+            "new_tab First", 'launch kitty-unserialize-data=\'{"id":7}\' /bin/kzw-pane',
+            "new_tab Second", 'launch kitty-unserialize-data=\'{"id":8}\' /bin/kzw-pane', "focus_tab 1"]
         boss = Mock(window_id_map=windows, os_window_map={42: manager})
         boss.list_os_windows.return_value = iter(tree)
         result = json.loads(module.handle_result(["kitten", "42", "--with-tree"], None, 7, boss))
         self.assertEqual(result["tree"], workspace_tree(tree))
         self.assertEqual(manager.serialize_state_as_session.call_args.args[1], frozenset([windows[7], windows[8]]))
-        self.assertEqual(result["session"], "new_tab First\nnew_tab Second\nfocus_tab 0")
+        self.assertEqual(result["session"],
+                         "new_tab First\nlaunch kitty-unserialize-data='{\"id\":7}' /bin/kzw-pane\n"
+                         "new_tab Second\nlaunch kitty-unserialize-data='{\"id\":8}' /bin/kzw-pane\nfocus_tab 0")
         self.assertEqual(focused_pane(result["tree"]), A)
 
     def test_queue_launch_uses_managed_creation_and_selected_context(self):

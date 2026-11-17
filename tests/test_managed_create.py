@@ -94,6 +94,7 @@ class ManagedCreateTests(unittest.TestCase):
                  patch("kzw.cli.finish_bootstrap") as finish, \
                  patch("kzw.cli.start_title_monitor", return_value=title_stop), \
                  patch("kzw.cli.remote_client.start_status_monitor", return_value=lambda: None), \
+                 patch("kzw.connection.Display"), \
                  patch("kzw.cli.subprocess.Popen", return_value=child) as popen, \
                  patch("kzw.cli.synchronize_exits"), patch("kzw.cli.capture"):
                 self.assertEqual(run("Test", "origin", remote_attached=True, new_instance=True,
