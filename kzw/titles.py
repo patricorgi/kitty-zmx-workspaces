@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import PurePath
 import re
+import shlex
 import subprocess
 import threading
 
@@ -57,13 +58,13 @@ def parse_processes(zmx_list, ps_output):
     return {pane: detail["name"] for pane, detail in parse_process_details(zmx_list, ps_output).items()}
 
 
-def read_process_details(host):
+def read_process_details(host, environment=None, executable=None):
     """Read session/process metadata in one local process or SSH request."""
     from .network import require
     require(host)
     script = ("PATH=\"$HOME/.local/bin:$PATH\"; export PATH; "
               "unset ZMX_SESSION ZMX_SESSION_PREFIX; "
-              "zmx list || exit; printf '\\n__KZW_PROCESS_LIST__\\n'; "
+              + shlex.quote(executable or "zmx") + " list || exit; printf '\\n__KZW_PROCESS_LIST__\\n'; "
               "LC_ALL=C ps -A -o pid=,pgid=,tpgid=,tty=,comm=")
     if host:
         if host.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host):
@@ -71,7 +72,7 @@ def read_process_details(host):
         cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, script]
     else:
         cmd = ["sh", "-c", script]
-    env = os.environ.copy()
+    env = (environment if environment is not None else os.environ).copy()
     env.pop("ZMX_SESSION", None)
     env.pop("ZMX_SESSION_PREFIX", None)
     out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=10, check=True).stdout

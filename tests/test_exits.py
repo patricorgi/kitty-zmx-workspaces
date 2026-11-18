@@ -2,12 +2,14 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from kzw import cli, exits, remote_client
+from kzw.layout_prune import prune_snapshot
 from kzw.remote import Store, response, zmx_exit_receipt
 from test_layout_prune import snapshot
 
@@ -108,6 +110,71 @@ class ExitTests(unittest.TestCase):
 
     def sync(self):
         return cli.synchronize_exits(self.directory, "/bin/kzw-pane")
+
+    def disappear(self, pane):
+        tab = self.tree[0]["tabs"][0]
+        tab["windows"] = [w for w in tab["windows"] if w["user_vars"]["kzw_pane"] != pane]
+        for index, window in enumerate(tab["windows"]):
+            window["is_active"] = index == 0
+        self.source = prune_snapshot(self.source, {pane})
+
+    def test_vanished_confirmed_exit_backs_up_layout_and_never_closes_a_view(self):
+        self.ended(B)
+        self.disappear(B)
+        previous = (self.directory / "workspace.kitty-session").read_text()
+        revision = self.request({"method": "workspace.get", "workspace": "Test"})["revision"]
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.request({"method": "workspace.get", "workspace": "Test"})["panes"], [A, C])
+        self.assertEqual((self.directory / "exit-backups" / f"revision-{revision}.kitty-session").read_text(), previous)
+        self.assertFalse(self.closes)
+        self.assertFalse((self.directory / "pending-exit.json").exists())
+
+    def test_vanished_unproven_exit_blocks_the_whole_update(self):
+        self.ended(B)
+        self.disappear(C)  # Still live, despite being absent from Kitty.
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.request({"method": "workspace.get", "workspace": "Test"})["panes"], [A, B, C])
+        self.assertFalse(self.closes)
+        self.assertFalse((self.directory / "exit-backups").exists())
+
+    def test_vanished_exit_replays_after_lost_commit_reply(self):
+        self.ended(B)
+        self.disappear(B)
+        attempts = []
+
+        def call(host, req):
+            result = self.request(req)
+            if req["method"] == "panes.exited":
+                attempts.append(copy.deepcopy(req))
+                if len(attempts) == 1:
+                    raise OSError("lost commit reply")
+            return result
+
+        with patch("kzw.remote_client.call", side_effect=call):
+            with self.assertRaisesRegex(OSError, "lost commit reply"):
+                self.sync()
+            self.assertTrue((self.directory / "pending-exit.json").exists())
+            self.assertEqual(self.sync(), 1)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertFalse(self.closes)
+
+    def test_vanished_exit_is_reconciled_before_managed_creation_capture(self):
+        self.ended(B)
+        self.disappear(B)
+
+        def capture(directory, executable):
+            self.assertEqual(json.loads((directory / "panes.json").read_text()), [A, C])
+            raise ValueError("stop before launching")
+
+        which = shutil.which
+        with patch("kzw.cli.state_dir", return_value=self.directory), \
+             patch("kzw.cli.shutil.which", side_effect=lambda name, **kw: "/bin/kzw-pane" if name == "kzw-pane"
+                   else which(name, **kw)), \
+             patch("kzw.cli.capture_locked", side_effect=capture) as check, \
+             self.assertRaisesRegex(ValueError, "stop before launching"):
+            cli.create_pane("Test", "tab", 1, A, "")
+        check.assert_called_once()
 
     def test_positive_exit_commits_before_exact_view_close_without_kill(self):
         self.ended(B)

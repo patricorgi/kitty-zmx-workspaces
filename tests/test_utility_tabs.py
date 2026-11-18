@@ -34,6 +34,30 @@ def fixture(active=True):
 
 
 class UtilityTests(unittest.TestCase):
+    def test_scoped_export_uses_fresh_local_projection_without_reloading_shared_cache(self):
+        from kzw import utility_tabs
+        module = load_adapter("scoped_session")
+        old = SimpleNamespace(__file__=utility_tabs.__file__, workspace_tree=lambda tree: tree)
+        local = {"id": 9, "is_active": True, "user_vars": {
+            "kzw_local": "kzw-" + "c" * 32, "kzw_local_owner": "d" * 32,
+            "kzw_local_source": "7", "kzw_local_source_pane": A, "kzw_local_workspace": "Test",
+            "kzw_local_origin": "origin", "kzw_local_directory": "/tmp/Test"}}
+        tree = [{"id": 42, "tabs": [
+            {"id": 1, "is_active": False, "windows": [{"id": 7, "is_active": True,
+                "user_vars": {"kzw_pane": A, "kzw_host": "origin"}}]},
+            {"id": 2, "is_active": True, "windows": [local]}]}]
+        original = deepcopy(tree)
+        with patch.object(module, "utility_tabs", old):
+            project = module.current_workspace_tree()
+            self.assertEqual(pane_map(project(tree)), {7: (A, "origin")})
+            self.assertIs(module.utility_tabs, old)
+            self.assertFalse(hasattr(old, "is_local"))
+            self.assertEqual(tree, original)
+            mixed = deepcopy(tree)
+            mixed[0]["tabs"][1]["windows"].append({"id": 10, "user_vars": {}})
+            with self.assertRaisesRegex(ValueError, "local tab"):
+                project(mixed)
+
     def test_projection_preserves_order_and_underlying_focus_without_changing_input(self):
         for active, focus in ((True, B), (False, A)):
             with self.subTest(active=active):
@@ -267,8 +291,10 @@ class DotfilesUtilityTests(unittest.TestCase):
         with patch.object(self.module.subprocess, "Popen") as popen:
             self.module.handle_result(["kitten", "os-window"], None, 7, self.boss)
             self.boss.confirm.call_args.args[1](True)
-        command = popen.call_args.args[0]
-        self.assertEqual(command[1:], ["detach", "Test", "--host", "origin"])
+        popen.assert_not_called()
+        command = self.boss.call_remote_control.call_args.args[1]
+        self.assertEqual(command[0], "kitten")
+        self.assertTrue(command[1].endswith("/kzw/detach_kitten.py"))
         self.boss.mark_window_for_close.assert_not_called()
         self.tab.append(SimpleNamespace(id=10, user_vars={}))
         self.boss.reset_mock()
@@ -283,6 +309,12 @@ class DotfilesUtilityTests(unittest.TestCase):
                 module.handle_result(["kitten", kind], None, 9, self.boss)
         self.boss.call_remote_control.assert_not_called()
         self.assertEqual(self.boss.show_error.call_count, 4)
+
+    def test_repeated_detach_delegates_to_existing_progress_without_new_confirmation(self):
+        self.manager._kzw_detach_in_progress = object()
+        self.module.handle_result(["kitten", "os-window"], None, 7, self.boss)
+        self.boss.confirm.assert_not_called()
+        self.assertTrue(self.boss.call_remote_control.call_args.args[1][1].endswith("/kzw/detach_kitten.py"))
 
 
 if __name__ == "__main__":

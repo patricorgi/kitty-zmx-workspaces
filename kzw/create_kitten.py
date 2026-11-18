@@ -15,7 +15,7 @@ def handle_result(args, answer, target_window_id, boss):
     kind = args[1] if len(args) > 1 else ""
     window = boss.window_id_map.get(target_window_id)
     variables = getattr(window, "user_vars", {}) if window is not None else {}
-    if variables.get("kzw_utility"):
+    if variables.get("kzw_utility") or variables.get("kzw_local"):
         boss.show_error("Cannot create pane", "Select a workspace terminal before creating a tab or split.")
         return
     name = variables.get("kzw_workspace", os.environ.get("KZW_WORKSPACE", ""))

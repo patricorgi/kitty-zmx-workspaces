@@ -15,8 +15,13 @@ A, B = ("kzw-" + letter * 32 for letter in "ab")
 def kitten(name):
     handler = types.ModuleType("kittens.tui.handler")
     handler.result_handler = lambda **kwargs: lambda function: function
+    fast = types.ModuleType("kitty.fast_data_types")
+    fast.add_timer, fast.remove_timer = Mock(return_value=17), Mock()
+    notifications = types.ModuleType("kitty.notifications")
+    notifications.OnlyWhen = types.SimpleNamespace(always="always")
     with patch.dict(sys.modules, {"kittens": types.ModuleType("kittens"), "kittens.tui": types.ModuleType("kittens.tui"),
-                                  "kittens.tui.handler": handler}):
+                                  "kittens.tui.handler": handler, "kitty.fast_data_types": fast,
+                                  "kitty.notifications": notifications}):
         spec = importlib.util.spec_from_file_location("routing_" + name, Path(__file__).parents[1] / "kzw" / (name + "_kitten.py"))
         result = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(result)
@@ -28,7 +33,7 @@ class Tab(list):
 
 
 def view(origin):
-    windows = [types.SimpleNamespace(id=i, tab_id=4,
+    windows = [types.SimpleNamespace(id=i, tab_id=4, os_window_id=42,
                                     user_vars={"kzw_workspace": "Test", "kzw_origin": origin,
                                                "kzw_pane": pane, "kzw_host": origin},
                                     screen=types.SimpleNamespace(last_reported_cwd=b"file://host/a%20b"))
@@ -38,6 +43,7 @@ def view(origin):
             window.user_vars.pop("kzw_origin")
             window.user_vars.pop("kzw_host")
     boss = Mock(window_id_map={w.id: w for w in windows})
+    boss.os_window_map = {42: types.SimpleNamespace(tabs=[windows])}
     boss.tab_for_id.return_value = Tab(windows)
     return windows, boss
 
@@ -106,5 +112,7 @@ class KittenRoutingTests(unittest.TestCase):
                             boss.confirm.call_args.args[1](True)
                     popen.assert_called_once()
                     if name == "detach":
-                        self.assertEqual(popen.call_args.args[0], ["kzw", "detach", "Test"] + (["--host", origin] if origin else []))
+                        command = popen.call_args.args[0]
+                        self.assertEqual(Path(command[0]).name, "kzw")
+                        self.assertEqual(command[1:], ["detach", "Test"] + (["--host", origin] if origin else []))
                     self.assertIn("launcher unavailable", boss.show_error.call_args.args[1])

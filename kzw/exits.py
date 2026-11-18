@@ -73,7 +73,8 @@ def synchronize(directory, executable, locked=False):
             raise ValueError("unsafe exit journal")
         if not journal.exists():
             if any((directory / item).exists() for item in
-                   ("pending-create.json", "pending-close.json", "native-stage.json", "bootstrap.kitty-session")):
+                   ("pending-create.json", "pending-close.json", "pending-local-kill.json",
+                    "native-stage.json", "bootstrap.kitty-session")):
                 return 0
             native = directory / "native-pending"
             if native.exists() and (not native.is_dir() or any(native.iterdir())):
@@ -81,25 +82,39 @@ def synchronize(directory, executable, locked=False):
             config = json.loads((directory / "remote.json").read_text())
             if config.get("pending") or not config.get("panes"):
                 return 0
+            view = cli.view_state(directory)
             tree = json.loads(cli.view_query(directory, "ls"))
+            if len(tree) != 1 or (view is not None and tree[0].get("id") != view["os_window_id"]):
+                return 0  # Never reconcile an entirely vanished or ambiguous view.
             mapping = pane_map(tree)
-            if {p for p, host in mapping.values()} != set(config["panes"]):
-                return 0  # Partial restore, native creation or teardown.
+            saved = set(config["panes"])
+            visible = {p for p, host in mapping.values()}
+            if not visible.issubset(saved) or any(host != config["host"] for p, host in mapping.values()):
+                return 0  # Unregistered creation or mismatched origin.
+            missing = saved - visible
             views = windows(tree)
-            candidates = {w["pane"] for w in views.values() if w["ended"] == "1"}
+            candidates = missing | {w["pane"] for w in views.values() if w["ended"] == "1"}
             if not candidates:
                 return 0
             receipts = remote_client.exit_receipts(directory, candidates)
-            if not receipts:
+            if not receipts or not missing.issubset(receipts):
                 return 0
-            # Journal the latest complete layout with the proven leaves pruned.
-            # No intermediate publication or repeated layout reads are needed;
-            # the origin validates the final layout and exit evidence together.
+            # Already absent leaves are not in the export. Prune only proven
+            # exits that still have a view, using the current layout and focus.
             source = snapshot_for_exit(directory, executable, tree)
-            snapshot = prune_snapshot(source, receipts)
-            data = {"snapshot": snapshot, "panes": sorted(set(config["panes"]) - set(receipts)),
+            present_exits = visible.intersection(receipts)
+            snapshot = prune_snapshot(source, present_exits) if present_exits else source
+            if cli.view_state(directory) != view:
+                raise ValueError("workspace attachment changed during exit capture")
+            if missing:
+                previous = (directory / "workspace.kitty-session").read_text()
+                portable, panes = remote_client.translate(previous, "", config["host"], True)
+                if set(panes) != saved or remote_client.snapshot_hash(portable, panes) != config["published_hash"]:
+                    raise ValueError("saved layout differs from the published revision; exit removal deferred")
+                atomic_write(directory / "exit-backups" / f"revision-{config['revision']}.kitty-session", previous)
+            data = {"snapshot": snapshot, "panes": sorted(saved - set(receipts)),
                     "receipts": receipts, "targets": {k: w for k, w in views.items() if w["pane"] in receipts},
-                    "view": cli.view_state(directory)}
+                    "view": view}
             atomic_write(journal, json.dumps(data) + "\n")
         else:
             data = json.loads(journal.read_text())

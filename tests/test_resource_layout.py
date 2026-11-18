@@ -66,6 +66,51 @@ class ResourceLayoutTests(unittest.TestCase):
         self.assertEqual(segments[6][1], self.renderer["usage_color"](75))
         self.assertTrue(all(color == 0x9399b2 for text, color in segments if text == ' · '))
 
+    def test_local_selected_keeps_workspace_metrics_and_privacy(self):
+        self.window.user_vars = {"kzw_local": "kzw-" + "c" * 32,
+                                 "kzw_local_workspace": "Test", "kzw_local_origin": "remote"}
+        self.window.current_marker_spec = ("function", "helpers/privacy_marker.py")
+        segments = self.renderer["resource_segments"](self.tab, 0)
+        self.assertIn((" ••••", 0xcba6f7), segments)
+        self.assertIn(("󰢹 ••••••", 0x89b4fa), segments)
+        self.assertIn("25%", "".join(text for text, _ in segments))
+        self.window.user_vars["kzw_local_origin"] = "other"
+        self.assertEqual(self.renderer["resource_segments"](self.tab, 0), [])
+
+    def test_local_label_is_blue_and_right_aligned_with_no_status_overlap(self):
+        local = types.SimpleNamespace(user_vars={
+            "kzw_local": "kzw-" + "c" * 32, "kzw_local_owner": "d" * 32})
+        self.kitty_tab[:] = [local]
+        self.tab.is_active = True
+        self.tab.title = "yazi"
+
+        class Screen:
+            def __init__(self, columns):
+                self.columns = columns
+                self.cursor = types.SimpleNamespace(x=15, fg=123, bg=456, bold=False, italic=False)
+                self.draws = []
+
+            def draw(self, text):
+                self.draws.append((self.cursor.x, text, self.cursor.fg))
+                self.cursor.x += len(text)
+
+        data = types.SimpleNamespace(inactive_fg=0x9399b2, default_bg=0x1e1e2e, tab_bar_edge="top")
+        screen = Screen(140)
+        end = self.renderer["draw_tab"](data, screen, self.tab, 15, 50, 2, True,
+                                         types.SimpleNamespace(for_layout=False))
+        start = self.manager.tab_bar._kzw_local_start[1]
+        labels = [draw for draw in screen.draws if draw[1] == " yazi "]
+        self.assertEqual(labels, [(start, " yazi ", 0x89b4fa)])
+        self.assertGreater(start, 15)
+        self.assertEqual(end, start + 6)
+        status_width = sum(len(text) for text, _ in self.renderer["resource_segments"](self.tab, 0))
+        self.assertEqual(end + 2, screen.columns - status_width)
+        narrow = Screen(25)
+        end = self.renderer["draw_tab"](data, narrow, self.tab, 15, 6, 2, True,
+                                         types.SimpleNamespace(for_layout=False))
+        self.assertEqual(end, 25)
+        self.assertNotIn("25%", "".join(text for _, text, _ in narrow.draws))
+
     def test_connection_states_replace_metrics_in_yellow_without_shortcut_hint(self):
         for state, label in (("stalled", "Connection stalled…"), ("reconnecting", "Reconnecting…"),
                              ("restoring", "Restoring…"), ("connecting", "Connecting…"),
@@ -79,6 +124,33 @@ class ResourceLayoutTests(unittest.TestCase):
             self.assertNotIn("%", text)
         self.record["connection"] = ""
         self.assertIn("25%", "".join(text for text, _ in self.renderer["resource_segments"](self.tab, 0)))
+
+    def test_detach_overrides_connection_and_metrics_with_privacy(self):
+        self.record.update(connection="offline", connection_expires=float("inf"))
+        self.window.user_vars["kzw_connection"] = "reconnecting"
+        self.window.current_marker_spec = ("function", "helpers/privacy_marker.py")
+        self.manager._kzw_detach_in_progress = {"workspace": "Test", "origin": "remote"}
+        segments = self.renderer["resource_segments"](self.tab, 0x9399b2)
+        self.assertEqual("".join(text for text, _ in segments), " •••• · 󰢹 •••••• · Detaching… ")
+        self.assertEqual(segments[-2], ("Detaching…", 0xf9e2af))
+        self.assertNotIn("⌘", "".join(text for text, _ in segments))
+        self.manager._kzw_detach_in_progress = None
+        self.assertIn(("Waiting for network…", 0xf9e2af), self.renderer["resource_segments"](self.tab, 0))
+        self.record["connection"] = ""
+        self.window.user_vars["kzw_connection"] = ""
+        self.assertIn("25%", "".join(text for text, _ in self.renderer["resource_segments"](self.tab, 0)))
+
+    def test_detach_status_does_not_leak_across_workspace_or_origin(self):
+        for workspace, origin in (("Other", "remote"), ("Test", "other")):
+            self.manager._kzw_detach_in_progress = {"workspace": workspace, "origin": origin}
+            segments = self.renderer["resource_segments"](self.tab, 0)
+            self.assertNotIn("Detaching…", "".join(text for text, _ in segments))
+
+    def test_detach_status_visible_while_local_companion_selected(self):
+        self.window.user_vars = {"kzw_local": "kzw-" + "c" * 32,
+                                 "kzw_local_workspace": "Test", "kzw_local_origin": "remote"}
+        self.manager._kzw_detach_in_progress = {"workspace": "Test", "origin": "remote"}
+        self.assertIn(("Detaching…", 0xf9e2af), self.renderer["resource_segments"](self.tab, 0))
 
     def test_stale_health_and_individual_pane_recovery_override_control_success(self):
         self.record.update(connection="", connection_expires=0)

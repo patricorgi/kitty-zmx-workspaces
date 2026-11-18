@@ -1,6 +1,7 @@
 """Serialize only the OS window containing a verified managed pane."""
 
 import json
+import importlib.util
 
 from kittens.tui.handler import result_handler
 from kitty.session import default_save_as_session_opts
@@ -9,13 +10,35 @@ from kitty.session import default_save_as_session_opts
 try:
     from kzw.core import pane_map, rewrite_export
     from kzw.session_export import serializable_managed_windows
-    from kzw.utility_tabs import workspace_tree
+    from kzw import utility_tabs
 except ModuleNotFoundError as exc:
     if exc.name != "kzw":
         raise
     from core import pane_map, rewrite_export
     from session_export import serializable_managed_windows
-    from utility_tabs import workspace_tree
+    import utility_tabs
+
+
+def current_workspace_tree():
+    """Use the local-tab-aware adapter even in a long-running Kitty instance.
+
+    Do not reload or replace a shared module: other Kitty components can retain
+    references to it. The existing module's trusted source path identifies the
+    adapter distributed alongside this kitten.
+    """
+    if hasattr(utility_tabs, "is_local"):
+        return utility_tabs.workspace_tree
+    path = getattr(utility_tabs, "__file__", "")
+    if not path:
+        raise ValueError("local-tab-aware workspace projection is unavailable")
+    spec = importlib.util.spec_from_file_location("_kzw_scoped_utility_tabs", path)
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load local-tab-aware workspace projection")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "is_local"):
+        raise ValueError("local-tab-aware workspace projection is unavailable")
+    return module.workspace_tree
 
 
 def main(args):
@@ -31,8 +54,8 @@ def handle_result(args, answer, target_window_id, boss):
     tm = boss.os_window_map.get(window.os_window_id)
     if tm is None:
         raise ValueError("workspace OS window no longer exists")
-    has_utilities = any("kzw_utility" in w.user_vars for tab in tm.tabs for w in tab)
-    tree = workspace_tree(list(boss.list_os_windows(tab_filter=lambda tab: tab.os_window_id == window.os_window_id)))
+    has_utilities = any("kzw_utility" in w.user_vars or "kzw_local" in w.user_vars for tab in tm.tabs for w in tab)
+    tree = current_workspace_tree()(list(boss.list_os_windows(tab_filter=lambda tab: tab.os_window_id == window.os_window_id)))
     if len(tree) != 1 or tree[0]["id"] != window.os_window_id:
         raise ValueError("workspace changed during scoped snapshot")
     panes = pane_map(tree)

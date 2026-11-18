@@ -60,6 +60,16 @@ class MetricsIntegrationTests(unittest.TestCase):
         for offset, character in enumerate(status):
             if character == "·":
                 self.assertEqual(displayed["fg"][displayed["line"].index(WORKSPACE_ICON) + offset], 0x9399b2)
+        # Only the test-owned window receives simulated detach display state.
+        detach = str(REPO / "tests/kitty_detach_probe.py")
+        kit.raw("kitten", detach, str(window["id"]), "start")
+        during = inspect()
+        self.assertIn("Detaching…", during["line"])
+        self.assertNotIn(CPU_ICON, during["line"])
+        self.assertNotIn("⌘", during["line"])
+        self.assertEqual(during["fg"][during["line"].index("Detaching…")], 0xf9e2af)
+        kit.raw("kitten", detach, str(window["id"]), "finish")
+        self.assertIn(CPU_ICON, inspect()["line"])
         for icon, expected in ((WORKSPACE_ICON, 0xcba6f7), (HOST_ICON, 0x89b4fa)):
             self.assertEqual(displayed["fg"][displayed["line"].index(icon)], expected)
         self.assertTrue(all(value is None for value in displayed["other_records"].values()))

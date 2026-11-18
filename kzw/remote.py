@@ -117,6 +117,15 @@ class SessionNotReady(Conflict):
     pass
 
 
+def rollback(db):
+    """Best-effort rollback that never masks the exception being handled."""
+    try:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+
+
 def zmx_exit_receipt(directory, pane):
     """Read zmx 0.5.0's final PTY teardown, never terminal output.
 
@@ -329,6 +338,14 @@ class Store:
                 generation INTEGER NOT NULL, observed_at REAL NOT NULL,
                 source TEXT NOT NULL, sessions TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS local_tabs (
+                owner TEXT PRIMARY KEY, pane TEXT UNIQUE NOT NULL,
+                state TEXT NOT NULL, focused INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS session_origins (
+                pane TEXT PRIMARY KEY, created_workspace TEXT NOT NULL,
+                reserved_at REAL NOT NULL, request_id TEXT NOT NULL
+            );
         """)
         self.zmx = zmx
 
@@ -375,7 +392,7 @@ class Store:
             return result
         except Exception:
             if own_transaction:
-                self.db.execute("ROLLBACK")
+                rollback(self.db)
             raise
 
     def inventory(self):
@@ -392,8 +409,12 @@ class Store:
         live = set(sample["sessions"])
         claims = {pane: [] for pane in live}
         workspaces = {}
+        origins = {}
         self.db.execute("BEGIN")
         try:
+            for pane, workspace, reserved_at, operation in self.db.execute(
+                    "SELECT pane,created_workspace,reserved_at,request_id FROM session_origins"):
+                origins[pane] = {"workspace": workspace, "reserved_at": reserved_at, "request_id": operation}
             for name, revision, snapshot, encoded in self.db.execute("SELECT name,revision,snapshot,panes FROM workspaces ORDER BY name"):
                 panes = json.loads(encoded)
                 workspace = {"revision": revision, "snapshot": snapshot, "panes": panes}
@@ -413,9 +434,12 @@ class Store:
             for table, role in (("reservations", "reserved"), ("cleanup", "closing")):
                 for name, pane in self.db.execute(f"SELECT workspace,pane FROM {table}"):
                     claims.setdefault(pane, []).append({"workspace": name, "role": role})
+            for owner, pane, state in self.db.execute("SELECT owner,pane,state FROM local_tabs"):
+                claims.setdefault(pane, []).append({"workspace": "local-tab:" + owner, "role": "local-tab",
+                                                    "state": state})
             self.db.execute("COMMIT")
         except Exception:
-            self.db.execute("ROLLBACK")
+            rollback(self.db)
             raise
         sessions = []
         for pane, references in sorted(claims.items()):
@@ -423,7 +447,7 @@ class Store:
             sessions.append({"id": pane, "presence": "unknown" if error is not None else "live" if pane in live else "missing",
                              "last_seen_live": pane in live, "workspace": next(iter(owners)) if len(owners) == 1 else None,
                              "assignment": "conflict" if len(owners) > 1 else "assigned" if owners else "unassigned",
-                             "references": references})
+                             "references": references, "creation_origin": origins.get(pane)})
         return {"available": error is None, "error": error,
                 "query_source": self.inventory_source(self.zmx_environment()), "observation": sample,
                 "sessions": sessions, "workspaces": workspaces}
@@ -459,6 +483,12 @@ class Store:
 
     def observe_detached(self):
         """Journal status even when no client is connected; never prune here."""
+        if os.environ.get("KZW_LOCAL_COORDINATOR") == "1":
+            for owner, pane in list(self.db.execute("SELECT owner,pane FROM local_tabs WHERE state='closing'")):
+                try:
+                    self.local_tab({"method": "local.tab.close", "owner": owner, "pane": pane})
+                except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
+                    pass  # Only an already-authorized close is retried.
         names = [row[0] for row in self.db.execute("SELECT name FROM workspaces ORDER BY name")]
         if not names:
             try:
@@ -507,7 +537,7 @@ class Store:
             self.db.execute("COMMIT")
             return True
         except Exception:
-            self.db.execute("ROLLBACK")
+            rollback(self.db)
             raise
 
     def check_lease(self, name, token):
@@ -521,12 +551,98 @@ class Store:
 
     def add_event(self, name, revision, kind, data):
         self.db.execute("INSERT INTO workspace_events (workspace,revision,kind,data) VALUES (?,?,?,?)",
-                        (name, revision, kind, json.dumps(data, separators=(",", ":"))))
+                         (name, revision, kind, json.dumps(data, separators=(",", ":"))))
+
+    def local_tab(self, req):
+        """Local-only companion terminals, never part of a remote layout.
+
+        Reserve before launch; consume creation permission before attempting
+        attach. An uncertain start can only resume an existing session.
+        """
+        if os.environ.get("KZW_LOCAL_COORDINATOR") != "1":
+            raise ValueError("local tabs require the local coordinator")
+        owner, pane = req.get("owner"), req.get("pane")
+        if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
+            raise ValueError("invalid local tab owner")
+        action = req["method"][len("local.tab."):]
+        if action not in ("get", "reserve", "launch", "focus", "close", "exited"):
+            raise ValueError("unknown local tab action")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT pane,state,focused FROM local_tabs WHERE owner=?", (owner,)).fetchone()
+            create = False
+            source = None
+            if action in ("close", "exited") and row is None:
+                self.db.execute("COMMIT")
+                return {"tab": None, "create": False, "source": None}
+            if action == "reserve":
+                if not isinstance(pane, str) or not PANE.fullmatch(pane):
+                    raise ValueError("invalid local tab pane")
+                if row and row[0] != pane:
+                    raise Conflict("a local tab already exists for this window")
+                if not row:
+                    if any(pane in json.loads(encoded) for (encoded,) in self.db.execute("SELECT panes FROM workspaces")):
+                        raise Conflict("session already belongs to a workspace")
+                    if any(pane in json.loads(encoded) for (encoded,) in self.db.execute("SELECT panes FROM staged_layouts")):
+                        raise Conflict("session belongs to a staged layout")
+                    if any(self.db.execute("SELECT 1 FROM " + table + " WHERE pane=?", (pane,)).fetchone()
+                           for table in ("reservations", "cleanup", "local_tabs")):
+                        raise Conflict("session already has an owner")
+                    if pane in self.read_inventory()["sessions"]:
+                        raise Conflict("session already exists")
+                    self.db.execute("INSERT INTO local_tabs VALUES (?,?,'reserved',0)", (owner, pane))
+                    row = (pane, "reserved", 0)
+            elif action != "get":
+                if not row or row[0] != pane:
+                    raise Conflict("local tab selection changed")
+                if action == "focus":
+                    if type(req.get("focused")) is not bool:
+                        raise ValueError("invalid local focus")
+                    self.db.execute("UPDATE local_tabs SET focused=? WHERE owner=?", (int(req["focused"]), owner))
+                    row = (pane, row[1], int(req["focused"]))
+                elif action == "launch":
+                    if row[1] == "closing":
+                        raise Conflict("local tab cleanup is pending")
+                    sample = self.read_inventory()
+                    source = sample["source"]
+                    if row[1] == "reserved":
+                        if pane in sample["sessions"]:
+                            raise Conflict("reserved session appeared before authorized launch")
+                        create = True
+                        self.db.execute("UPDATE local_tabs SET state='started' WHERE owner=?", (owner,))
+                        row = (pane, "started", row[2])
+                    elif pane not in sample["sessions"]:
+                        raise Conflict("local session is missing; refusing to create a replacement; close it explicitly")
+                elif action == "close":
+                    # The intent survives failed listing/kill and daemon restart.
+                    self.db.execute("UPDATE local_tabs SET state='closing' WHERE owner=?", (owner,))
+                    row = (pane, "closing", row[2])
+                elif action == "exited" and row[1] == "started" and self.exit_receipts({pane}):
+                    # A verified shell exit needs no kill and must not enqueue one.
+                    self.db.execute("DELETE FROM local_tabs WHERE owner=? AND pane=?", (owner, pane))
+                    row = None
+            self.db.execute("COMMIT")
+        except Exception:
+            rollback(self.db)
+            raise
+        if action == "close":
+            live = self.read_inventory()["sessions"]
+            if pane in live:
+                subprocess.run([self.zmx, "kill", pane], env=self.zmx_environment(),
+                               capture_output=True, text=True, check=True, timeout=10)
+            if pane in self.read_inventory()["sessions"]:
+                raise Conflict("local tab cleanup is pending; session is still live")
+            self.db.execute("DELETE FROM local_tabs WHERE owner=? AND pane=? AND state='closing'", (owner, pane))
+            row = None
+        return {"tab": ({"pane": row[0], "state": row[1], "focused": bool(row[2])} if row else None),
+                "create": create, "source": source}
 
     def dispatch(self, req):
         if not isinstance(req, dict):
             raise ValueError("request must be an object")
         method = req.get("method")
+        if isinstance(method, str) and method.startswith("local.tab."):
+            return self.local_tab(req)
         if method == "host.metrics":
             return HOST_METRICS.get()
         if method == "workspace.list":
@@ -542,7 +658,8 @@ class Store:
         killing = self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone()
         if killing and method not in ("workspace.get", "workspace.sync", "workspace.events", "workspace.events.wait",
                                       "workspace.status", "workspace.watch", "cleanup.list", "cleanup.retry",
-                                      "workspace.lease.release"):
+                                      "workspace.lease.release", "workspace.lease.acquire", "workspace.lease.renew",
+                                      "workspace.lease.inspect", "workspace.kill"):
             raise Conflict("workspace termination is pending")
         if method == "workspace.kill":
             revision, token = req.get("revision"), req.get("lease_token")
@@ -552,6 +669,10 @@ class Store:
             try:
                 self.check_lease(name, token)
                 row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
+                if killing and row and row[0] == revision + 1:
+                    pending = [r[0] for r in self.db.execute("SELECT pane FROM cleanup WHERE workspace=?", (name,))]
+                    self.db.execute("COMMIT")
+                    return {"revision": row[0], "pending_cleanup": pending}
                 if row is None or row[0] != revision:
                     raise Conflict("workspace changed after confirmation")
                 if any(self.db.execute(query, (name,)).fetchone() for query in (
@@ -570,7 +691,7 @@ class Store:
                 self.db.execute("COMMIT")
                 return {"revision": new_revision, "pending_cleanup": panes}
             except Exception:
-                self.db.execute("ROLLBACK")
+                rollback(self.db)
                 raise
         if method in ("workspace.lease.acquire", "workspace.lease.renew", "workspace.lease.release",
                       "workspace.lease.inspect", "workspace.lease.recover"):
@@ -585,7 +706,7 @@ class Store:
             try:
                 if not self.db.execute("SELECT 1 FROM workspaces WHERE name=?", (name,)).fetchone():
                     raise ValueError("workspace does not exist")
-                if method != "workspace.lease.release" and self.db.execute(
+                if method == "workspace.lease.recover" and self.db.execute(
                         "SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone():
                     raise Conflict("workspace termination is pending")
                 row = self.db.execute("SELECT token,expires FROM leases WHERE workspace=?", (name,)).fetchone()
@@ -622,7 +743,7 @@ class Store:
                 self.db.execute("COMMIT")
                 return {"held": method != "workspace.lease.release", "ttl": 30}
             except Exception:
-                self.db.execute("ROLLBACK")
+                rollback(self.db)
                 raise
         if method == "workspace.get":
             row = self.db.execute("SELECT revision,snapshot,panes FROM workspaces WHERE name=?", (name,)).fetchone()
@@ -652,7 +773,7 @@ class Store:
                 self.db.execute("COMMIT")
                 return {"revision": row[0], "receipts": receipts}
             except Exception:
-                self.db.execute("ROLLBACK")
+                rollback(self.db)
                 raise
         if method == "workspace.stage":
             revision, snapshot, panes = req.get("revision"), req.get("snapshot"), req.get("panes")
@@ -683,7 +804,7 @@ class Store:
                 self.db.execute("COMMIT")
                 return {"revision": revision, "panes": sorted(current)}
             except Exception:
-                self.db.execute("ROLLBACK")
+                rollback(self.db)
                 raise
         if method == "workspace.sync":
             self.db.execute("BEGIN")
@@ -695,7 +816,7 @@ class Store:
                 self.db.execute("COMMIT")
                 return snapshot
             except Exception:
-                self.db.execute("ROLLBACK")
+                rollback(self.db)
                 raise
         if method == "workspace.events":
             after, limit = req.get("after", 0), req.get("limit", 100)
@@ -765,16 +886,21 @@ class Store:
                     raise Conflict("pane is awaiting cleanup")
                 if self.db.execute("SELECT 1 FROM reservations WHERE pane=?", (pane,)).fetchone():
                     raise Conflict("pane is already reserved")
+                if self.db.execute("SELECT 1 FROM local_tabs WHERE pane=?", (pane,)).fetchone():
+                    raise Conflict("pane belongs to a local tab")
+                if self.db.execute("SELECT 1 FROM session_origins WHERE pane=?", (pane,)).fetchone():
+                    raise Conflict("pane ID has retained creation provenance")
                 if pane in self.read_inventory()["sessions"]:
                     raise Conflict("pane ID already belongs to a live zmx session")
                 self.db.execute("INSERT INTO reservations VALUES (?,?)", (pane, name))
+                self.db.execute("INSERT INTO session_origins VALUES (?,?,?,?)", (pane, name, time.time(), operation))
                 self.add_event(name, revision, "pane.reserved", {"pane": pane})
                 result = {"pane": pane, "revision": revision}
                 self.db.execute("INSERT INTO operations VALUES (?,?,?,?)", (name, operation, digest, json.dumps(result)))
                 self.db.execute("COMMIT")
                 return result
             except Exception:
-                self.db.execute("ROLLBACK")
+                rollback(self.db)
                 raise
         if method == "workspace.watch":
             known = req.get("known")
@@ -820,7 +946,7 @@ class Store:
                                         "listed_sessions": inventory["sessions"]})
                 self.db.execute("COMMIT")
             except Exception:
-                self.db.execute("ROLLBACK")
+                rollback(self.db)
                 raise
             return {"revision": row[0], "live": sorted(live), "missing": sorted(panes - live),
                     "confirmed_missing": sorted((panes - live) & seen)}
@@ -925,6 +1051,8 @@ class Store:
             foreign_reservations = {r[0] for r in self.db.execute("SELECT pane FROM reservations WHERE workspace<>?", (name,))}
             if current & foreign_reservations:
                 raise Conflict("pane is reserved by another workspace")
+            if current & {r[0] for r in self.db.execute("SELECT pane FROM local_tabs")}:
+                raise Conflict("pane belongs to a local tab")
             new_revision = actual + 1
             self.db.execute("INSERT OR REPLACE INTO workspaces VALUES (?,?,?,?)", (name, new_revision, snapshot, json.dumps(sorted(current))))
             if row is None and retired:
@@ -958,7 +1086,7 @@ class Store:
             self.db.execute("COMMIT")
             return response
         except Exception:
-            self.db.execute("ROLLBACK")
+            rollback(self.db)
             raise
 
     def rename_workspace(self, name, req):
@@ -1009,7 +1137,7 @@ class Store:
             self.db.execute("COMMIT")
             return result
         except Exception:
-            self.db.execute("ROLLBACK")
+            rollback(self.db)
             raise
 
     def retry_cleanup(self, name, token=None, unattended=False):
@@ -1044,7 +1172,7 @@ class Store:
             self.db.execute("COMMIT")
             return {"remaining": failed}
         except Exception:
-            self.db.execute("ROLLBACK")
+            rollback(self.db)
             raise
 
 
@@ -1060,6 +1188,39 @@ def build_id():
     else:
         source = source.encode()
     return hashlib.sha256(source).hexdigest()
+
+
+# Reviewed protocol-1 baseline (44b1f6f). The SSH bridge hashes the base64 source
+# string; the local bridge hashes the file bytes. Local companions add separate
+# methods/tables, not a new remote workspace layout or lease protocol.
+PRE_LOCAL_EXIT_BUILD = "eea27ec4e00fac3d7c126ba026420f7cd32fcdd6c72ccc21536dfa1da356da4d"
+PRE_LOCAL_EXIT_METHODS = frozenset("local.tab." + action for action in ("get", "reserve", "launch", "focus", "close"))
+LEGACY_WORKSPACE_BUILDS = frozenset((
+    "cdb3e2965288d4aff8499c0fb8fb38bbf97c75aa47fa8e80d57754196286139b",
+    "e379b6c6dec43acaaee87693654dd5259f1eb97bf36cb7bb736b23b7214c577f",
+    # Installed pre-exit build: same remote workspace protocol.
+    "9199b10641d57c7c07a1c278cfe0eb2d02332924a394efe5486c32c46946c37e",
+    PRE_LOCAL_EXIT_BUILD,
+))
+LEGACY_WORKSPACE_METHODS = frozenset((
+    "host.metrics", "session.inventory", "workspace.list", "workspace.get", "workspace.sync",
+    "workspace.status", "workspace.watch", "workspace.events", "workspace.events.wait",
+    "workspace.lease.acquire", "workspace.lease.renew", "workspace.lease.release",
+    "workspace.lease.inspect", "workspace.lease.recover", "workspace.put", "workspace.stage",
+    "workspace.recover-stage", "workspace.exits", "workspace.prune", "workspace.reconcile",
+    "workspace.rename", "workspace.kill", "pane.reserve", "panes.close", "panes.exited",
+    "cleanup.list", "cleanup.retry",
+))
+
+
+def legacy_workspace_request(info, request):
+    """Permit only reviewed baseline methods, never arbitrary version skew."""
+    result = info.get("result") if isinstance(info, dict) and info.get("ok") is True else None
+    return (isinstance(result, dict) and type(result.get("protocol")) is int and result["protocol"] == 1 and
+            isinstance(result.get("build"), str) and result["build"] in LEGACY_WORKSPACE_BUILDS and
+            isinstance(request, dict) and isinstance(request.get("method"), str) and
+            (request["method"] in LEGACY_WORKSPACE_METHODS or
+             (result["build"] == PRE_LOCAL_EXIT_BUILD and request["method"] in PRE_LOCAL_EXIT_METHODS)))
 
 
 def response(store, line):
@@ -1096,7 +1257,7 @@ def serve():
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 probe.connect(str(path))
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, ConnectionResetError):
                 path.unlink()
             else:
                 raise ValueError("server socket already active")
@@ -1215,7 +1376,7 @@ def connect_server():
 
     try:
         return connect()
-    except (FileNotFoundError, ConnectionRefusedError):
+    except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
         pass
     source = os.environ.get("KZW_COORDINATOR_SOURCE")
     if source:
@@ -1229,7 +1390,7 @@ def connect_server():
     while time.monotonic() < deadline:
         try:
             return connect()
-        except (FileNotFoundError, ConnectionRefusedError):
+        except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
             time.sleep(0.05)
     raise OSError("workspace server did not start; check remote state directory and socket path")
 
@@ -1256,8 +1417,9 @@ def main():
                         request = json.loads(line)
                     except (ValueError, UnicodeDecodeError):
                         request = None
-                    if request not in ({"method": "server.info"}, {"method": "server.shutdown"}):
-                        sys.stdout.buffer.write(b'{"ok":false,"error":"workspace server version differs; stop the old server before retrying"}\n')
+                    if (request not in ({"method": "server.info"}, {"method": "server.shutdown"}) and
+                            not legacy_workspace_request(info, request)):
+                        sys.stdout.buffer.write(b'{"ok":false,"code":"build_mismatch","error":"workspace server version differs; stop the old server before retrying"}\n')
                         sys.stdout.buffer.flush()
                         continue
                 client.sendall(line)

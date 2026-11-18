@@ -8,13 +8,20 @@ def summarize(inventory):
     sessions, workspaces = inventory["sessions"], inventory["workspaces"]
     stray = sorted(s["id"] for s in sessions if s["presence"] == "live" and not s["references"]) if available else None
     missing = sorted(s["id"] for s in sessions if s["presence"] == "missing" and
-                     any(ref["role"] == "layout" for ref in s["references"])) if available else None
+                     any(ref["role"] == "layout" or
+                         (ref["role"] == "local-tab" and ref.get("state") == "started")
+                         for ref in s["references"])) if available else None
     conflicts = sorted(s["id"] for s in sessions if s["assignment"] == "conflict")
     errors = {name: data["layout_error"] for name, data in sorted(workspaces.items()) if "layout_error" in data}
     pending = []
+    orphaned = sorted(s["id"] for s in sessions
+                      if available and s["presence"] == "live" and not s["references"]
+                      and s.get("creation_origin"))
     for session in sessions:
         owners = {ref["workspace"] for ref in session["references"] if ref["role"] == "layout"}
-        if any(ref["role"] in ("reserved", "closing") or (ref["role"] == "staged" and ref["workspace"] not in owners)
+        if any(ref["role"] in ("reserved", "closing") or
+               (ref["role"] == "local-tab" and ref.get("state") in ("reserved", "closing")) or
+               (ref["role"] == "staged" and ref["workspace"] not in owners)
                for ref in session["references"]):
             pending.append(session["id"])
     return {
@@ -26,6 +33,7 @@ def summarize(inventory):
         "conflicting_sessions": conflicts,
         "invalid_workspaces": errors,
         "pending_sessions": sorted(pending),
+        "known_origin_unassigned": orphaned,
     }
 
 
@@ -65,6 +73,12 @@ def render(report):
         lines.extend("  ".join(row[col].ljust(widths[col]) for col in range(3)) + "  " + row[3] for row in table)
     for name, error in check["invalid_workspaces"].items():
         lines.append(f"Invalid layout {display(name)}: {display(error)}")
+    for session in sorted(report["sessions"], key=lambda item: item["id"]):
+        origin = session.get("creation_origin")
+        if origin and session["id"] in check.get("known_origin_unassigned", []):
+            lines.append("Unassigned session " + display(session["id"]) +
+                         " was reserved by workspace " + display(origin["workspace"]) +
+                         "; original ownership is not current ownership.")
     stray = len(check["stray_sessions"]) if report["available"] else "unknown"
     missing = len(check["missing_sessions"]) if report["available"] else "unknown"
     lines += ["", f"Stray: {stray}; missing saved: {missing}; conflicts: {len(check['conflicting_sessions'])}; "

@@ -64,6 +64,40 @@ class InventoryTests(unittest.TestCase):
         self.store = Store(self.path)
         self.assertEqual(self.store.inventory()["workspaces"]["Test"]["snapshot"], layout(A, C))
 
+    def test_reservation_provenance_survives_restart_and_is_not_current_ownership(self):
+        from kzw.check import summarize, render
+        token = "f" * 32
+        self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": token})
+        request = {"method": "pane.reserve", "workspace": "Test", "revision": 1,
+                   "request_id": "reserve-origin", "pane": C, "lease_token": token}
+        self.store.dispatch(request)
+        self.store.dispatch(request)
+        self.live.append(C)
+        self.store.close()
+        self.store = Store(self.path)
+        sample = self.store.inventory()
+        by_id = {s["id"]: s for s in sample["sessions"]}
+        self.assertEqual(by_id[C]["creation_origin"]["workspace"], "Test")
+        self.assertEqual(by_id[C]["creation_origin"]["request_id"], "reserve-origin")
+        self.assertIsNone(by_id[A]["creation_origin"])  # existing data is not invented
+        self.assertIsNone(by_id["ordinary-session"]["creation_origin"])
+        self.assertEqual(by_id[C]["assignment"], "assigned")
+        # A historical origin is diagnostic, not authority to adopt or kill.
+        self.store.db.execute("DELETE FROM reservations WHERE pane=?", (C,))
+        sample = self.store.inventory()
+        by_id = {s["id"]: s for s in sample["sessions"]}
+        self.assertEqual((by_id[C]["assignment"], by_id[C]["references"]), ("unassigned", []))
+        check = summarize(sample)
+        self.assertIn(C, check["known_origin_unassigned"])
+        report = {**sample, "origin": "origin", "check": check}
+        self.assertIn("was reserved by workspace Test", render(report))
+        with patch("kzw.remote.subprocess.run", side_effect=OSError("offline")):
+            unavailable = self.store.inventory()
+        self.assertFalse(unavailable["available"])
+        self.assertEqual(summarize(unavailable)["known_origin_unassigned"], [])
+        self.assertEqual(next(s for s in unavailable["sessions"] if s["id"] == C)["creation_origin"],
+                         by_id[C]["creation_origin"])
+
     def test_absence_failures_and_origin_changes_preserve_authoritative_layout(self):
         original = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
         self.live = [A, "ordinary-session"]

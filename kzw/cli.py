@@ -676,6 +676,8 @@ def capture_locked(directory, executable, allow_removals=False, expected_panes=N
         if (isinstance(staged, dict) and staged.get("kind") == "kzw-native-stage-v1" and
                 set(staged.get("panes", [])) == current and staged.get("snapshot") == snapshot):
             stage.unlink()
+    from .local_tabs import sync_focus
+    sync_focus(directory)
     return len(after)
 
 
@@ -720,15 +722,27 @@ def detach(name, origin=""):
     with capture_lock(directory):
         if (directory / "pending-create.json").exists():
             raise ValueError("a pane creation is incomplete; inspect pending-create.json")
-        count = capture_stable_locked(directory, executable)
-        if (directory / "remote.json").exists():
-            remote_client.ensure_current_revision(directory)
-        tree = json.loads(view_query(directory, "ls"))
-        mapped = pane_map(tree)
-        if {pane for pane, _ in mapped.values()} != set(json.loads((directory / "panes.json").read_text())):
-            raise ValueError("workspace changed after final snapshot; refusing to detach")
-        ids = sorted(mapped)
-        view_query(directory, "close-window", "--match", " or ".join(f"id:{wid}" for wid in ids))
+        from . import local_tabs
+        if local_tabs.detach_only(directory):
+            count = 0
+        else:
+            count = capture_stable_locked(directory, executable)
+            if (directory / "remote.json").exists():
+                remote_client.ensure_current_revision(directory)
+            tree = json.loads(view_query(directory, "ls"))
+            mapped = pane_map(tree)
+            if {pane for pane, _ in mapped.values()} != set(json.loads((directory / "panes.json").read_text())):
+                raise ValueError("workspace changed after final snapshot; refusing to detach")
+            ids = sorted(mapped)
+            if local_tabs.owner(directory) is not None:
+                raw_tree = local_tabs.windows(directory)
+                for tab in raw_tree[0]["tabs"]:
+                    for window in tab["windows"]:
+                        if window.get("user_vars", {}).get("kzw_local_owner") == local_tabs.owner(directory):
+                            if not local_tabs.local_window(window) or len(tab["windows"]) != 1:
+                                raise ValueError("invalid local tab; refusing incomplete detach")
+                            ids.append(window["id"])
+            view_query(directory, "close-window", "--match", " or ".join(f"id:{wid}" for wid in ids))
     # A shared-view supervisor owns the marker files and exits once its OS
     # window is gone. Waiting here makes an immediate re-attach reliable.
     if view is not None:
@@ -952,12 +966,16 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
     if not executable:
         raise ValueError("kzw-pane not found on PATH")
     with capture_lock(directory):
-        if (directory / "remote.json").exists():
+        coordinated = (directory / "remote.json").exists()
+        if coordinated:
             remote_client.renew_lease(directory)
         if (directory / "pending-close.json").exists() or (directory / "pending-create.json").exists():
             raise ValueError("an earlier workspace mutation is incomplete")
+        if coordinated:
+            from .exits import synchronize
+            synchronize(directory, executable, locked=True)
         capture_locked(directory, executable)
-        if (directory / "remote.json").exists():
+        if coordinated:
             remote_client.ensure_current_revision(directory)
         tree = json.loads(view_query(directory, "ls"))
         before = pane_map(tree)
@@ -1401,6 +1419,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             raise ValueError("a pane close is incomplete; inspect it or run kzw retry-close")
         if (directory / "pending-exit.json").exists():
             raise ValueError("session exit reconciliation is incomplete; retain pending-exit.json for recovery")
+        if (directory / "pending-local-kill.json").exists():
+            raise ValueError("workspace termination is incomplete; retry kzw kill")
         pending_create = directory / "pending-create.json"
         sock = directory / "kitty.sock"
         # The lock proves no kzw supervisor is using this workspace. Refuse a
@@ -1554,7 +1574,9 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                          "-o", "map kitty_mod+up scroll_to_prompt -1",
                          "-o", "map kitty_mod+down scroll_to_prompt 1",
                          "-o", f"map super+t kitten {create_kitten} tab",
-                         "-o", f"map kitty_mod+t kitten {create_kitten} tab"]
+                          "-o", f"map kitty_mod+t kitten {create_kitten} tab"]
+                local_kitten = Path(__file__).with_name("local_tab_kitten.py")
+                args += ["-o", f"map super+shift+ctrl+t kitten {local_kitten}"]
                 utility_kitten = Path(__file__).with_name("utility_kitten.py")
                 args += ["-o", f"map ctrl+space>shift+q kitten {utility_kitten}",
                          "-o", "map ctrl+space>ctrl+space send_key ctrl+space"]
@@ -1588,6 +1610,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         last_error = None
         reported_started = False
         pending_focus = focus
+        local_restored = False
         change_signal = directory / "watcher.changed"
         last_signal = None
         next_capture = 0.0
@@ -1603,6 +1626,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         source_window = None if shared is not None else supervisor_window.source_window()
         minimize_attempted = False
         try:
+            atomic_write(directory / "local-tab-capability.json", json.dumps({"pid": os.getpid()}) + "\n")
             while child is None or child.poll() is None:
                 try:
                     # Check for a vanished view even while the first capture is
@@ -1615,6 +1639,10 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                             current = [window for window in current if not only_utilities(window)]
                         else:
                             current = json.loads(view_query(directory, "ls"))
+                            if not current:
+                                from .local_tabs import owner, windows
+                                if owner(directory) is not None:
+                                    current = windows(directory)
                         native = directory / "native-pending"
                         unfinished = ((directory / "pending-create.json").exists() or (directory / "pending-close.json").exists() or
                                       (directory / "pending-exit.json").exists() or
@@ -1645,6 +1673,11 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                     if pending_focus:
                         restore_focus(sock, pending_focus, view_directory=directory)
                         pending_focus = None
+                    if not local_restored:
+                        from .local_tabs import launch
+                        with capture_lock(directory):
+                            launch(directory, name, host if remote_attached else "", focus=None)
+                        local_restored = True
                     try:
                         signal = change_signal.stat().st_mtime_ns
                     except FileNotFoundError:
@@ -1702,6 +1735,12 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             child.wait()
         finally:
             try:
+                capability = directory / "local-tab-capability.json"
+                try:
+                    if capability.is_file() and json.loads(capability.read_text()).get("pid") == os.getpid():
+                        capability.unlink()
+                except (OSError, ValueError):
+                    pass  # Never let advisory capability cleanup strand a broker/lease.
                 if (directory / "pending-exit.json").exists():
                     try:
                         synchronize_exits(directory, pane_executable)
@@ -1798,7 +1837,7 @@ def rename_workspace(name, destination, host=""):
                 except BlockingIOError:
                     raise ValueError("workspace is attached locally; detach before renaming") from None
             source, target = paths
-            if any((source / item).exists() for item in ("kitty.sock", "view.json", "pending-create.json", "pending-close.json", "pending-exit.json", "native-stage.json")):
+            if any((source / item).exists() for item in ("kitty.sock", "view.json", "pending-create.json", "pending-close.json", "pending-exit.json", "native-stage.json", "pending-local-kill.json")):
                 raise ValueError("workspace has an active view or unfinished local operations")
             native = source / "native-pending"
             if native.exists() and (native.is_symlink() or not native.is_dir() or any(native.iterdir())):
@@ -1823,7 +1862,10 @@ def rename_workspace(name, destination, host=""):
                 if (cached.get("rename_request") != pending_record.get("request_id") or
                         cached.get("workspace") != destination or cached.get("host") != host or
                         cached.get("pending") or cached.get("creating") or
-                        not remote_client.inert_legacy_artifacts(target, ignored_names=("remote.json",))):
+                        not remote_client.inert_legacy_artifacts(
+                            target, ignored_names=("remote.json", "local-tab-owner") if
+                            pending_record.get("local_owner") and (target / "local-tab-owner").is_file() and
+                            (target / "local-tab-owner").read_text().strip() == pending_record["local_owner"] else ("remote.json",))):
                     raise ValueError("destination has existing local workspace state")
         if journal.exists():
             record = json.loads(journal.read_text())
@@ -1835,6 +1877,11 @@ def rename_workspace(name, destination, host=""):
                 raise ValueError("workspace does not exist")
             record = {"route": route, "workspace": name, "destination": destination,
                       "revision": state["revision"], "request_id": uuid.uuid4().hex}
+            if cache:
+                from .local_tabs import owner
+                identity = owner(source)
+                if identity is not None:
+                    record["local_owner"] = identity
             atomic_write(journal, json.dumps(record, separators=(",", ":")) + "\n")
         request = {"method": "workspace.rename", "workspace": name, "destination": destination,
                    "revision": record["revision"], "request_id": record["request_id"]}
@@ -1852,6 +1899,13 @@ def rename_workspace(name, destination, host=""):
                                               "revision": result["revision"],
                                               "state_home": remote_client.origin_state_home(host),
                                               "rename_request": record["request_id"]})
+            if record.get("local_owner"):
+                atomic_write(target / "local-tab-owner", record["local_owner"] + "\n")
+                old_owner = source / "local-tab-owner"
+                if old_owner.exists():
+                    if old_owner.is_symlink() or old_owner.read_text().strip() != record["local_owner"]:
+                        raise ValueError("local tab association changed during rename; retain the rename journal")
+                    old_owner.unlink()
         journal.unlink()
     print(f"Renamed workspace {name!r} to {destination!r}; zmx sessions are unchanged")
 
@@ -1859,7 +1913,7 @@ def rename_workspace(name, destination, host=""):
 def kill_workspace(name, host):
     """Confirm and durably schedule all coordinator-owned sessions for cleanup."""
     directory = state_dir(name, host)
-    with open(directory / "lock", "a+") as lock:
+    with open(directory / "lock", "a+") as lock, capture_lock(directory):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -1879,21 +1933,47 @@ def kill_workspace(name, host):
             remove_view(directory)
         if (directory / "kitty.sock").exists() or view_state(directory) is not None:
             raise ValueError("workspace may be active or has unfinished local operations")
+        from . import local_tabs
+        journal = directory / "pending-local-kill.json"
+        intent = json.loads(journal.read_text()) if journal.exists() else None
+        local_identity = local_tabs.owner(directory)
+        local = local_tabs.request(directory)["tab"] if local_identity else None
         state = remote_client.call(host, {"method": "workspace.get", "workspace": name})
-        if not state.get("exists"):
+        if not state.get("exists") and intent is None:
             raise ValueError("workspace does not exist")
-        panes = state["panes"]
-        if input(f"Kill workspace {name!r} and terminate its {len(panes)} zmx session(s) and all their programs? [y/N] ").strip().lower() != "y":
+        panes = intent["panes"] if intent else state["panes"]
+        local_pane = intent["local_pane"] if intent else local["pane"] if local else None
+        if intent and local and local["pane"] != local_pane:
+            raise ValueError("local sessions changed after kill confirmation")
+        extra = f" plus local zmx session {local_pane}" if local_pane else ""
+        if input(f"Kill workspace {name!r} and terminate its {len(panes)} zmx session(s){extra} and all their programs? [y/N] ").strip().lower() != "y":
             print("Cancelled")
+            return
+        if local_identity and intent is None:
+            intent = {"panes": panes, "revision": state["revision"], "local_pane": local_pane}
+            atomic_write(journal, json.dumps(intent) + "\n")
+        if not state.get("exists"):
+            if local:
+                local_tabs.close(directory, local_pane)
+            if local_identity:
+                (directory / "local-tab-owner").unlink()
+            journal.unlink()
+            print(f"Workspace {name!r} and associated local session cleanup complete")
             return
         remote_client.acquire_lease(directory, name, host)
         try:
             token = remote_client.lease_token(directory)
             remote_client.call(host, {"method": "workspace.kill", "workspace": name,
-                                      "revision": state["revision"], "lease_token": token})
+                                      "revision": intent["revision"] if intent else state["revision"], "lease_token": token})
+            if local:
+                local_tabs.close(directory, local_pane)
             result = remote_client.call(host, {"method": "cleanup.retry", "workspace": name, "lease_token": token})
             if result["remaining"]:
                 raise ValueError("workspace kill is pending cleanup; the server will retry")
+            if local_identity:
+                (directory / "local-tab-owner").unlink()
+            if journal.exists():
+                journal.unlink()
         finally:
             remote_client.release_lease(directory)
     print(f"Workspace {name!r} termination scheduled; the coordinator will retire it after verified cleanup")
@@ -2125,6 +2205,14 @@ def spawn_background(args):
 def main():
     parser = argparse.ArgumentParser(prog="kzw")
     commands = parser.add_subparsers(dest="command", required=True)
+    local_parser = commands.add_parser("_local-tab", help=argparse.SUPPRESS)
+    local_parser.add_argument("name")
+    local_parser.add_argument("--host", default="")
+    local_parser.add_argument("--window-id", type=int)
+    local_parser.add_argument("--close", metavar="PANE")
+    local_attach = commands.add_parser("_local-attach", help=argparse.SUPPRESS)
+    local_attach.add_argument("owner")
+    local_attach.add_argument("pane")
     queue_parser = commands.add_parser("_queue", help=argparse.SUPPRESS)
     queue_parser.add_argument("--host", default="")
     sessions_parser = commands.add_parser("sessions", help="select a session from a workspace on this host")
@@ -2226,6 +2314,27 @@ def main():
     server_stop.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
     args = parser.parse_args()
     try:
+        if args.command == "_local-attach":
+            from .local_tabs import attach
+            return attach(args.owner, args.pane)
+        if args.command == "_local-tab":
+            from . import local_tabs
+            directory = state_dir(args.name, args.host)
+            with capture_lock(directory):
+                if (directory / "pending-local-kill.json").exists():
+                    raise ValueError("workspace termination is pending")
+                if args.close:
+                    local_tabs.close(directory, args.close, args.window_id)
+                else:
+                    capability = directory / "local-tab-capability.json"
+                    if not capability.is_file():
+                        raise ValueError("detach and reattach this workspace to enable local tabs in its supervisor")
+                    pid = json.loads(capability.read_text()).get("pid")
+                    if type(pid) is not int or pid <= 0:
+                        raise ValueError("invalid local tab supervisor capability")
+                    os.kill(pid, 0)
+                    local_tabs.launch(directory, args.name, args.host, target=args.window_id, create=True)
+            return 0
         if (not getattr(args, "hold", False) and os.environ.get("KZW_BACKGROUND_SUPERVISOR") != "1"
                 and background_command(args)):
             return spawn_background(args)
@@ -2234,8 +2343,8 @@ def main():
         if getattr(args, "inherit_appearance", False):
             if args.command == "create" and not args.attach:
                 raise ValueError("--inherit-appearance requires --attach when creating a workspace")
-            from .appearance import capture
-            appearance_arg["appearance"] = capture()
+            from .appearance import capture as capture_appearance
+            appearance_arg["appearance"] = capture_appearance()
         if args.command == "create" and getattr(args, "new_kitty_instance", False) and not args.attach:
             raise ValueError("--new-kitty-instance requires --attach when creating a workspace")
         if args.command == "_queue":

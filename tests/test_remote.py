@@ -1,6 +1,7 @@
 import subprocess
 import json
 import os
+import sqlite3
 import socket
 import sys
 import tempfile
@@ -11,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from kzw.remote import Conflict, Store, response
+from kzw.remote import Conflict, Store, response, rollback
 from workspace_fixtures import layout
 
 A = "kzw-" + "a" * 32
@@ -41,6 +42,38 @@ class RemoteStoreTests(unittest.TestCase):
             self.assertEqual(state_root(), Path(self.temp.name) / "kzw" / "coordinator")
         with patch.dict(os.environ, {"XDG_STATE_HOME": self.temp.name, "KZW_LOCAL_COORDINATOR": ""}):
             self.assertEqual(state_root(), Path(self.temp.name) / "kzw")
+
+    def test_dispatch_preserves_original_error_if_rollback_reports_inactive(self):
+        self.put(panes=[A])
+        connection = self.store.db
+
+        class RollbackErrorAfterCompletion:
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+            @property
+            def in_transaction(self):
+                return connection.in_transaction
+
+            def execute(self, statement, *args):
+                result = connection.execute(statement, *args)
+                if statement == "ROLLBACK":
+                    raise sqlite3.OperationalError("cannot rollback - no transaction is active")
+                return result
+
+        self.store.db = RollbackErrorAfterCompletion()
+        with self.assertRaisesRegex(Conflict, "revision mismatch: expected 0, current 1"):
+            self.put("stale", revision=0, panes=[A])
+        self.assertFalse(connection.in_transaction)
+
+    def test_rollback_skips_inactive_transaction(self):
+        class InactiveTransaction:
+            in_transaction = False
+
+            def execute(self, statement):
+                raise AssertionError("rollback must not execute without an active transaction")
+
+        rollback(InactiveTransaction())
 
     def test_compare_and_swap_and_idempotency(self):
         self.assertEqual(self.put(), self.put())

@@ -24,7 +24,7 @@ def percent(value):
 def refresh_renderer(manager, connection=False):
     bar = getattr(manager, "tab_bar", None)
     draw = getattr(bar, "draw_func", None)
-    feature = "_kzw_network_pause" if connection else "_kzw_resources"
+    feature = "_kzw_local_program" if connection else "_kzw_resources"
     checked = feature + "_renderer_checked"
     if (getattr(draw, "_equal_margins", False) and not getattr(draw, feature, False)
             and not getattr(bar, checked, False)):
@@ -46,7 +46,8 @@ def handle_result(args, answer, target_window_id, boss):
     data = json.loads(args[2])
     if manager is None:
         return False
-    windows = [window for tab in manager.tabs for window in tab if not window.user_vars.get("kzw_utility")]
+    windows = [window for tab in manager.tabs for window in tab
+               if not window.user_vars.get("kzw_utility") and not window.user_vars.get("kzw_local")]
     if not windows or any(not PANE.fullmatch(window.user_vars.get("kzw_pane", "")) or
                           window.user_vars.get("kzw_workspace") != data["workspace"] or
                           window.user_vars.get("kzw_origin", "") != data["origin"] for window in windows):
