@@ -1,5 +1,7 @@
 # kzw
 
+<img src="assets/ai-slop-stamp.png" alt="AI SLOP warning" width="180">
+
 https://github.com/user-attachments/assets/c602f153-64fb-479f-bbda-e4553450ae67
 
 ## Installation
