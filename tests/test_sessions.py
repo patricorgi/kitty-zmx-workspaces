@@ -152,6 +152,52 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(sessions.list_and_attach("Test"), 0)
             execute.assert_not_called()
 
+    def test_remote_selector_revalidates_membership_and_origin(self):
+        state = {"revision": 1, "snapshot": LAYOUT, "panes": [A, B, C]}
+        source = {"host": "origin", "uid": 1000, "executable": "/bin/zmx",
+                  "socket_selector": "ZMX_DIR", "socket_base": "/run/zmx"}
+        initial = (state, {B}, source)
+        for latest, success in ((initial, True), ((state, set(), source), False),
+                                ((state, {B}, {**source, "uid": 1001}), False),
+                                (({**state, "revision": 2}, {B}, source), False)):
+            with self.subTest(latest=latest), \
+                    patch.object(sessions, "remote_selection", side_effect=[initial, latest]), \
+                    patch.object(sessions, "choose", return_value=B), \
+                    patch.object(sessions, "attach_on_origin", return_value=0) as attach:
+                if success:
+                    self.assertEqual(sessions.list_and_attach("Test", "login"), 0)
+                    attach.assert_called_once_with("login", B, source)
+                else:
+                    with self.assertRaisesRegex(ValueError, "changed|no longer available"):
+                        sessions.list_and_attach("Test", "login")
+                    attach.assert_not_called()
+
+    def test_remote_labels_are_advisory_and_sanitize_controls(self):
+        source = {"host": "origin", "uid": 1000, "executable": "/bin/zmx",
+                  "socket_selector": "ZMX_DIR", "socket_base": "/run/zmx"}
+        listing = (f"name={B}\tpid=123\tcwd=file://origin/tmp/a%20b\tkzw_title=Fit\x1b\n"
+                   f"name={A}\tkzw_title=Ignore\n")
+        with patch.object(sessions.subprocess, "run", return_value=type("Result", (), {"stdout": listing})()):
+            self.assertEqual(sessions.remote_labels("login", source, {B}), {B: "Fit? · /tmp/a b"})
+
+    def test_remote_preview_is_opt_in_and_checks_origin_before_reading(self):
+        state = {"revision": 1, "snapshot": LAYOUT, "panes": [A, B, C]}
+        source = {"host": "origin", "uid": 1000, "executable": "/bin/zmx",
+                  "socket_selector": "ZMX_DIR", "socket_base": "/run/zmx"}
+
+        def preview_and_cancel(*args, preview, **kwargs):
+            self.assertEqual(preview(B), "visible screen")
+            return None
+
+        with patch.object(sessions, "remote_selection", return_value=(state, {B}, source)), \
+             patch.object(sessions, "remote_labels", return_value={}), \
+             patch.object(sessions, "choose", side_effect=preview_and_cancel), \
+             patch.object(sessions.subprocess, "run", return_value=type("Result", (), {"stdout": "visible screen"})()) as run, \
+             patch.object(sessions, "attach_on_origin") as attach:
+            self.assertEqual(sessions.list_and_attach("Test", "login"), 0)
+            self.assertIn(f"zmx history {B} --screen", run.call_args.args[0][-1])
+            attach.assert_not_called()
+
     def test_disappeared_session_or_listing_failure_never_attaches(self):
         state = {"exists": True, "revision": 1, "snapshot": LAYOUT, "panes": [A, B, C]}
         for second in (set(), OSError("zmx unavailable")):

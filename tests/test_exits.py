@@ -111,6 +111,28 @@ class ExitTests(unittest.TestCase):
     def sync(self):
         return cli.synchronize_exits(self.directory, "/bin/kzw-pane")
 
+    def test_zmx_1_0_1_exit_requires_ordered_suffix_and_absent_pid(self):
+        self.version = "1.0.1"
+        self.ended(B, evidence=False)
+        log = self.zmx / "logs" / (B + ".log")
+
+        def suffix(pid):
+            lines = ("shell exited pty_fd=6", "daemon loop shutdown", f"deleting socket file session={B}",
+                     f"kill received session={B}", f"shutting down daemon session={B}",
+                     f"sending SIGHUP session={B} pid={pid}")
+            return "".join(f"[1795048227] [info] (default): {line}\n" for line in lines)
+
+        log.write_text(lifecycle(B))
+        self.assertEqual(self.sync(), 0)
+        log.write_text(suffix(os.getpid()))
+        self.assertEqual(self.sync(), 0)
+        log.write_text(suffix(2147483647))
+        receipt = self.store.exit_receipts({B})[B]
+        self.assertEqual(receipt["kind"], "zmx-1.0.1-reaped")
+        self.assertEqual(receipt["exited_at_ms"], 1795048227000)
+        self.assertNotIn("reaped_at_ms", receipt)
+        self.assertEqual(self.sync(), 1)
+
     def disappear(self, pane):
         tab = self.tree[0]["tabs"][0]
         tab["windows"] = [w for w in tab["windows"] if w["user_vars"]["kzw_pane"] != pane]

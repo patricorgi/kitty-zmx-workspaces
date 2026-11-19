@@ -1,8 +1,9 @@
-"""Host-local, terminal-only selection of coordinator-owned zmx sessions."""
+"""Terminal-only selection of coordinator-owned zmx sessions."""
 
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shlex
 import socket
@@ -13,7 +14,7 @@ import termios
 import tty
 
 from .core import PANE, check_name
-from . import session_meta
+from . import remote_client, session_meta
 from .remote_client import RemoteRejected
 from .titles import read_process_details
 
@@ -112,7 +113,7 @@ def process_labels():
     return labels
 
 
-def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=None):
+def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=None, preview=None):
     if not input_stream.isatty() or not output.isatty():
         raise ValueError("session selection requires an interactive terminal")
     panes = [pane for tab in tabs for pane in tab if pane in live]
@@ -136,7 +137,10 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
                     process = labels.get(pane, "unknown")
                     shortcut = shortcuts.get(pane, " ")
                     lines.append(f"  {marker} [{shortcut}] Split {split_number} — {process}{status}")
-            output.write("\x1b[H\x1b[2J" + "\r\n".join(lines) + "\r\n\r\n0–9: attach  ↑/↓: select  Enter: attach  q/Esc: cancel\r\n")
+            help_text = "0–9: attach  ↑/↓: select  Enter: attach  q/Esc: cancel"
+            if preview:
+                help_text += "  p: preview"
+            output.write("\x1b[H\x1b[2J" + "\r\n".join(lines) + "\r\n\r\n" + help_text + "\r\n")
             output.flush()
             key = os.read(fd, 1)
             if key == b"\x1b":
@@ -150,6 +154,15 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
                 selected = (selected - 1) % len(panes)
             elif key in (b"\x1b[B", b"j"):
                 selected = (selected + 1) % len(panes)
+            elif key == b"p" and preview:
+                try:
+                    screen = preview(panes[selected])
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    screen = "Preview unavailable."
+                output.write("\x1b[H\x1b[2J" + "\r\n".join(display_text(row, 200) for row in
+                             screen.splitlines()[-20:]) + "\r\n\r\nPress any key to return.\r\n")
+                output.flush()
+                os.read(fd, 1)
             elif key in (b"\r", b"\n"):
                 return panes[selected]
             elif len(key) == 1 and b"0" <= key <= b"9":
@@ -164,7 +177,106 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
         output.flush()
 
 
-def list_and_attach(name):
+def remote_selection(name, host):
+    result = remote_client.call(host, {"method": "session.inventory"})
+    if result.get("available") is not True:
+        raise ValueError("remote zmx inventory unavailable")
+    state = result["workspaces"].get(name)
+    if state is None:
+        raise ValueError(f"workspace {name!r} does not exist on {host}")
+    sample = result["observation"]
+    source = sample["source"]
+    if not isinstance(source, dict) or source != result.get("query_source"):
+        raise ValueError("remote inventory origin is unknown")
+    live = {item["id"] for item in result["sessions"]
+            if item["presence"] == "live" and item["workspace"] == name
+            and any(ref["workspace"] == name and ref["role"] == "layout" for ref in item["references"])}
+    return state, live, source
+
+
+def origin_command(host, source, *args, tty=False):
+    selector = source.get("socket_selector")
+    executable, base, hostname, uid = (source.get(key) for key in ("executable", "socket_base", "host", "uid"))
+    if (selector not in (None, "ZMX_DIR", "XDG_RUNTIME_DIR", "TMPDIR") or
+            not all(isinstance(value, str) and value.startswith("/") and "\0" not in value
+                    for value in (executable, base)) or
+            not isinstance(hostname, str) or not hostname or "\0" in hostname or type(uid) is not int or uid < 0):
+        raise ValueError("invalid remote session origin")
+    zmx = shlex.quote(executable)
+    prefix = (
+        f'test "$(uname -n)" = {shlex.quote(hostname)} && test "$(id -u)" = {uid} || '
+        '{ echo "kzw: SSH origin does not match the inventory" >&2; exit 1; }; '
+        "unset ZMX_SESSION ZMX_SESSION_PREFIX ZMX_DIR XDG_RUNTIME_DIR TMPDIR; "
+        + (f"export {selector}={shlex.quote(base)}; " if selector else "export TMPDIR=/tmp; ")
+    )
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-t" if tty else "-T",
+            host, prefix + shlex.join([executable, *args])], prefix, zmx
+
+
+def attach_on_origin(host, pane, source):
+    if not PANE.fullmatch(pane):
+        raise ValueError("invalid remote pane")
+    command, prefix, zmx = origin_command(host, source, tty=True)
+    command[-1] = (
+        prefix + f'sessions=$({zmx} list --short) || exit; '
+          f'printf "%s\\n" "$sessions" | grep -F -x -- {pane} >/dev/null || '
+          '{ echo "kzw: selected session is no longer available" >&2; exit 1; }; '
+          f"exec {zmx} attach {pane} /bin/false"
+    )
+    os.execvp("ssh", command)
+
+
+def display_text(text, limit=100):
+    return "".join(c if c.isprintable() else "?" for c in text[:limit])
+
+
+def remote_labels(host, source, live):
+    from .process_cwd import reported_cwd
+
+    command, _, _ = origin_command(host, source, "list")
+    result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=10)
+    labels = {}
+    for line in result.stdout.splitlines():
+        fields = dict(field.split("=", 1) for field in line.lstrip().split("\t") if "=" in field)
+        pane = fields.get("name")
+        if pane in live:
+            title = fields.get("kzw_title") or pane
+            cwd = reported_cwd(fields.get("cwd", ""), {source["host"].lower().rstrip("."), "", "localhost"})
+            labels[pane] = display_text(title) + (f" · {display_text(cwd)}" if cwd else "")
+    return labels
+
+
+def list_and_attach(name, host=""):
+    if host:
+        check_name(name)
+        if not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host) or host.startswith("-"):
+            raise ValueError("invalid remote host")
+        initial, live, source = remote_selection(name, host)
+        tabs = snapshot_tabs(initial.get("snapshot"), initial.get("panes"))
+        labels = {p: p for tab in tabs for p in tab}
+        if live:
+            try:
+                labels.update(remote_labels(host, source, live))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass  # Metadata is advisory.
+
+        def preview(pane):
+            latest, available, current_source = remote_selection(name, host)
+            if (latest.get("revision") != initial.get("revision") or current_source != source or pane not in available):
+                raise ValueError("pane changed during selection")
+            command, _, _ = origin_command(host, source, "history", pane, "--screen")
+            return subprocess.run(command, capture_output=True, text=True, check=True, timeout=10).stdout
+
+        pane = choose(name, tabs, live, labels=labels, preview=preview)
+        if pane is None:
+            return 0
+        latest, live, current_source = remote_selection(name, host)
+        if latest.get("revision") != initial.get("revision") or pane not in latest.get("panes", []):
+            raise ValueError("workspace changed during selection; try again")
+        if source != current_source or pane not in live:
+            raise ValueError("selected session origin changed or session is no longer available")
+        return attach_on_origin(host, pane, source)
+
     initial = coordinator_snapshot(name)
     tabs = snapshot_tabs(initial.get("snapshot"), initial.get("panes"))
     pane = choose(name, tabs, live_sessions(), labels=process_labels())

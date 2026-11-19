@@ -126,8 +126,8 @@ def rollback(db):
         pass
 
 
-def zmx_exit_receipt(directory, pane):
-    """Read zmx 0.5.0's final PTY teardown, never terminal output.
+def zmx_exit_receipt(directory, pane, version="0.5.0", log_directory=None):
+    """Read a reviewed zmx teardown sequence, never terminal output.
 
     In v0.5.0 main.zig, the deleting-socket record follows waitpid(shell, 0).
     A PTY EOF alone is insufficient (zmx also maps read errors to EOF). Require
@@ -135,7 +135,9 @@ def zmx_exit_receipt(directory, pane):
     Reading only the current log rejects rotation through this short suffix;
     ordinary earlier rotation is fine. A later generation invalidates the suffix.
     """
-    path = directory / "logs" / (pane + ".log")
+    if version not in ("0.5.0", "1.0.1") or not PANE.fullmatch(pane):
+        return None
+    path = (log_directory if log_directory is not None else directory / "logs") / (pane + ".log")
     for parent in (directory, path.parent):
         info = parent.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
@@ -154,17 +156,24 @@ def zmx_exit_receipt(directory, pane):
     # optional killpg failures from handleKill, not general daemon errors.
     prefix = rb"\[(\d+)\] \[info\] \(default\): "
     name = pane.encode()
-    pattern = (prefix + rb"shell exited pty_fd=(\d+)\n" +
-               prefix + rb"kill received session=" + name + rb"\n" +
-               prefix + rb"shutting down daemon session=" + name + rb"\n" +
-               prefix + rb"sending SIGHUP session=" + name + rb" pid=(\d+)\n" +
-               rb"(?:\[\d+\] \[warning\] \(default\): failed to send SIG(?:HUP|KILL) to pty child err=[A-Za-z]+\n)*" +
-               prefix + rb"deleting socket file session=" + name + rb"\n\Z")
+    shell_exit = prefix + rb"shell exited pty_fd=\d+\n"
+    teardown = (prefix + rb"kill received session=" + name + rb"\n" +
+                prefix + rb"shutting down daemon session=" + name + rb"\n" +
+                prefix + rb"sending SIGHUP session=" + name + rb" pid=(?P<pid>\d+)\n" +
+                rb"(?:\[\d+\] \[warning\] \(default\): failed to send SIG(?:HUP|KILL) to pty child err=[A-Za-z]+\n)*")
+    deletion = prefix + rb"deleting socket file session=" + name + rb"\n"
+    if version == "1.0.1":
+        # Socket removal now precedes shutdown/waitpid. PID absence below
+        # is mandatory; the final log timestamp is not a waitpid timestamp.
+        pattern = shell_exit + prefix + rb"daemon loop shutdown\n" + deletion + teardown + rb"\Z"
+    else:
+        pattern = shell_exit + teardown + deletion + rb"\Z"
     match = re.search(rb"(?:\A|\n)" + pattern, tail)
     if match is None:
         return None
-    exited, fd, killed, shutdown, hup, pid, reaped = map(int, match.groups())
-    if not 0 < exited <= killed <= shutdown <= hup <= reaped or pid <= 1:
+    pid = int(match["pid"])
+    timestamps = [int(match[i]) for i in range(1, len(match.groups()) + 1) if i != match.re.groupindex["pid"]]
+    if timestamps != sorted(timestamps) or timestamps[0] <= 0 or pid <= 1:
         return None
     # lexists semantics: a stale, inaccessible or symlink socket is unknown.
     try:
@@ -179,8 +188,9 @@ def zmx_exit_receipt(directory, pane):
         pass
     else:
         return None
-    return {"kind": "zmx-0.5.0-reaped", "pane": pane, "shell_pid": pid,
-            "exited_at_ms": exited, "reaped_at_ms": reaped,
+    times = ({"exited_at_ms": timestamps[0], "reaped_at_ms": timestamps[-1]} if version == "0.5.0"
+             else {"exited_at_ms": timestamps[0] * 1000, "shutdown_logged_at_ms": timestamps[-1] * 1000})
+    return {"kind": f"zmx-{version}-reaped", "pane": pane, "shell_pid": pid, **times,
             "lifecycle_sha256": hashlib.sha256(match.group().lstrip(b"\n")).hexdigest()}
 
 
@@ -465,13 +475,22 @@ class Store:
         directory = Path(env["ZMX_DIR"] if "ZMX_DIR" in env else
                          str(Path(env["XDG_RUNTIME_DIR"]) / "zmx") if "XDG_RUNTIME_DIR" in env else
                          str(Path(env.get("TMPDIR", "/tmp")) / ("zmx-" + str(os.getuid()))))
-        if (fields.get("zmx") != "0.5.0" or fields.get("socket_dir") != str(directory) or
-                fields.get("log_dir") != str(directory / "logs")):
+        version = fields.get("zmx")
+        log_directory = directory / "logs"
+        if version == "1.0.1" and not env.get("ZMX_DIR"):
+            if env.get("XDG_STATE_HOME"):
+                log_directory = Path(env["XDG_STATE_HOME"]) / "zmx" / "logs"
+            elif env.get("HOME"):
+                log_directory = Path(env["HOME"]) / ".local" / "state" / "zmx" / "logs"
+            else:
+                log_directory = Path(env.get("TMPDIR", "/tmp")) / ("zmx-" + str(os.getuid()))
+        if (version not in ("0.5.0", "1.0.1") or fields.get("socket_dir") != str(directory) or
+                fields.get("log_dir") != str(log_directory)):
             return {}
         receipts = {}
         for pane in sorted(candidates):
             try:
-                receipt = zmx_exit_receipt(directory, pane)
+                receipt = zmx_exit_receipt(directory, pane, version, log_directory)
             except (OSError, ValueError):
                 continue  # Missing, unreadable or ambiguous evidence is unknown.
             if receipt is not None:

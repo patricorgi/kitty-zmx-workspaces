@@ -648,6 +648,15 @@ class NewInstanceIntegrationTests(unittest.TestCase):
         else:
             self.fail("private final exit did not finish: " + (self.directory / "supervisor.log").read_text()[-4000:])
         self.assertEqual(self.sessions(), self.baseline)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            result = self.kzw("list")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            if "Test" not in result.stdout.splitlines():
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("empty workspace was not retired: " + (self.directory / "supervisor.log").read_text()[-4000:])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,18 @@ PANE = 'kzw-' + 'a' * 32
 
 
 class ShellCwdTests(unittest.TestCase):
+    def test_exact_origin_osc7_report_avoids_process_probe(self):
+        fields = {"pid": "123", "created": "456", "cwd": "file://origin/tmp/a%20b"}
+        with patch.object(process_cwd, "session_fields", return_value=fields), \
+             patch.object(process_cwd.socket, "gethostname", return_value="origin"), \
+             patch.object(process_cwd.socket, "getfqdn", return_value="origin"), \
+             patch.object(process_cwd.os.path, "isdir", return_value=True), \
+             patch.object(process_cwd, "process_identity") as lookup:
+            self.assertEqual(process_cwd.read(PANE, prefer_report=True)["cwd"], "/tmp/a b")
+            lookup.assert_not_called()
+        self.assertIsNone(process_cwd.reported_cwd("file://other/tmp", {"origin"}))
+        self.assertIsNone(process_cwd.reported_cwd("file://origin/tmp%0Aunsafe", {"origin"}))
+
     def test_process_lookup_uses_exact_origin_and_clears_nested_zmx_context(self):
         payload = {'pane': PANE, 'pid': 123, 'created': '1700000000', 'cwd': "/tmp/a b's"}
         for host in ('', 'origin'):

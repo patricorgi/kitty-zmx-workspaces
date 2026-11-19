@@ -390,7 +390,8 @@ class RemoteOriginIntegration(unittest.TestCase):
         self.kitty("send-text", "--match", f"id:{next(iter(current))}", "\\x04")
         self.process.wait(timeout=45)
         self.process = None
-        self.assertIn("has no live panes", self.kzw("d", "attach", "Test", "--host", self.host))
+        self.wait_for(lambda: "Test" not in self.kzw("d", "list", "--host", self.host).splitlines(),
+                      "workspace was not retired after final exit")
 
     def test_confirmed_close_split_then_last_pane(self):
         self.kzw("a", "create", "Test", "--host", self.host)
@@ -409,9 +410,10 @@ class RemoteOriginIntegration(unittest.TestCase):
         self.process.wait(timeout=30)
         self.process = None
         self.assertNotIn(panes[first][0], zmx_command(self.host, "list", "--short").splitlines())
-        self.assertIn("has no live panes", self.kzw("b", "attach", "Test", "--host", self.host))
+        self.wait_for(lambda: "Test" not in self.kzw("b", "list", "--host", self.host).splitlines(),
+                      "workspace was not retired after final close")
 
-    def test_explicit_new_pane_reopens_empty_workspace(self):
+    def test_recreated_workspace_uses_a_new_pane(self):
         self.kzw("a", "create", "Test", "--host", self.host)
         self.attach("a", 1)
         window, (old_pane, _) = next(iter(pane_map(self.tree()).items()))
@@ -419,8 +421,10 @@ class RemoteOriginIntegration(unittest.TestCase):
         self.process.wait(timeout=30)
         self.process = None
         self.assertNotIn(old_pane, zmx_command(self.host, "list", "--short").splitlines())
-        self.assertIn("has no live panes", self.kzw("b", "attach", "Test", "--host", self.host))
-        self.attach("b", 1, command="new-pane")
+        self.wait_for(lambda: "Test" not in self.kzw("b", "list", "--host", self.host).splitlines(),
+                      "empty workspace was not retired")
+        self.kzw("b", "create", "Test", "--host", self.host)
+        self.attach("b", 1)
         new_pane = next(iter(pane_map(self.tree()).values()))[0]
         self.assertNotEqual(new_pane, old_pane)
         self.assertIn(new_pane, zmx_command(self.host, "list", "--short").splitlines())

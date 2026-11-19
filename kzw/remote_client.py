@@ -868,14 +868,23 @@ def create(directory, name, host):
                 raise ValueError("local workspace already exists; refusing to overwrite it")
             allowed = {"lock", "capture.lock", "lease.lock", "watcher.changed", "remote-status.changed", "remote.json",
                        "lease.json", "workspace.kitty-session", "panes.json", "bootstrap.kitty-session",
-                       "native-pending", "supervisor.log", "supervisor.startup.json"}
+                       "native-pending", "supervisor.log", "supervisor.startup.json", "local-tab-owner"}
             for path in directory.iterdir():
                 if path.name in ("pending-create.json", "pending-close.json", "native-stage.json", "kitty.sock", "view.json"):
                     raise ValueError("local workspace has unfinished operations; refusing to overwrite it")
+                if (path.name == "exit-backups" or
+                        re.fullmatch(r"backup-confirmed-exit-[a-z0-9_]{8}", path.name)):
+                    if not stat.S_ISDIR(path.lstat().st_mode):
+                        raise ValueError("unsafe workspace backup; refusing to overwrite it")
+                    allowed.add(path.name)
                 if path.name not in allowed and not re.fullmatch(r"\.retired-[0-9a-f]{32}", path.name):
-                    raise ValueError("local workspace contains unknown state; refusing to overwrite it")
+                    raise ValueError(f"local workspace contains unknown state ({path.name!r}); refusing to overwrite it")
                 if path.name == "native-pending" and (path.is_symlink() or not path.is_dir() or any(path.iterdir())):
                     raise ValueError("local workspace has unfinished operations; refusing to overwrite it")
+            if os.path.lexists(directory / "local-tab-owner"):
+                from . import local_tabs
+                if local_tabs.request(directory)["tab"] is not None:
+                    raise ValueError("retired workspace still has a local companion; refusing to overwrite it")
             archive = directory / (".retired-" + uuid.uuid4().hex)
             archive.mkdir(mode=0o700)
             # Move config last; a crash cannot make old metadata look like a

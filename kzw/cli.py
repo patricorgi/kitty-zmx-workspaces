@@ -1979,6 +1979,45 @@ def kill_workspace(name, host):
     print(f"Workspace {name!r} termination scheduled; the coordinator will retire it after verified cleanup")
 
 
+def retire_empty_coordinator_workspace(directory, name, host):
+    """Schedule metadata-only retirement under the attachment lease."""
+    from . import local_tabs
+
+    with capture_lock(directory):
+        snapshot = directory / "workspace.kitty-session"
+        if snapshot.is_symlink() or not snapshot.is_file() or snapshot.read_text() != EMPTY_SNAPSHOT:
+            return False
+        if view_state(directory) is not None or os.path.lexists(directory / "kitty.sock"):
+            return False
+        if any(os.path.lexists(directory / item) for item in
+               ("pending-close.json", "pending-create.json", "pending-exit.json",
+                "pending-local-kill.json", "native-stage.json", "bootstrap.kitty-session",
+                "reconcile-pending.json")):
+            return False
+        native = directory / "native-pending"
+        if native.is_symlink() or (native.exists() and (not native.is_dir() or any(native.iterdir()))):
+            return False
+        config = json.loads((directory / "remote.json").read_text())
+        if (config.get("host") != host or config.get("workspace") != name or
+                config.get("state_home", "") != remote_client.origin_state_home(host) or
+                config.get("pending") or config.get("panes") != []):
+            return False
+        if local_tabs.request(directory)["tab"] is not None:
+            return False
+        state = remote_client.call(host, {"method": "workspace.get", "workspace": name})
+        if (not state.get("exists") or state["snapshot"] != EMPTY_SNAPSHOT or state["panes"] != [] or
+                state["revision"] != config["revision"] or state.get("reservations") or state.get("staged")):
+            return False
+        token = remote_client.lease_token(directory)
+        if not token:
+            return False
+        # The coordinator fences this exact empty revision and rejects any
+        # outstanding cleanup. No sessions are queued for termination.
+        remote_client.call(host, {"method": "workspace.kill", "workspace": name,
+                                  "revision": state["revision"], "lease_token": token})
+        return True
+
+
 def attach_remote(name, host, create_empty=False, appearance=None, new_instance=False):
     directory = state_dir(name, host)
     executable = shutil.which("kzw-pane")
@@ -2008,25 +2047,33 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
         stop_heartbeat = lambda: None
         appearance_arg = {"appearance": appearance} if appearance is not None else {}
         run_arg = {"new_instance": True} if new_instance else {}
+
+        def run_attached(**kwargs):
+            result = run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg, **run_arg, **kwargs)
+            if result == 0:
+                try:
+                    if retire_empty_coordinator_workspace(directory, name, host):
+                        print(f"Workspace {name!r} is empty; retirement scheduled")
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    print(f"kzw: empty workspace retirement deferred: {exc}", file=sys.stderr, flush=True)
+            return result
+
         try:
             stop_heartbeat = remote_client.start_lease_heartbeat(directory)
             if recovering_managed:
                 if create_empty:
                     raise ValueError("a pane creation is already pending")
                 recover_remote_managed_creation(directory, name, host, executable)
-                return run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg, **run_arg)
+                return run_attached()
             if recovering_bootstrap:
                 if create_empty:
                     raise ValueError("a bootstrap is already pending; attach to recover it")
                 if reconcile_bootstrap_commit(directory, name, host, executable):
-                    return run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg, **run_arg)
+                    return run_attached()
                 session = recover_bootstrap(directory, name, host, executable)
-                return run(name, host, remote_attached=True, existing_lock=lock, bootstrap_session=session,
-                           **appearance_arg, **run_arg)
+                return run_attached(bootstrap_session=session)
             remote_client.pull(directory, name, host, executable)
-            return (run(name, host, remote_attached=True, existing_lock=lock, create_empty=True,
-                        **appearance_arg, **run_arg) if create_empty else
-                    run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg, **run_arg))
+            return run_attached(create_empty=True) if create_empty else run_attached()
         finally:
             stop_heartbeat()
             try:
@@ -2215,10 +2262,11 @@ def main():
     local_attach.add_argument("pane")
     queue_parser = commands.add_parser("_queue", help=argparse.SUPPRESS)
     queue_parser.add_argument("--host", default="")
-    sessions_parser = commands.add_parser("sessions", help="select a session from a workspace on this host")
+    sessions_parser = commands.add_parser("sessions", help="select a local or remote workspace session")
     sessions_commands = sessions_parser.add_subparsers(dest="sessions_command", required=True)
-    sessions_list = sessions_commands.add_parser("list", help="select a local zmx session to attach")
+    sessions_list = sessions_commands.add_parser("list", help="select a workspace zmx session to attach")
     sessions_list.add_argument("name")
+    sessions_list.add_argument("--host", default="", help="workspace origin SSH host")
     sessions_commands.add_parser("bash-hook", help="print the optional Bash command-tracking hook")
     sessions_record = sessions_commands.add_parser("_record", help=argparse.SUPPRESS)
     sessions_record.add_argument("pane")
@@ -2359,7 +2407,7 @@ def main():
                 record(args.pane, args.pid, sys.stdin.read(16384))
                 return 0
             from .sessions import list_and_attach
-            return list_and_attach(args.name)
+            return list_and_attach(args.name, args.host)
         if args.command == "start":
             if not args.host:
                 directory = state_dir(args.name)

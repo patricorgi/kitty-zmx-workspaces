@@ -56,9 +56,18 @@ class RemoteClientTests(unittest.TestCase):
         config = {"workspace": "Test", "host": "", "revision": 4, "state_home": ""}
         (directory / "remote.json").write_text(json.dumps(config))
         (directory / "workspace.kitty-session").write_text("old layout")
-        remote_client.create(directory, "Test", "")
+        (directory / "local-tab-owner").write_text("b" * 32)
+        (directory / "exit-backups").mkdir()
+        (directory / "exit-backups" / "revision-4.kitty-session").write_text("backup")
+        with patch("kzw.local_tabs.request", return_value={"tab": {"pane": PANE}}):
+            with self.assertRaisesRegex(ValueError, "local companion"):
+                remote_client.create(directory, "Test", "")
+        with patch("kzw.local_tabs.request", return_value={"tab": None}):
+            remote_client.create(directory, "Test", "")
         archive, = directory.glob(".retired-*")
         self.assertEqual((archive / "workspace.kitty-session").read_text(), "old layout")
+        self.assertEqual((archive / "exit-backups" / "revision-4.kitty-session").read_text(), "backup")
+        self.assertEqual((archive / "local-tab-owner").read_text(), "b" * 32)
         self.assertEqual(json.loads((archive / "remote.json").read_text()), config)
         self.assertEqual(json.loads((directory / "remote.json").read_text())["revision"], 6)
 
