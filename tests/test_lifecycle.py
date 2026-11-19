@@ -40,7 +40,7 @@ class FakeKitty:
         self.active, self.focused = tab_id, window_id
 
     def tree(self):
-        return [{"last_focused": True, "tabs": [{"id": tab["id"], "is_active": tab["id"] == self.active,
+        return [{"id": 1, "last_focused": True, "tabs": [{"id": tab["id"], "is_active": tab["id"] == self.active,
                  "windows": [{"id": w["id"], "is_active": w["id"] == self.focused,
                               "user_vars": {"kzw_pane": w["pane"], "kzw_host": "fake-host"}}
                              for w in tab["windows"]]} for tab in self.tabs]}]
@@ -59,8 +59,8 @@ class FakeKitty:
     def query(self, socket, *args):
         if args == ("ls",):
             return json.dumps(self.tree())
-        if args == ("ls", "--output-format=session"):
-            return self.export()
+        if args[0] == "kitten" and args[-1] == "--with-tree":
+            return json.dumps({"tree": self.tree(), "session": self.export(), "os_window_id": 1})
         if args[:2] == ("focus-window", "--match"):
             self.focused = int(args[2].split(":")[1])
             self.active = next(t["id"] for t in self.tabs if any(w["id"] == self.focused for w in t["windows"]))

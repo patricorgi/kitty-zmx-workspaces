@@ -44,23 +44,12 @@ def snapshot_for_exit(directory, executable, tree):
     """Capture the current complete layout and identities in one Kitty callback."""
     from . import cli
     mapping, views = pane_map(tree), windows(tree)
-    if len(tree) != 1 or type(tree[0].get("id")) is not int:
-        raise ValueError("ambiguous workspace view during exit capture")
-    os_id = tree[0]["id"]
-    kitten = str(Path(__file__).with_name("scoped_session_kitten.py"))
-    response = json.loads(cli.view_query(directory, "kitten", "--match", "id:" + str(next(iter(mapping))),
-                                         kitten, str(os_id), "--with-tree"))
-    current = response.get("tree") if isinstance(response, dict) else None
-    if (not isinstance(current, list) or len(current) != 1 or not isinstance(current[0], dict) or
-            current[0].get("id") != os_id or response.get("os_window_id") != os_id or
-            not isinstance(response.get("session"), str)):
-        raise ValueError("invalid atomic exit snapshot")
+    current, session = cli.scoped_snapshot(directory, tree)
     if pane_map(current) != mapping or windows(current) != views:
         raise ValueError("workspace view changed while preparing exit removal")
-    current[0]["last_focused"] = True
     focus = focused_pane(current)
     return FOCUS_PREFIX + json.dumps({"pane": focus}, separators=(",", ":")) + "\n" + rewrite_export(
-        response["session"], mapping, executable)
+        session, mapping, executable)
 
 
 def synchronize(directory, executable, locked=False):

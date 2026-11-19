@@ -364,7 +364,7 @@ class RemoteClientTests(unittest.TestCase):
         remote_client.reserve_pane(directory, second, operation)
         (directory / "panes.json").write_text(json.dumps([PANE]))
         (directory / "pending-create.json").write_text(json.dumps({"pane": second, "host": "origin", "request_id": operation}))
-        tree = [{"last_focused": True, "tabs": [{"is_active": True, "windows": [
+        tree = [{"id": 1, "last_focused": True, "tabs": [{"is_active": True, "windows": [
             {"id": 1, "is_active": True, "user_vars": {"kzw_pane": PANE, "kzw_host": "origin"}},
             {"id": 2, "is_active": False, "user_vars": {"kzw_pane": second, "kzw_host": "origin"}},
         ]}]}]
@@ -372,7 +372,8 @@ class RemoteClientTests(unittest.TestCase):
                   "launch 'kitty-unserialize-data={\"id\":1}'\n"
                   "launch 'kitty-unserialize-data={\"id\":2}'\n")
         def kitty(socket, *args):
-            return export if args == ("ls", "--output-format=session") else json.dumps(tree)
+            return (json.dumps(tree) if args == ("ls",) else
+                    json.dumps({"tree": tree, "session": export, "os_window_id": 1}))
         listing = subprocess.CompletedProcess([], 0, PANE + "\n" + second + "\n", "")
         which = shutil.which
         with patch("kzw.cli.state_dir", return_value=directory), \
@@ -400,12 +401,13 @@ class RemoteClientTests(unittest.TestCase):
         self.assertIn("'/a path/kzw-pane' --pane " + PANE, session.read_text())
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["reservations"], [PANE])
         mark_bootstrap_launching(directory)
-        tree = [{"last_focused": True, "tabs": [{"is_active": True, "windows": [
+        tree = [{"id": 1, "last_focused": True, "tabs": [{"is_active": True, "windows": [
             {"id": 1, "is_active": True, "user_vars": {"kzw_pane": PANE, "kzw_host": "origin"}},
         ]}]}]
         export = "new_tab Test\nlayout splits\nlaunch 'kitty-unserialize-data={\"id\":1}'\n"
         def kitty(socket, *args):
-            return export if args == ("ls", "--output-format=session") else json.dumps(tree)
+            return (json.dumps(tree) if args == ("ls",) else
+                    json.dumps({"tree": tree, "session": export, "os_window_id": 1}))
         with patch("kzw.cli.query", side_effect=kitty), patch("kzw.cli.zmx_command", return_value=""):
             with self.assertRaisesRegex(ValueError, "waiting"):
                 finish_bootstrap(directory, "/a path/kzw-pane")

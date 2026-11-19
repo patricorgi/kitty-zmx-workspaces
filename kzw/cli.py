@@ -619,24 +619,48 @@ def recover_remote_managed_creation(directory, name, host, executable):
     return True
 
 
+def scoped_snapshot(directory, tree):
+    """Use the initial listing to address one atomic Kitty capture."""
+    if len(tree) != 1 or type(tree[0].get("id")) is not int:
+        raise ValueError("ambiguous workspace view during snapshot")
+    os_id = tree[0]["id"]
+    anchor = next(iter(pane_map(tree)))
+    kitten = str(Path(__file__).with_name("scoped_session_kitten.py"))
+    response = json.loads(view_query(directory, "kitten", "--match", f"id:{anchor}", kitten, str(os_id), "--with-tree"))
+    current = response.get("tree") if isinstance(response, dict) else None
+    if (not isinstance(current, list) or len(current) != 1 or not isinstance(current[0], dict) or
+            current[0].get("id") != os_id or response.get("os_window_id") != os_id or
+            not isinstance(response.get("session"), str)):
+        raise ValueError("invalid atomic workspace snapshot")
+    current[0]["last_focused"] = True
+    return current, response["session"]
+
+
+def write_snapshot_if_changed(path, text):
+    try:
+        info = path.lstat()
+        if (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and path.read_text() == text):
+            return
+    except (FileNotFoundError, UnicodeError):
+        pass
+    atomic_write(path, text)
+
+
 def capture_locked(directory, executable, allow_removals=False, expected_panes=None, confirmed_exits=False, confirmed_close=False, close_panes=None):
     if (directory / "pending-exit.json").exists():
         raise ValueError("an acknowledged exit is awaiting view cleanup; snapshot deferred")
     before_tree = json.loads(view_query(directory, "ls"))
     before = pane_map(before_tree)
-    focus = focused_pane(before_tree)
-    export = view_query(directory, "ls", "--output-format=session")
-    after_tree = json.loads(view_query(directory, "ls"))
+    after_tree, export = scoped_snapshot(directory, before_tree)
     after = pane_map(after_tree)
-    if before != after or focus != focused_pane(after_tree):
+    focus = focused_pane(after_tree)
+    if before != after:
         raise ValueError("panes or focus changed while taking snapshot")
     if expected_panes is not None and after != expected_panes:
         raise ValueError("unexpected pane change while saving a close; refusing cleanup")
     snapshot = FOCUS_PREFIX + json.dumps({"pane": focus}, separators=(",", ":")) + "\n"
     snapshot += rewrite_export(export, after, executable)
-    # Layout itself can change without the window IDs changing.
-    if view_query(directory, "ls", "--output-format=session") != export:
-        raise ValueError("layout changed while taking snapshot")
     target = directory / "workspace.kitty-session"
     metadata = directory / "panes.json"
     old = set(json.loads(metadata.read_text())) if metadata.exists() else set()
@@ -655,9 +679,10 @@ def capture_locked(directory, executable, allow_removals=False, expected_panes=N
                 live_by_host[host] = set(zmx_command(host, "list", "--short").splitlines())
             if pane not in live_by_host[host]:
                 raise ValueError("new pane session is missing or not yet ready")
-        if added and (pane_map(json.loads(view_query(directory, "ls"))) != after or
-                      view_query(directory, "ls", "--output-format=session") != export):
-            raise ValueError("layout changed while taking snapshot")
+        if added:
+            latest, latest_export = scoped_snapshot(directory, after_tree)
+            if pane_map(latest) != after or latest_export != export or focused_pane(latest) != focus:
+                raise ValueError("layout changed while taking snapshot")
     if (directory / "remote.json").exists():
         if allow_removals and not (confirmed_exits or confirmed_close):
             raise ValueError("remote workspace removal is not yet supported; no snapshot was saved")
@@ -667,8 +692,8 @@ def capture_locked(directory, executable, allow_removals=False, expected_panes=N
         remote_client.publish(directory, snapshot, [pane for pane, _ in after.values()], **kwargs)
     # IDs are also embedded in the session, so a failed metadata write cannot
     # cause a partially written Kitty session.
-    atomic_write(target, snapshot)
-    atomic_write(metadata, json.dumps(sorted(pane for pane, _ in after.values())) + "\n")
+    write_snapshot_if_changed(target, snapshot)
+    write_snapshot_if_changed(metadata, json.dumps(sorted(current)) + "\n")
     remove_native_journals(journals)
     stage = directory / "native-stage.json"
     if stage.is_file() and not stage.is_symlink():

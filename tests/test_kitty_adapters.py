@@ -18,6 +18,8 @@ def load_adapter(name, path=None, native_loader=False):
     native.os_window_font_size = Mock(return_value=14.5)
     native.cocoa_minimize_os_window = Mock()
     native.focus_os_window = Mock()
+    native.add_timer = Mock()
+    native.remove_timer = Mock()
     with patch.dict(sys.modules, {"kittens": types.ModuleType("kittens"), "kittens.tui": types.ModuleType("kittens.tui"),
                                   "kittens.tui.handler": handler, "kitty": types.ModuleType("kitty"),
                                   "kitty.session": session, "kitty.fast_data_types": native}):

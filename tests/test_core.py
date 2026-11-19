@@ -17,7 +17,7 @@ B = "kzw-" + "b" * 32
 
 
 def tree():
-    return [{"last_focused": True, "tabs": [{"is_active": True, "windows": [
+    return [{"id": 1, "last_focused": True, "tabs": [{"is_active": True, "windows": [
         {"id": 7, "is_active": True, "user_vars": {"kzw_pane": A, "kzw_host": ""}},
         {"id": 8, "is_active": False, "user_vars": {"kzw_pane": B, "kzw_host": "dev.example"}},
     ]}]}]
@@ -26,6 +26,13 @@ def tree():
 def launch(window_id, extra=""):
     metadata = json.dumps({"id": window_id, "cmd_at_shell_startup": "rm -rf never"})
     return shlex.join(["launch", "kitty-unserialize-data=" + metadata, "--cwd=/some path", "--var=example=yes", *shlex.split(extra)])
+
+
+def snapshot_reply(args, current, export):
+    if args == ("ls",):
+        return json.dumps(current)
+    assert args[-1] == "--with-tree", args
+    return json.dumps({"tree": current, "session": export, "os_window_id": current[0]["id"]})
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -121,7 +128,7 @@ class WorkspaceTests(unittest.TestCase):
         current[0]["tabs"][0]["windows"].pop()
         export = launch(7) + "\n"
         def query(_socket, *args):
-            return export if "--output-format=session" in args else json.dumps(current)
+            return snapshot_reply(args, current, export)
         with tempfile.TemporaryDirectory() as directory, patch("kzw.cli.query", side_effect=query):
             path = Path(directory)
             (path / "panes.json").write_text(json.dumps([A, B]))
@@ -133,8 +140,9 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_capture_refuses_racing_layout(self):
         with tempfile.TemporaryDirectory() as directory:
-            responses = [json.dumps(tree()), launch(7) + "\n" + launch(8),
-                         json.dumps(tree()), launch(7) + "\n" + launch(8) + "\nfocus"]
+            changed = tree()
+            changed[0]["tabs"][0]["windows"].pop()
+            responses = [json.dumps(tree()), snapshot_reply(("--with-tree",), changed, launch(7))]
             with patch("kzw.cli.query", side_effect=responses):
                 with self.assertRaises(ValueError):
                     capture(Path(directory), "/bin/kzw-pane")
@@ -146,12 +154,42 @@ class WorkspaceTests(unittest.TestCase):
         current[0]["tabs"][0]["windows"][1]["is_active"] = True
         export = launch(7) + "\n" + launch(8)
         def query(_socket, *args):
-            return export if "--output-format=session" in args else json.dumps(current)
+            return snapshot_reply(args, current, export)
         with tempfile.TemporaryDirectory() as directory, patch("kzw.cli.query", side_effect=query), \
              patch("kzw.cli.zmx_command", return_value=A + "\n" + B + "\n"):
             capture(Path(directory), "/bin/kzw-pane")
             text = (Path(directory) / "workspace.kitty-session").read_text()
             self.assertEqual(saved_focus(text), B)
+
+    def test_steady_capture_uses_two_kitty_commands_and_does_not_write(self):
+        current = tree()
+        export = launch(7) + "\n" + launch(8)
+        def raw(command, **kwargs):
+            args = tuple(command[4:])
+            return types.SimpleNamespace(stdout=snapshot_reply(args, current, export))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            atomic_write(path / "panes.json", json.dumps([A, B]) + "\n")
+            with patch("kzw.cli.subprocess.run", side_effect=raw) as run:
+                capture(path, "/bin/kzw-pane")
+                run.reset_mock()
+                with patch("kzw.cli.atomic_write") as write:
+                    self.assertEqual(capture(path, "/bin/kzw-pane"), 2)
+                    write.assert_not_called()
+                self.assertEqual([call.args[0][4] for call in run.call_args_list], ["ls", "kitten"])
+
+    def test_new_pane_capture_rechecks_layout_after_listing_zmx(self):
+        current = tree()
+        export = launch(7) + "\n" + launch(8)
+        responses = [json.dumps(current), snapshot_reply(("--with-tree",), current, export),
+                     snapshot_reply(("--with-tree",), current, export + "\nfocus_tab 1")]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("kzw.cli.query", side_effect=responses), \
+             patch("kzw.cli.zmx_command", return_value=A + "\n" + B + "\n"):
+            path = Path(directory)
+            with self.assertRaisesRegex(ValueError, "layout changed"):
+                capture(path, "/bin/kzw-pane")
+            self.assertFalse((path / "workspace.kitty-session").exists())
 
     def test_local_capture_preserves_native_journal_until_session_is_confirmed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -165,7 +203,7 @@ class WorkspaceTests(unittest.TestCase):
             journal.write_text(json.dumps({"pane": B, "host": "dev.example", "workspace": "Test"}))
             export = launch(7) + "\n" + launch(8)
             def kitty(_socket, *args):
-                return export if "--output-format=session" in args else json.dumps(tree())
+                return snapshot_reply(args, tree(), export)
             with patch("kzw.cli.query", side_effect=kitty), patch("kzw.cli.zmx_command", return_value=""):
                 with self.assertRaisesRegex(ValueError, "not yet ready"):
                     capture(path, "/bin/kzw-pane")
@@ -339,7 +377,7 @@ class WorkspaceTests(unittest.TestCase):
         current = tree()
         export = launch(7) + "\n" + launch(8)
         def query(_socket, *args):
-            return export if "--output-format=session" in args else json.dumps(current)
+            return snapshot_reply(args, current, export)
         with tempfile.TemporaryDirectory() as directory, patch("kzw.cli.query", side_effect=query):
             with self.assertRaises(ValueError):
                 capture_locked(Path(directory), "/bin/kzw-pane", allow_removals=True, expected_panes={7: (A, "")})
