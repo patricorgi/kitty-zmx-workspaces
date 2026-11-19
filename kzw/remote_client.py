@@ -47,7 +47,7 @@ class LeaseBusy(BlockingIOError):
     pass
 
 
-def ssh_command(host):
+def ssh_command(host, *, allow_configured_master=False):
     bridge.check_host(host)
     state_override = os.environ.get("KZW_REMOTE_STATE_HOME", "")
     if state_override and (not state_override.startswith("/") or "\x00" in state_override):
@@ -65,8 +65,13 @@ def ssh_command(host):
                     "exec(base64.b64decode(os.environ['KZW_COORDINATOR_SOURCE']))") % source.decode()
         program = "exec python3 -u -c " + shlex.quote(fallback)
     command = ("export XDG_STATE_HOME=" + shlex.quote(state_override) + "; " if state_override else "") + program
-    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            "-o", "ControlMaster=no", "-o", "ControlPersist=no", "-o", "ControlPath=none", host, command]
+    options = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+               "-o", "ControlMaster=no", "-o", "ControlPersist=no"]
+    if allow_configured_master:
+        options += ["-o", "ClearAllForwardings=yes"]
+    else:
+        options += ["-o", "ControlPath=none"]
+    return [*options, host, command]
 
 
 def coordinator_command(host):
@@ -165,6 +170,16 @@ def persistent_rpc(*, reuse=False):
         _local.connection_health = previous_health
 
 
+@contextmanager
+def reuse_configured_ssh_once(host):
+    previous = getattr(_local, "shared_startup_host", None)
+    _local.shared_startup_host = host if host and os.environ.get("KZW_ATTACH_REUSE_SSH") != "0" else None
+    try:
+        yield
+    finally:
+        _local.shared_startup_host = previous
+
+
 def decode_response(data):
     try:
         response = json.loads(data)
@@ -205,7 +220,12 @@ def direct_call(host, request, *, timeout=None):
     with _channel_lock:
         network.require(host)
         if key not in channels:
-            channels[key] = Channel(coordinator_command(host))
+            if host and host == getattr(_local, "shared_startup_host", None):
+                _local.shared_startup_host = None
+                command = ssh_command(host, allow_configured_master=True)
+            else:
+                command = coordinator_command(host)
+            channels[key] = Channel(command)
         health = getattr(_local, "connection_health", None)
         if health is not None:
             health.begin("rpc", channels[key], 8, threading.Event())

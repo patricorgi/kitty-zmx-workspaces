@@ -174,6 +174,8 @@ def workspace_context(name, directory, host="", remote_attached=False, rpc_socke
     }
     if rpc_socket:
         env["KZW_RPC_SOCKET"] = str(rpc_socket)
+    if os.environ.get("XDG_CACHE_HOME"):
+        env["XDG_CACHE_HOME"] = os.environ["XDG_CACHE_HOME"]
     if host and os.environ.get("KZW_SSH_KITTEN") == "1":
         env["KZW_SSH_KITTEN"] = "1"
     if os.environ.get("KZW_DEBUG") == "1":
@@ -2086,7 +2088,8 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
             record = json.loads(pending.read_text())
             recovering_bootstrap = record.get("kind") == "bootstrap"
             recovering_managed = not recovering_bootstrap
-        remote_client.acquire_lease(directory, name, host)
+        with remote_client.reuse_configured_ssh_once(host):
+            remote_client.acquire_lease(directory, name, host)
         stop_heartbeat = lambda: None
         appearance_arg = {"appearance": appearance} if appearance is not None else {}
         run_arg = {"new_instance": True} if new_instance else {}

@@ -49,6 +49,20 @@ class RemoteClientTests(unittest.TestCase):
             self.assertEqual(remote_client.coordinator_command("origin"), ["ssh", "origin"])
             ssh.assert_called_once_with("origin")
 
+    def test_attach_reuses_a_configured_master_only_for_the_initial_channel(self):
+        request = {"method": "workspace.get", "workspace": "Test"}
+        with patch.dict("os.environ", {"KZW_ATTACH_REUSE_SSH": "1"}), \
+                remote_client.persistent_rpc(), remote_client.reuse_configured_ssh_once("origin"), \
+                patch("kzw.network.require"), patch("kzw.remote_client.Channel") as channel:
+            channel.return_value.request.side_effect = [OSError("lost response"), {"exists": True}]
+            with self.assertRaisesRegex(OSError, "lost response"):
+                remote_client.direct_call("origin", request)
+            self.assertEqual(channel.call_count, 1)
+            self.assertNotIn("ControlPath=none", channel.call_args.args[0])
+            self.assertIn("ControlMaster=no", channel.call_args.args[0])
+            self.assertEqual(remote_client.direct_call("origin", request), {"exists": True})
+            self.assertIn("ControlPath=none", channel.call_args.args[0])
+
     def test_recreate_archives_retired_cache_without_overwriting_it(self):
         directory = self.root / "client"
         directory.mkdir()

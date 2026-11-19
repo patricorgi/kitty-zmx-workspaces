@@ -1,5 +1,6 @@
 """Opt-in cwd inheritance through actual managed tab/split creation."""
 
+import fcntl
 import json
 import os
 import shlex
@@ -127,6 +128,58 @@ class CwdIntegrationTests(unittest.TestCase):
                    for parent, command in [line.split(None, 1)]
                    if parent == str(pid) and command.startswith("ssh -T ") and self.remote_root in command]
         self.assertEqual(len(bridges), 2)
+
+    @unittest.skipUnless(os.environ.get("KZW_RUN_ATTACH_BENCHMARK") == "1", "attach benchmark is opt-in")
+    def test_remote_cold_attach_to_shell_input(self):
+        host, kit = os.environ["KZW_INTEGRATION_HOST"], self.kitty
+        kit.env["KZW_SSH_KITTEN"] = "0"
+        result = kit.kzw("create", "Test", "--attach", "--host", host)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        original = self.wait(self.windows)[0]["user_vars"]["kzw_pane"]
+        with patch.dict(os.environ, kit.env):
+            directory = cli.state_dir("Test", host)
+
+        def detached():
+            with (directory / "lock").open("r") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False
+                return not (directory / "lease.json").exists()
+
+        for attempt, mode in enumerate(("0", "1", "1", "0", "0", "1")):
+            result = kit.kzw("detach", "Test", "--host", host)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.wait(detached)
+            # A fresh private socket path makes this terminal connection cold
+            # without stopping a master that may still have clients.
+            cache = kit.tmp / str(attempt)
+            cache.mkdir(mode=0o700)
+            kit.env["XDG_CACHE_HOME"] = str(cache)
+            kit.env["KZW_ATTACH_REUSE_SSH"] = mode
+            started = time.monotonic()
+            result = kit.kzw("attach", "Test", "--host", host)
+            launch = time.monotonic() - started
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            pane = self.wait(self.windows)[0]
+            self.assertEqual(pane["user_vars"]["kzw_pane"], original)
+            match = f"id:{pane['id']}"
+            token = uuid.uuid4().hex
+            last_send = 0
+
+            def command_ran():
+                nonlocal last_send
+                if token in kit.raw("get-text", "--match", match):
+                    return True
+                if time.monotonic() - last_send >= 0.3:
+                    last_send = time.monotonic()
+                    kit.raw("send-text", "--match", match,
+                            f"printf '%s%s' '{token[:16]}' '{token[16:]}'\r")
+                return False
+
+            self.wait(command_ran)
+            print(f"rpc reuse={mode}: {launch:.2f}s to CLI return, "
+                  f"{time.monotonic() - started:.2f}s to shell input", flush=True)
 
     @unittest.skipUnless(os.environ.get("KZW_RUN_SSH_KITTEN_INTEGRATION") == "1", "SSH kitten benchmark is opt-in")
     def test_remote_ssh_kitten_managed_shell_readiness(self):
