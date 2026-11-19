@@ -73,6 +73,24 @@ class KittenRoutingTests(unittest.TestCase):
                         self.assertNotIn("--origin", command)
                     boss.show_error.assert_not_called()
 
+    def test_create_reuses_only_the_selected_panes_broker_and_transport(self):
+        module = kitten("create")
+        windows, boss = view("origin")
+        windows[0].child = types.SimpleNamespace(environ={
+            "KZW_RPC_SOCKET": "/selected", "KZW_SSH_KITTEN": "1", "UNRELATED": "not copied",
+        })
+        with patch.dict(os.environ, {"KZW_RPC_SOCKET": "/wrong", "KZW_SSH_KITTEN": "wrong"}), \
+                patch.object(module.subprocess, "Popen") as popen:
+            module.handle_result(["kitten", "tab"], None, 7, boss)
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual((env["KZW_WORKSPACE"], env["KZW_WORKSPACE_ORIGIN"],
+                              env["KZW_RPC_SOCKET"], env["KZW_SSH_KITTEN"]),
+                             ("Test", "origin", "/selected", "1"))
+            self.assertNotIn("UNRELATED", env)
+            module.handle_result(["kitten", "tab"], None, 8, boss)
+            self.assertNotIn("KZW_RPC_SOCKET", popen.call_args.kwargs["env"])
+            self.assertNotIn("KZW_SSH_KITTEN", popen.call_args.kwargs["env"])
+
     def test_confirmed_close_freezes_selection_and_routes_to_the_selected_workspace(self):
         module = kitten("close")
         for kind in ("pane", "tab"):

@@ -24,6 +24,14 @@ class SSHTransportTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.env = {"XDG_CACHE_HOME": self.temp.name, "KZW_WORKSPACE": "Test", "KZW_WORKSPACE_ORIGIN": "origin"}
 
+    def test_kitten_keeps_the_prepared_socket_without_owning_it(self):
+        ssh = ["ssh", "-o", "ControlMaster=no", "-o", "ControlPath=/private/socket", "-t", "origin", "exec zmx"]
+        command = ssh_transport.kitten_command(ssh)
+        self.assertEqual(command[:3], ["kitty", "+kitten", "ssh"])
+        self.assertEqual(command[-len(ssh) + 1:], ssh[1:])
+        self.assertIn("share_connections=no", command)
+        self.assertIn("forward_remote_control=no", command)
+
     def test_socket_reuse_and_isolation_use_workspace_origin_and_target_host(self):
         expected = ssh_transport.pane_options("origin", self.env)
         self.assertEqual(expected[:4], ["-o", "ControlMaster=auto", "-o", "ControlPersist=60"])

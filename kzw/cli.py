@@ -174,6 +174,8 @@ def workspace_context(name, directory, host="", remote_attached=False, rpc_socke
     }
     if rpc_socket:
         env["KZW_RPC_SOCKET"] = str(rpc_socket)
+    if host and os.environ.get("KZW_SSH_KITTEN") == "1":
+        env["KZW_SSH_KITTEN"] = "1"
     if os.environ.get("KZW_DEBUG") == "1":
         env["KZW_DEBUG"] = "1"
     if marker is not None:
@@ -1045,7 +1047,11 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
         target_window = next((window for os_window in tree for tab in os_window.get("tabs", [])
                               for window in tab.get("windows", []) if window.get("id") == window_id), None)
         env_context, var_context = workspace_context(
-            name, directory, host, (directory / "remote.json").exists(), marker=view_marker(target_window))
+            name, directory, host, coordinated,
+            rpc_socket=(os.environ.get("KZW_RPC_SOCKET") if coordinated and
+                        os.environ.get("KZW_WORKSPACE") == name and
+                        os.environ.get("KZW_WORKSPACE_ORIGIN", "") == origin else None),
+            marker=view_marker(target_window))
         context_options = (["--var=" + key + "=" + value for key, value in var_context.items()] +
                            ["--env=" + key + "=" + value for key, value in env_context.items()])
         options = ["--type=tab", "--tab-title=..."] if kind == "tab" else ["--next-to", f"id:{window_id}",

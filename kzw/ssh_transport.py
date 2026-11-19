@@ -13,6 +13,14 @@ import time
 from . import network
 
 
+def kitten_command(command):
+    """Use the prepared OpenSSH socket, not the kitten's master/retry policy."""
+    return ["kitty", "+kitten", "ssh",
+            "--kitten", "share_connections=no",
+            "--kitten", "forward_remote_control=no",
+            "--kitten", "remote_kitty=no", *command[1:]]
+
+
 def pane_options(host, env):
     """Return SSH multiplexing options, without changing SSH configuration.
 

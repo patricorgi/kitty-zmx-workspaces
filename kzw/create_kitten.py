@@ -38,7 +38,15 @@ def handle_result(args, answer, target_window_id, boss):
     origin = variables.get("kzw_origin", "" if "kzw_workspace" in variables else os.environ.get("KZW_WORKSPACE_ORIGIN", ""))
     if origin:
         cmd += ["--origin", origin]
+    env = os.environ.copy()
+    child_env = getattr(getattr(window, "child", None), "environ", {})
+    for key in ("KZW_RPC_SOCKET", "KZW_SSH_KITTEN"):
+        env.pop(key, None)
+        if isinstance(child_env, dict) and child_env.get(key):
+            env[key] = child_env[key]
+    env["KZW_WORKSPACE"] = name
+    env["KZW_WORKSPACE_ORIGIN"] = origin
     try:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, env=env)
     except OSError as exc:
         boss.show_error("Cannot create pane", str(exc))

@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -36,12 +37,21 @@ def ready_frame(data, marker, acknowledged=False):
     return output, pending, acknowledged
 
 
+def foreground_group(tty, group):
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+    try:
+        os.tcsetpgrp(tty, group)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 class Attachment:
     def __init__(self, workspace, origin, pane, directory="", *, existing=False):
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.stop = threading.Event()
         self.process = None
+        self.process_group = None
         self.network = network.get()
         self.resumed = self.network.resumes
         self.offline_phase = None
@@ -97,7 +107,7 @@ class Attachment:
             self.set_phase("reconnecting")
             if self.process is not None and self.process.poll() is None:
                 try:
-                    self.process.terminate()
+                    self.signal_child(signal.SIGTERM)
                 except ProcessLookupError:
                     pass
 
@@ -106,12 +116,24 @@ class Attachment:
             if self.process is not None:
                 self.initial_phase = "restoring"
             self.process = None
+            self.process_group = None
             self.direct = True
             self.set_phase("reconnecting")
 
+    def signal_child(self, signum):
+        if self.process_group is not None:
+            os.killpg(self.process_group, signum)
+        elif signum == signal.SIGTERM:
+            self.process.terminate()
+        else:
+            self.process.kill()
+
     def run(self, command, env):
         self.network.require(True)
-        from .ssh_transport import prepare_attachment
+        from .ssh_transport import kitten_command, prepare_attachment
+        use_kitten = (not self.direct and env.get("KZW_SSH_KITTEN") == "1"
+                      and env.get("KITTY_PID") and env.get("KITTY_WINDOW_ID")
+                      and sys.version_info >= (3, 11) and sys.stdin.isatty())
         if self.direct:
             # Bypass a possibly stale master, without stopping or unlinking it.
             tail = command.index("-t")
@@ -142,6 +164,13 @@ class Attachment:
             command = result[0]
         # Keepalive messages belong to this existing transport, not a new poll.
         command = [command[0], "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", *command[1:]]
+        tty, original_group = None, None
+        if use_kitten:
+            tty = sys.stdin.fileno()
+            original_group = os.tcgetpgrp(tty)
+            use_kitten = original_group == os.getpgrp()
+            if use_kitten:
+                command = kitten_command(command)
         with self.lock:
             self.network.require(True)
             if self.wake.is_set():
@@ -149,10 +178,29 @@ class Attachment:
             self.started = time.monotonic()
             self.set_phase(self.initial_phase)
             try:
-                self.process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                options = {"process_group": 0} if use_kitten else {}
+                self.process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                **options)
             except OSError as exc:
                 raise NotStarted(str(exc)) from exc
             process = self.process
+            if use_kitten:
+                self.process_group = process.pid
+                try:
+                    foreground_group(tty, process.pid)
+                    # If it reached the terminal before the handoff, it may
+                    # have been stopped by the kernel's job control.
+                    os.killpg(process.pid, signal.SIGCONT)
+                except OSError:
+                    if process.poll() is None:
+                        self.signal_child(signal.SIGKILL)
+                        process.wait()
+                    foreground_group(tty, original_group)
+                    process.stdout.close()
+                    process.stderr.close()
+                    self.ended()
+                    # A child was spawned; the caller must not replay startup.
+                    raise
 
         def forward():
             from .pane import ssh_diagnostic_visible
@@ -193,20 +241,25 @@ class Attachment:
                     try:
                         process.wait(timeout=1)
                     except subprocess.TimeoutExpired:
-                        process.kill()
+                        self.signal_child(signal.SIGKILL)
                     break
             return subprocess.CompletedProcess(command, process.wait())
         finally:
             if process.poll() is None:
                 try:
-                    process.terminate()
+                    self.signal_child(signal.SIGTERM)
                 except ProcessLookupError:
                     pass
                 try:
                     process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    self.signal_child(signal.SIGKILL)
                     process.wait()
+            if use_kitten:
+                try:
+                    foreground_group(tty, original_group)
+                except OSError:
+                    pass  # Kitty can close the terminal before the child exits.
             thread.join(timeout=1)
             output_thread.join(timeout=1)
             process.stderr.close()
@@ -219,7 +272,7 @@ class Attachment:
             process = self.process
             if process is not None and process.poll() is None:
                 try:
-                    process.terminate()
+                    self.signal_child(signal.SIGTERM)
                 except ProcessLookupError:
                     pass
         self.endpoint.close()

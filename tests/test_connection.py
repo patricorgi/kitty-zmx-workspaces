@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import signal
 import socket
 import sys
 import tempfile
@@ -193,6 +194,23 @@ class AttachmentTests(unittest.TestCase):
                 self.assertTrue(attachment.wake.is_set())
                 self.assertEqual(attachment.phase, "reconnecting")
             finally:
+                attachment.close()
+
+    def test_kitten_retry_signals_the_panes_process_group(self):
+        with patch("kzw.attachment.user_var"), patch("kzw.attachment.os.killpg") as kill:
+            attachment = Attachment("Test", "origin", PANE)
+            child = Mock()
+            child.poll.return_value = None
+            attachment.process = child
+            attachment.process_group = 1234
+            try:
+                attachment.phase = "stalled"
+                attachment.retry()
+                kill.assert_called_once_with(1234, signal.SIGTERM)
+                child.terminate.assert_not_called()
+                self.assertTrue(attachment.direct)
+            finally:
+                attachment.ended()
                 attachment.close()
 
 

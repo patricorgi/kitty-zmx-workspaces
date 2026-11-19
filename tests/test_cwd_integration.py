@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 from kzw import cli, remote_client, shell_cwd
@@ -126,6 +127,56 @@ class CwdIntegrationTests(unittest.TestCase):
                    for parent, command in [line.split(None, 1)]
                    if parent == str(pid) and command.startswith("ssh -T ") and self.remote_root in command]
         self.assertEqual(len(bridges), 2)
+
+    @unittest.skipUnless(os.environ.get("KZW_RUN_SSH_KITTEN_INTEGRATION") == "1", "SSH kitten benchmark is opt-in")
+    def test_remote_ssh_kitten_managed_shell_readiness(self):
+        host = os.environ["KZW_INTEGRATION_HOST"]
+        kit = self.kitty
+        for mode in ("0", "1"):
+            kit.env["KZW_SSH_KITTEN"] = mode
+            result = kit.kzw("create" if mode == "0" else "attach", "Test",
+                             *(["--attach"] if mode == "0" else []), "--host", host)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            anchor = min(self.wait(self.windows), key=lambda w: w["id"])
+            if mode == "1":
+                self.assertEqual(anchor["user_vars"]["kzw_pane"], original)
+            original = anchor["user_vars"]["kzw_pane"]
+
+            def ready(window):
+                match = "id:" + str(window["id"])
+                token = uuid.uuid4().hex
+                last_send = 0
+
+                def command_ran():
+                    nonlocal last_send
+                    if token in kit.raw("get-text", "--match", match):
+                        return True
+                    if time.monotonic() - last_send >= 0.3:
+                        last_send = time.monotonic()
+                        kit.raw("send-text", "--match", match,
+                                f"printf '%s%s' '{token[:16]}' '{token[16:]}'\r")
+                    return False
+
+                self.wait(command_ran)
+                if mode == "1":
+                    def using_kitten():
+                        processes = subprocess.check_output(["ps", "-axo", "ppid=,command="], text=True)
+                        return any(line.lstrip().startswith(str(window["pid"]) + " ")
+                                   and ("+kitten ssh" in line or "kitten ssh" in line)
+                                   for line in processes.splitlines())
+                    self.assertTrue(using_kitten(), "pane became ready without the SSH kitten")
+
+            ready(anchor)
+            for kind in ("tab", "split"):
+                before = {w["id"] for w in self.windows()}
+                started = time.monotonic()
+                kit.raw("kitten", "--match", "id:" + str(anchor["id"]),
+                        str(shared.REPO / "kzw/create_kitten.py"), kind)
+                new = self.wait(lambda: next((w for w in self.windows() if w["id"] not in before), None))
+                ready(new)
+                print(f"kitten={mode}, {kind}: {time.monotonic() - started:.2f}s to shell command", flush=True)
+            result = kit.kzw("detach", "Test", "--host", host)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def cleanup_remote(self, host, root):
         self.windows()
