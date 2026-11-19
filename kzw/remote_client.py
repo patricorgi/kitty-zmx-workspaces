@@ -1,6 +1,5 @@
 """Experimental single-writer remote workspace snapshots over OpenSSH."""
 
-import base64
 import fcntl
 import hashlib
 import json
@@ -20,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .core import PANE, atomic_write, check_name
-from . import network
+from . import bridge, network
 
 DORMANT = "# kzw-dormant-workspace\n"
 ORIGIN = "KZW_ORIGIN"
@@ -49,18 +48,23 @@ class LeaseBusy(BlockingIOError):
 
 
 def ssh_command(host):
-    if not isinstance(host, str) or host.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host):
-        raise ValueError("invalid SSH host")
-    # Ship our stdlib-only RPC handler over SSH; no remote install or TCP
-    # listener is required. Remote state is persistent in its XDG state dir.
-    source = Path(__file__).with_name("remote.py").read_bytes()
-    program = ("import base64,os;os.environ.pop('KZW_LOCAL_COORDINATOR',None);os.environ['KZW_COORDINATOR_SOURCE']=%r;"
-               "exec(base64.b64decode(os.environ['KZW_COORDINATOR_SOURCE']))") % base64.b64encode(source).decode()
+    bridge.check_host(host)
     state_override = os.environ.get("KZW_REMOTE_STATE_HOME", "")
     if state_override and (not state_override.startswith("/") or "\x00" in state_override):
         raise ValueError("KZW_REMOTE_STATE_HOME must be an absolute remote path")
-    command = ("XDG_STATE_HOME=" + shlex.quote(state_override) + " " if state_override else "") + "python3 -u -c " + shlex.quote(program)
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+    source = bridge.encoded_source()
+    if host in bridge.installed_hosts():
+        expected = hashlib.sha256(source).hexdigest()
+        program = ('bridge="$HOME/.local/bin/kzw-bridge"; '
+                   'if [ ! -x "$bridge" ] || [ ! -f "$bridge" ]; then '
+                   "echo 'kzw: ~/.local/bin/kzw-bridge missing or not executable; reinstall it' >&2; exit 127; fi; "
+                   'exec "$bridge" ' + expected)
+    else:
+        fallback = ("import base64,os;os.environ.pop('KZW_LOCAL_COORDINATOR',None);os.environ['KZW_COORDINATOR_SOURCE']=%r;"
+                    "exec(base64.b64decode(os.environ['KZW_COORDINATOR_SOURCE']))") % source.decode()
+        program = "exec python3 -u -c " + shlex.quote(fallback)
+    command = ("export XDG_STATE_HOME=" + shlex.quote(state_override) + "; " if state_override else "") + program
+    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ControlMaster=no", "-o", "ControlPersist=no", "-o", "ControlPath=none", host, command]
 
 
@@ -79,11 +83,24 @@ class Channel:
     def __init__(self, command):
         if command and Path(command[0]).name == "ssh":
             network.require(True)
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, bufsize=0)
+        # A file cannot block the RPC stream if SSH writes diagnostic output.
+        self.stderr = tempfile.TemporaryFile()
+        try:
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=self.stderr, bufsize=0)
+        except BaseException:
+            self.stderr.close()
+            raise
         os.set_blocking(self.process.stdin.fileno(), False)
         os.set_blocking(self.process.stdout.fileno(), False)
         self.buffer = b""
+
+    def disconnected(self):
+        fd = self.stderr.fileno()
+        end = os.fstat(fd).st_size
+        detail = os.pread(fd, 1024, max(0, end - 1024)).decode(errors="replace").strip().splitlines()
+        message = "remote coordinator disconnected; operation outcome may be unknown"
+        return OSError(message + (": " + detail[-1][:500] if detail else ""))
 
     def request(self, request, timeout=30):
         data = (json.dumps(request, separators=(",", ":")) + "\n").encode()
@@ -95,14 +112,17 @@ class Channel:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([], [self.process.stdin], [], remaining)[1]:
                 raise TimeoutError("remote coordinator request timed out")
-            offset += os.write(self.process.stdin.fileno(), data[offset:])
+            try:
+                offset += os.write(self.process.stdin.fileno(), data[offset:])
+            except BrokenPipeError:
+                raise self.disconnected() from None
         while b"\n" not in self.buffer:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
                 raise TimeoutError("remote coordinator response timed out")
             chunk = os.read(self.process.stdout.fileno(), 65536)
             if not chunk:
-                raise OSError("remote coordinator disconnected; operation outcome may be unknown")
+                raise self.disconnected()
             self.buffer += chunk
             if len(self.buffer) > MAX_MESSAGE:
                 raise ValueError("remote coordinator response too large")
@@ -121,6 +141,7 @@ class Channel:
                 self.process.kill()
                 self.process.wait()
         self.process.stdout.close()
+        self.stderr.close()
 
 
 @contextmanager
