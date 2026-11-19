@@ -780,14 +780,14 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_observations_never_authorize_pane_or_layout_removal(self):
         cases = (
-            ("all attachments ended", False, [A, B], [A, B], "", [], None),
-            ("network failure", False, [A, B], [B], OSError("network down"), [], None),
-            ("remote status failure", True, [A, B], [B], "", [], OSError("origin unavailable")),
-            ("last pane missing hint", True, [B], [], "", [B], {"missing": [B]}),
-            ("live session with stale hint", True, [A, B], [], B + "\n", [B], {"missing": []}),
-            ("live detached session", False, [A, B], [B], B + "\n", [], None),
+            ("all attachments ended", False, [A, B], [A, B], "", None),
+            ("network failure", False, [A, B], [B], OSError("network down"), None),
+            ("remote status failure", True, [A, B], [B], "", OSError("origin unavailable")),
+            ("last pane missing", True, [B], [], "", {"missing": [B]}),
+            ("live session", True, [A, B], [], B + "\n", {"missing": []}),
+            ("live detached session", False, [A, B], [B], B + "\n", None),
         )
-        for label, remote, panes, ended, listing, hints, status in cases:
+        for label, remote, panes, ended, listing, status in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory)
                 current = tree()
@@ -806,7 +806,7 @@ class WorkspaceTests(unittest.TestCase):
                      patch("kzw.cli.remote_client.status", **status_args), \
                      patch("kzw.cli.remote_client.publish") as publish, \
                      patch("sys.stdout", new_callable=io.StringIO) as output:
-                    self.assertEqual(synchronize_exits(path, "/bin/kzw-pane", hints), 0)
+                    self.assertEqual(synchronize_exits(path, "/bin/kzw-pane"), 0)
                 self.assertEqual(output.getvalue(), "")
                 self.assertEqual((path / "workspace.kitty-session").read_text(), "complete saved layout\n")
                 self.assertEqual(json.loads((path / "panes.json").read_text()), panes)

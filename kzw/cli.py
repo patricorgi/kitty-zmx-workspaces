@@ -842,7 +842,7 @@ def retire_local_empty(directory):
     return True
 
 
-def synchronize_exits(directory, executable, remote_hint=()):
+def synchronize_exits(directory, executable):
     """Reconcile positive origin exit evidence, never inventory hints alone."""
     from .exits import synchronize
     return synchronize(directory, executable)
@@ -1642,7 +1642,6 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         next_exit_check = 0.0
         remote_signal = directory / "remote-status.changed"
         last_remote_signal = None
-        remote_hint = []
         remote_revision = None
         next_bootstrap = 0.0
         workspace_observed = False
@@ -1713,9 +1712,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                         remote_signal_time = None
                     remote_changed = remote_signal_time != last_remote_signal
                     if remote_changed:
-                        data = json.loads(remote_signal.read_text()) if remote_signal_time is not None else {"missing": []}
-                        remote_hint = data["missing"]
-                        if not isinstance(remote_hint, list) or any(not isinstance(p, str) or not PANE.fullmatch(p) for p in remote_hint):
+                        data = json.loads(remote_signal.read_text()) if remote_signal_time is not None else {}
+                        if not isinstance(data, dict):
                             raise ValueError("invalid remote status notification")
                         remote_revision = data.get("revision")
                         if remote_revision is not None and (type(remote_revision) is not int or remote_revision < 0):
@@ -1726,7 +1724,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                         if remote_revision > config.get("revision", -1) and not config.get("pending"):
                             raise ValueError("remote workspace revision changed; reconnect before changing the view")
                     if remote_changed or signal != last_signal or time.monotonic() >= next_exit_check:
-                        synchronize_exits(directory, pane_executable, remote_hint)
+                        synchronize_exits(directory, pane_executable)
                         next_exit_check = time.monotonic() + 1
                     if signal != last_signal or time.monotonic() >= next_capture:
                         capture(directory, pane_executable)

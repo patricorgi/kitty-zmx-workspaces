@@ -289,8 +289,33 @@ def layout_sessions(snapshot, panes):
     return found
 
 
+class ObservationSampler:
+    """Coalesce monitoring reads, never mutation or cleanup checks."""
+
+    interval = 0.5
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sample = None
+        self.sampled = 0.0
+
+    def get(self, store):
+        with self.lock:
+            env = store.zmx_environment()
+            source = store.inventory_source(env)
+            generation = store.inventory_generation(source)
+            sample = self.sample
+            if (sample is not None and sample["source"] == source and sample["generation"] == generation
+                    and time.monotonic() - self.sampled < self.interval):
+                return sample
+            self.sample = None  # A failed refresh must not serve old data.
+            self.sample = store.sample_observation(env, source, generation)
+            self.sampled = time.monotonic()
+            return self.sample
+
+
 class Store:
-    def __init__(self, path, zmx="zmx"):
+    def __init__(self, path, zmx="zmx", sampler=None):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
@@ -328,6 +353,8 @@ class Store:
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, workspace TEXT NOT NULL,
                 revision INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS workspace_events_by_workspace
+                ON workspace_events(workspace, seq);
             CREATE TABLE IF NOT EXISTS staged_layouts (
                 workspace TEXT PRIMARY KEY, revision INTEGER NOT NULL,
                 snapshot TEXT NOT NULL, panes TEXT NOT NULL
@@ -358,6 +385,7 @@ class Store:
             );
         """)
         self.zmx = zmx
+        self.sampler = sampler
 
     def zmx_environment(self):
         env = os.environ.copy()
@@ -372,6 +400,86 @@ class Store:
                 "executable": shutil.which(self.zmx, path=env["PATH"]) or self.zmx,
                 "socket_selector": selector, "socket_base": os.path.abspath(env[selector] if selector else "/tmp")}
 
+    def inventory_generation(self, source):
+        row = self.db.execute("SELECT generation,source FROM zmx_inventory WHERE singleton=1").fetchone()
+        if row and json.loads(row[1]) != source:
+            raise Conflict("zmx inventory origin changed; retained inventory and layouts require investigation")
+        return row[0] if row else 0
+
+    def query_sessions(self, env):
+        listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
+                                 text=True, env=env, timeout=10, check=True)
+        sessions = listing.stdout.splitlines()
+        if any(not session or "\x00" in session for session in sessions) or len(sessions) != len(set(sessions)):
+            raise ValueError("invalid flattened zmx inventory")
+        return sorted(sessions)
+
+    def record_inventory(self, source, generation, sessions):
+        result = {"generation": generation + 1, "observed_at": time.time(),
+                  "source": source, "sessions": sessions}
+        self.db.execute("INSERT OR REPLACE INTO zmx_inventory VALUES (1,?,?,?,?)",
+                        (result["generation"], result["observed_at"], json.dumps(source), json.dumps(sessions)))
+        return result
+
+    def sample_observation(self, env, source, generation):
+        # A slow monitoring scan must not hold SQLite's write lock or
+        # overwrite an inventory published by a concurrent operation.
+        sessions = self.query_sessions(env)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if self.inventory_generation(source) != generation:
+                raise Conflict("inventory changed while sampling; retry status")
+            result = self.record_inventory(source, generation, sessions)
+            self.db.execute("COMMIT")
+            return result
+        except Exception:
+            rollback(self.db)
+            raise
+
+    def observe_inventory(self):
+        if self.sampler is not None:
+            return self.sampler.get(self)
+        env = self.zmx_environment()
+        source = self.inventory_source(env)
+        return self.sample_observation(env, source, self.inventory_generation(source))
+
+    def workspace_status(self, name, *, sample=None, monitoring=False):
+        statement = "SELECT revision,panes FROM workspaces WHERE name=?"
+        row = self.db.execute(statement, (name,)).fetchone()
+        if row is None:
+            raise ValueError("workspace does not exist")
+        if sample is None:
+            sample = self.observe_inventory() if monitoring else self.read_inventory()
+        panes = set(json.loads(row[1]))
+        live = panes.intersection(sample["sessions"])
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if self.db.execute(statement, (name,)).fetchone() != row:
+                raise Conflict("workspace changed while checking session status")
+            if self.inventory_generation(sample["source"]) != sample["generation"]:
+                raise Conflict("inventory changed while checking session status")
+            seen = {r[0] for r in self.db.execute(
+                "SELECT pane FROM observed_sessions WHERE workspace=?", (name,))}
+            presence = dict(self.db.execute(
+                "SELECT pane,present FROM session_presence WHERE workspace=?", (name,)))
+            for pane in live - seen:
+                self.db.execute("INSERT INTO observed_sessions VALUES (?,?)", (name, pane))
+            seen.update(live)
+            for pane in sorted(panes & seen):
+                present = int(pane in live)
+                if presence.get(pane) != present:
+                    self.db.execute("INSERT OR REPLACE INTO session_presence VALUES (?,?,?)", (name, pane, present))
+                    self.add_event(name, row[0], "session.live" if present else "session.missing",
+                                   {"pane": pane, "inventory_generation": sample["generation"],
+                                    "observed_at": sample["observed_at"], "source": sample["source"],
+                                    "listed_sessions": sample["sessions"]})
+            self.db.execute("COMMIT")
+        except Exception:
+            rollback(self.db)
+            raise
+        return {"revision": row[0], "live": sorted(live), "missing": sorted(panes - live),
+                "confirmed_missing": sorted((panes - live) & seen)}
+
     def read_inventory(self):
         """One full, unprefixed zmx inventory, pinned to its origin namespace.
 
@@ -385,18 +493,8 @@ class Store:
         try:
             env = self.zmx_environment()
             source = self.inventory_source(env)
-            previous = self.db.execute("SELECT generation,source FROM zmx_inventory WHERE singleton=1").fetchone()
-            if previous and json.loads(previous[1]) != source:
-                raise Conflict("zmx inventory origin changed; retained inventory and layouts require investigation")
-            listing = subprocess.run([self.zmx, "list", "--short"], capture_output=True,
-                                     text=True, env=env, timeout=10, check=True)
-            sessions = listing.stdout.splitlines()
-            if any(not session or "\x00" in session for session in sessions) or len(sessions) != len(set(sessions)):
-                raise ValueError("invalid flattened zmx inventory")
-            result = {"generation": previous[0] + 1 if previous else 1, "observed_at": time.time(),
-                      "source": source, "sessions": sorted(sessions)}
-            self.db.execute("INSERT OR REPLACE INTO zmx_inventory VALUES (1,?,?,?,?)",
-                            (result["generation"], result["observed_at"], json.dumps(source), json.dumps(result["sessions"])))
+            generation = self.inventory_generation(source)
+            result = self.record_inventory(source, generation, self.query_sessions(env))
             if own_transaction:
                 self.db.execute("COMMIT")
             return result
@@ -509,19 +607,22 @@ class Store:
                 except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
                     pass  # Only an already-authorized close is retried.
         names = [row[0] for row in self.db.execute("SELECT name FROM workspaces ORDER BY name")]
-        if not names:
-            try:
-                self.read_inventory()
-            except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
-                pass
         for name in names:
             try:
                 if self.db.execute("SELECT 1 FROM cleanup WHERE workspace=?", (name,)).fetchone():
                     self.retry_cleanup(name, unattended=True)
-                status = self.dispatch({"method": "workspace.status", "workspace": name})
-                self.retire_if_empty(name, status)
+                if self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone():
+                    self.retire_if_empty(name, self.workspace_status(name))
             except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
-                # Failure or a concurrent mutation is unknown; retry later.
+                continue
+        try:
+            sample = self.observe_inventory()
+        except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
+            return  # Failure or a concurrent mutation is unknown; retry later.
+        for name in names:
+            try:
+                self.workspace_status(name, sample=sample)
+            except (ValueError, OSError, sqlite3.Error):
                 continue
 
     def retire_if_empty(self, name, status):
@@ -866,7 +967,7 @@ class Store:
                     # A failed zmx listing is an error, never a disappearance.
                     # Poll only after delivering already journaled events.
                     try:
-                        self.dispatch({"method": "workspace.status", "workspace": name})
+                        self.workspace_status(name, monitoring=True)
                     except Conflict:
                         # A concurrent committed layout invalidates only this
                         # status sample; fetch the journal again immediately.
@@ -930,45 +1031,14 @@ class Store:
                 raise ValueError("invalid watch timeout")
             deadline = time.monotonic() + timeout
             while True:
-                current = self.dispatch({"method": "workspace.status", "workspace": name})
+                current = self.workspace_status(name, monitoring=True)
                 if current != known or time.monotonic() >= deadline:
                     if req.get("host_metrics") is True:
                         current["host_metrics"] = HOST_METRICS.get()
                     return current
                 time.sleep(min(0.25, max(0, deadline - time.monotonic())))
         if method == "workspace.status":
-            row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
-            if row is None:
-                raise ValueError("workspace does not exist")
-            panes = set(json.loads(row[1]))
-            inventory = self.read_inventory()
-            live = panes.intersection(inventory["sessions"])
-            self.db.execute("BEGIN IMMEDIATE")
-            try:
-                latest = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
-                if latest != row:
-                    raise Conflict("workspace changed while checking session status")
-                seen = {r[0] for r in self.db.execute(
-                    "SELECT pane FROM observed_sessions WHERE workspace=?", (name,))}
-                presence = {p: present for p, present in self.db.execute(
-                    "SELECT pane,present FROM session_presence WHERE workspace=?", (name,))}
-                for pane in live - seen:
-                    self.db.execute("INSERT INTO observed_sessions VALUES (?,?)", (name, pane))
-                seen.update(live)
-                for pane in sorted(panes):
-                    present = 1 if pane in live else 0
-                    if pane in seen and presence.get(pane) != present:
-                        self.db.execute("INSERT OR REPLACE INTO session_presence VALUES (?,?,?)", (name, pane, present))
-                        self.add_event(name, row[0], "session.live" if present else "session.missing",
-                                       {"pane": pane, "inventory_generation": inventory["generation"],
-                                        "observed_at": inventory["observed_at"], "source": inventory["source"],
-                                        "listed_sessions": inventory["sessions"]})
-                self.db.execute("COMMIT")
-            except Exception:
-                rollback(self.db)
-                raise
-            return {"revision": row[0], "live": sorted(live), "missing": sorted(panes - live),
-                    "confirmed_missing": sorted((panes - live) & seen)}
+            return self.workspace_status(name)
         if method == "cleanup.list":
             rows = self.db.execute("SELECT pane FROM cleanup WHERE workspace=? ORDER BY pane", (name,)).fetchall()
             return {"panes": [r[0] for r in rows]}
@@ -1219,6 +1289,8 @@ LEGACY_WORKSPACE_BUILDS = frozenset((
     "e379b6c6dec43acaaee87693654dd5259f1eb97bf36cb7bb736b23b7214c577f",
     # Installed pre-exit build: same remote workspace protocol.
     "9199b10641d57c7c07a1c278cfe0eb2d02332924a394efe5486c32c46946c37e",
+    # zmx 1.0.1 lifecycle build, before the monitoring-only sampler change.
+    "058a4858843fe23950c986ca848b98c97ded9a30e1861ae6e25a8e18da01d454",
     PRE_LOCAL_EXIT_BUILD,
 ))
 LEGACY_WORKSPACE_METHODS = frozenset((
@@ -1293,10 +1365,11 @@ def serve():
         stopping = threading.Event()
         client_lock = threading.Lock()
         active_clients = [0]
+        sampler = ObservationSampler()
 
         def observe():
             try:
-                store = Store(root / "remote.sqlite3")
+                store = Store(root / "remote.sqlite3", sampler=sampler)
                 try:
                     while not stopping.is_set():
                         store.observe_detached()
@@ -1311,7 +1384,7 @@ def serve():
 
         def handle(client):
             try:
-                store = Store(root / "remote.sqlite3")
+                store = Store(root / "remote.sqlite3", sampler=sampler)
                 try:
                     with client, client.makefile("rb") as stream:
                         while True:

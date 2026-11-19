@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from kzw.remote import Conflict, Store, response, rollback
+from kzw.remote import Conflict, ObservationSampler, Store, response, rollback
 from workspace_fixtures import layout
 
 A = "kzw-" + "a" * 32
@@ -218,6 +218,76 @@ class RemoteStoreTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.store.dispatch({"method": "workspace.status", "workspace": "Test"})
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [A, B])
+
+    def test_observer_and_watch_share_one_scan_across_twelve_workspaces(self):
+        for i in range(12):
+            self.store.dispatch({"method": "workspace.put", "workspace": f"Test{i}", "revision": 0,
+                                 "request_id": "create", "snapshot": "# kzw-dormant-workspace\n", "panes": []})
+        self.store.sampler = ObservationSampler()
+        listing = subprocess.CompletedProcess([], 0, "", "")
+        with patch("kzw.remote.time.monotonic", return_value=1), \
+             patch("kzw.remote.subprocess.run", return_value=listing) as run:
+            self.store.observe_detached()
+            self.store.dispatch({"method": "workspace.watch", "workspace": "Test1", "timeout": 0})
+            run.assert_called_once()
+            self.store.dispatch({"method": "workspace.status", "workspace": "Test1"})
+            self.assertEqual(run.call_count, 2)  # Explicit operations bypass the cache.
+            self.store.dispatch({"method": "workspace.watch", "workspace": "Test1", "timeout": 0})
+            self.assertEqual(run.call_count, 3)  # New generation invalidates the cache.
+
+    def test_slow_observation_holds_no_write_lock_and_cannot_overwrite_newer_scan(self):
+        self.put(panes=[A])
+        path = Path(self.temp.name) / "private" / "state.sqlite"
+        started, release = threading.Event(), threading.Event()
+        sampler = ObservationSampler()
+        token = "a" * 32
+
+        def observe():
+            store = Store(path, sampler=sampler)
+            try:
+                def slow(env):
+                    started.set()
+                    if not release.wait(5):
+                        raise AssertionError("lease or inventory call blocked behind monitoring")
+                    return []
+                with patch.object(store, "query_sessions", side_effect=slow):
+                    return store.workspace_status("Test", monitoring=True)
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            task = executor.submit(observe)
+            try:
+                self.assertTrue(started.wait(5))
+                self.store.db.execute("PRAGMA busy_timeout=100")
+                self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": token})
+                self.assertEqual(self.store.read_inventory()["sessions"], [A, B])
+            finally:
+                release.set()
+            with self.assertRaisesRegex(Conflict, "inventory changed"):
+                task.result(timeout=5)
+        self.assertIsNone(sampler.sample)
+        self.assertFalse(any(e["kind"] == "session.missing" for e in self.store.dispatch(
+            {"method": "workspace.events", "workspace": "Test"})["events"]))
+
+    def test_failed_monitor_refresh_does_not_return_expired_sample(self):
+        self.put(panes=[A])
+        self.store.sampler = ObservationSampler()
+        request = {"method": "workspace.watch", "workspace": "Test", "timeout": 0}
+        with patch("kzw.remote.time.monotonic", return_value=1):
+            self.assertEqual(self.store.dispatch(request)["live"], [A])
+        with patch("kzw.remote.time.monotonic", return_value=2), \
+             patch.object(self.store, "query_sessions", side_effect=OSError("unavailable")):
+            with self.assertRaisesRegex(OSError, "unavailable"):
+                self.store.dispatch(request)
+        self.assertIsNone(self.store.sampler.sample)
+        self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [A])
+
+    def test_events_query_uses_workspace_sequence_index(self):
+        plan = self.store.db.execute(
+            "EXPLAIN QUERY PLAN SELECT seq,revision,kind,data FROM workspace_events "
+            "WHERE workspace=? AND seq>? ORDER BY seq LIMIT ?", ("Test", 0, 100)).fetchall()
+        self.assertTrue(any("workspace_events_by_workspace" in line[-1] for line in plan))
 
     def test_detached_observer_records_absence_without_retiring(self):
         self.put(panes=[A])

@@ -67,16 +67,13 @@ class HostMetricsTests(unittest.TestCase):
             store = remote.Store(Path(tmp) / "coordinator.sqlite")
             self.addCleanup(store.close)
             status = {"revision": 1, "live": [], "missing": [], "confirmed_missing": []}
-            dispatch = store.dispatch
-            def request(req):
-                if req["method"] == "workspace.status":
-                    return dict(status)
-                return dispatch(req)
-            with patch.object(store, "dispatch", side_effect=request), patch.object(remote.HOST_METRICS, "get", return_value={"cpu_percent": 25}) as metrics:
-                ordinary = request({"method": "workspace.watch", "workspace": "Test", "timeout": 0})
+            with patch.object(store, "workspace_status", side_effect=lambda *a, **kw: dict(status)), \
+                    patch.object(remote.HOST_METRICS, "get", return_value={"cpu_percent": 25}) as metrics:
+                ordinary = store.dispatch({"method": "workspace.watch", "workspace": "Test", "timeout": 0})
                 self.assertEqual(ordinary, status)
                 metrics.assert_not_called()
-                sampled = request({"method": "workspace.watch", "workspace": "Test", "known": status, "timeout": 0, "host_metrics": True})
+                sampled = store.dispatch({"method": "workspace.watch", "workspace": "Test", "known": status,
+                                          "timeout": 0, "host_metrics": True})
                 self.assertEqual(sampled.pop("host_metrics"), {"cpu_percent": 25})
                 self.assertEqual(sampled, status)
 
