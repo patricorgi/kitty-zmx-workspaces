@@ -129,16 +129,19 @@ class SessionTests(unittest.TestCase):
     def test_attachment_rechecks_revision_and_session(self):
         state = {"exists": True, "revision": 1, "snapshot": LAYOUT, "panes": [A, B, C]}
         with patch.object(sessions, "coordinator_snapshot", return_value=state), \
-             patch.object(sessions, "choose", return_value=B), \
-             patch.object(sessions, "live_sessions", side_effect=[{A, B}, {A, B}]), \
-             patch.object(sessions.os, "execvpe") as execute:
-            sessions.list_and_attach("Test")
-        self.assertEqual(execute.call_args.args[1], ["zmx", "attach", B, "/bin/false"])
+             patch.object(sessions, "choose", side_effect=[B, A, B, None]) as choose, \
+             patch.object(sessions, "live_sessions", return_value={A, B}), \
+             patch.object(sessions, "run_attachment", side_effect=[0, 0, 7]) as execute:
+             sessions.list_and_attach("Test")
+        self.assertEqual([call.args[0] for call in execute.call_args_list],
+                         [["zmx", "attach", pane, "/bin/false"] for pane in (B, A, B)])
+        self.assertEqual([call.kwargs["previous"] for call in choose.call_args_list], [None, B, A, B])
+        self.assertEqual(choose.call_args.kwargs["notice"], "Attachment ended with status 7.")
 
         with patch.object(sessions, "coordinator_snapshot", side_effect=[state, {**state, "revision": 2}]), \
              patch.object(sessions, "choose", return_value=B), \
              patch.object(sessions, "live_sessions", return_value={A, B}), \
-             patch.object(sessions.os, "execvpe") as execute:
+             patch.object(sessions, "run_attachment") as execute:
             with self.assertRaisesRegex(ValueError, "changed"):
                 sessions.list_and_attach("Test")
             execute.assert_not_called()
@@ -148,7 +151,7 @@ class SessionTests(unittest.TestCase):
         with patch.object(sessions, "coordinator_snapshot", return_value=state), \
              patch.object(sessions, "choose", return_value=None), \
              patch.object(sessions, "live_sessions", return_value={A}), \
-             patch.object(sessions.os, "execvpe") as execute:
+             patch.object(sessions, "run_attachment") as execute:
             self.assertEqual(sessions.list_and_attach("Test"), 0)
             execute.assert_not_called()
 
@@ -161,8 +164,8 @@ class SessionTests(unittest.TestCase):
                                 ((state, {B}, {**source, "uid": 1001}), False),
                                 (({**state, "revision": 2}, {B}, source), False)):
             with self.subTest(latest=latest), \
-                    patch.object(sessions, "remote_selection", side_effect=[initial, latest]), \
-                    patch.object(sessions, "choose", return_value=B), \
+                    patch.object(sessions, "remote_selection", side_effect=[initial, latest, initial]), \
+                    patch.object(sessions, "choose", side_effect=[B, None]), \
                     patch.object(sessions, "attach_on_origin", return_value=0) as attach:
                 if success:
                     self.assertEqual(sessions.list_and_attach("Test", "login"), 0)
@@ -205,7 +208,7 @@ class SessionTests(unittest.TestCase):
                  patch.object(sessions, "coordinator_snapshot", return_value=state), \
                  patch.object(sessions, "choose", return_value=B), \
                  patch.object(sessions, "live_sessions", side_effect=[{B}, second]), \
-                 patch.object(sessions.os, "execvpe") as execute:
+                 patch.object(sessions, "run_attachment") as execute:
                 with self.assertRaises((ValueError, OSError)):
                     sessions.list_and_attach("Test")
                 execute.assert_not_called()

@@ -113,15 +113,14 @@ def process_labels():
     return labels
 
 
-def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=None, preview=None):
+def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=None, preview=None,
+           previous=None, notice=""):
     if not input_stream.isatty() or not output.isatty():
         raise ValueError("session selection requires an interactive terminal")
     panes = [pane for tab in tabs for pane in tab if pane in live]
-    if not panes:
-        raise ValueError("workspace has no available sessions")
     fd = input_stream.fileno()
     saved = termios.tcgetattr(fd)
-    selected = 0
+    selected = panes.index(previous) if previous in panes else 0
     labels = labels or {}
     shortcuts = {pane: str(index) for index, pane in enumerate(panes[:10])}
     try:
@@ -132,13 +131,18 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
             for tab_number, tab in enumerate(tabs, 1):
                 lines.append(f"  Tab {tab_number}")
                 for split_number, pane in enumerate(tab, 1):
-                    marker = ">" if pane == panes[selected] else " "
+                    marker = ">" if panes and pane == panes[selected] else " "
                     status = "" if pane in live else " [unavailable]"
                     process = labels.get(pane, "unknown")
                     shortcut = shortcuts.get(pane, " ")
                     lines.append(f"  {marker} [{shortcut}] Split {split_number} — {process}{status}")
-            help_text = "0–9: attach  ↑/↓: select  Enter: attach  q/Esc: cancel"
-            if preview:
+            if notice:
+                lines.append(notice)
+            if not panes:
+                lines.append("No available sessions.")
+            help_text = ("0–9: attach  ↑/↓: select  Enter: attach  q/Esc: quit"
+                         if panes else "q/Esc: quit")
+            if preview and panes:
                 help_text += "  p: preview"
             output.write("\x1b[H\x1b[2J" + "\r\n".join(lines) + "\r\n\r\n" + help_text + "\r\n")
             output.flush()
@@ -150,6 +154,10 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
                     key += os.read(fd, 1)
                 if key == b"\x1b":
                     return None
+            if key in (b"q", b"\x03", b""):
+                return None
+            if not panes:
+                continue
             if key in (b"\x1b[A", b"k"):
                 selected = (selected - 1) % len(panes)
             elif key in (b"\x1b[B", b"j"):
@@ -169,8 +177,6 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
                 index = key[0] - ord("0")
                 if index < min(10, len(panes)):
                     return panes[index]
-            elif key in (b"q", b"\x03", b""):
-                return None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         output.write("\x1b[?25h\x1b[?1049l")
@@ -223,7 +229,17 @@ def attach_on_origin(host, pane, source):
           '{ echo "kzw: selected session is no longer available" >&2; exit 1; }; '
           f"exec {zmx} attach {pane} /bin/false"
     )
-    os.execvp("ssh", command)
+    return run_attachment(command)
+
+
+def run_attachment(command, env=None):
+    """Give zmx the real terminal, then regain it without intercepting keys."""
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        return subprocess.run(command, env=env, check=False).returncode
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 def display_text(text, limit=100):
@@ -246,42 +262,40 @@ def remote_labels(host, source, live):
     return labels
 
 
-def list_and_attach(name, host=""):
-    if host:
-        check_name(name)
-        if not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host) or host.startswith("-"):
-            raise ValueError("invalid remote host")
-        initial, live, source = remote_selection(name, host)
-        tabs = snapshot_tabs(initial.get("snapshot"), initial.get("panes"))
-        labels = {p: p for tab in tabs for p in tab}
-        if live:
-            try:
-                labels.update(remote_labels(host, source, live))
-            except (OSError, ValueError, subprocess.SubprocessError):
-                pass  # Metadata is advisory.
+def select_remote(name, host, previous, notice):
+    initial, live, source = remote_selection(name, host)
+    tabs = snapshot_tabs(initial.get("snapshot"), initial.get("panes"))
+    labels = {p: p for tab in tabs for p in tab}
+    if live:
+        try:
+            labels.update(remote_labels(host, source, live))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass  # Metadata is advisory.
 
-        def preview(pane):
-            latest, available, current_source = remote_selection(name, host)
-            if (latest.get("revision") != initial.get("revision") or current_source != source or pane not in available):
-                raise ValueError("pane changed during selection")
-            command, _, _ = origin_command(host, source, "history", pane, "--screen")
-            return subprocess.run(command, capture_output=True, text=True, check=True, timeout=10).stdout
+    def preview(pane):
+        latest, available, current_source = remote_selection(name, host)
+        if (latest.get("revision") != initial.get("revision") or current_source != source or pane not in available):
+            raise ValueError("pane changed during selection")
+        command, _, _ = origin_command(host, source, "history", pane, "--screen")
+        return subprocess.run(command, capture_output=True, text=True, check=True, timeout=10).stdout
 
-        pane = choose(name, tabs, live, labels=labels, preview=preview)
-        if pane is None:
-            return 0
-        latest, live, current_source = remote_selection(name, host)
-        if latest.get("revision") != initial.get("revision") or pane not in latest.get("panes", []):
-            raise ValueError("workspace changed during selection; try again")
-        if source != current_source or pane not in live:
-            raise ValueError("selected session origin changed or session is no longer available")
-        return attach_on_origin(host, pane, source)
+    pane = choose(name, tabs, live, labels=labels, preview=preview, previous=previous, notice=notice)
+    if pane is None:
+        return None
+    latest, live, current_source = remote_selection(name, host)
+    if latest.get("revision") != initial.get("revision") or pane not in latest.get("panes", []):
+        raise ValueError("workspace changed during selection; try again")
+    if source != current_source or pane not in live:
+        raise ValueError("selected session origin changed or session is no longer available")
+    return pane, attach_on_origin(host, pane, source)
 
+
+def select_local(name, previous, notice):
     initial = coordinator_snapshot(name)
     tabs = snapshot_tabs(initial.get("snapshot"), initial.get("panes"))
-    pane = choose(name, tabs, live_sessions(), labels=process_labels())
+    pane = choose(name, tabs, live_sessions(), labels=process_labels(), previous=previous, notice=notice)
     if pane is None:
-        return 0
+        return None
     latest = coordinator_snapshot(name)
     if latest.get("revision") != initial.get("revision") or pane not in latest.get("panes", []):
         raise ValueError("workspace changed during selection; try again")
@@ -293,4 +307,17 @@ def list_and_attach(name, host=""):
     env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
     # zmx 0.5 has no attach-only mode. If the session vanishes between the
     # final check and attach, do not start a replacement interactive shell.
-    os.execvpe("zmx", ["zmx", "attach", pane, "/bin/false"], env)
+    return pane, run_attachment(["zmx", "attach", pane, "/bin/false"], env)
+
+
+def list_and_attach(name, host=""):
+    check_name(name)
+    if host and (not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host) or host.startswith("-")):
+        raise ValueError("invalid remote host")
+    previous, notice = None, ""
+    while True:
+        selected = select_remote(name, host, previous, notice) if host else select_local(name, previous, notice)
+        if selected is None:
+            return 0
+        previous, status = selected
+        notice = (f"Attachment ended with status {status}." if status else "")
