@@ -110,6 +110,23 @@ class CwdIntegrationTests(unittest.TestCase):
         subprocess.run(["ssh", "-o", "BatchMode=yes", host, shlex.join(["mkdir", "-p", "--", *paths])], check=True, timeout=20)
         self.check_inheritance(host, paths)
 
+    @unittest.skipUnless(os.environ.get("KZW_RUN_SERVER_INTEGRATION") == "1", "SSH RPC test is opt-in")
+    def test_remote_attachment_reuses_foreground_bridge_for_status(self):
+        host = os.environ["KZW_INTEGRATION_HOST"]
+        result = self.kitty.kzw("create", "Test", "--attach", "--host", host)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with patch.dict(os.environ, self.kitty.env):
+            directory = cli.state_dir("Test", host)
+        self.wait(self.windows)
+        notice = directory / "remote-status.changed"
+        self.wait(notice.is_file)
+        pid = json.loads((directory / "local-tab-capability.json").read_text())["pid"]
+        processes = subprocess.check_output(["ps", "-axo", "ppid=,command="], text=True)
+        bridges = [command for line in processes.splitlines() if line.strip()
+                   for parent, command in [line.split(None, 1)]
+                   if parent == str(pid) and command.startswith("ssh -T ") and self.remote_root in command]
+        self.assertEqual(len(bridges), 2)
+
     def cleanup_remote(self, host, root):
         self.windows()
         # Reservations also cover a failed launch before a pane becomes visible.

@@ -56,6 +56,7 @@ def ssh_command(host):
     if host in bridge.installed_hosts():
         expected = hashlib.sha256(source).hexdigest()
         program = ('bridge="$HOME/.local/bin/kzw-bridge"; '
+                   f'if [ -f "$bridge-{expected}" ]; then bridge="$bridge-{expected}"; fi; '
                    'if [ ! -x "$bridge" ] || [ ! -f "$bridge" ]; then '
                    "echo 'kzw: ~/.local/bin/kzw-bridge missing or not executable; reinstall it' >&2; exit 127; fi; "
                    'exec "$bridge" ' + expected)
@@ -145,9 +146,12 @@ class Channel:
 
 
 @contextmanager
-def persistent_rpc():
+def persistent_rpc(*, reuse=False):
     """Reuse a connection in this thread; one-shot CLI commands stay independent."""
     previous = getattr(_local, "channels", None)
+    if reuse and previous is not None:
+        yield
+        return
     previous_health = getattr(_local, "connection_health", None)
     _local.connection_health = None
     _local.channels = {}
@@ -183,7 +187,7 @@ def call(host, request):
     return direct_call(host, request)
 
 
-def direct_call(host, request):
+def direct_call(host, request, *, timeout=None):
     network.require(host)
     channels = getattr(_local, "channels", None)
     if channels is None:
@@ -206,7 +210,7 @@ def direct_call(host, request):
         if health is not None:
             health.begin("rpc", channels[key], 8, threading.Event())
         try:
-            response = channels[key].request(request)
+            response = channels[key].request(request) if timeout is None else channels[key].request(request, timeout=timeout)
             if health is not None:
                 health.success("rpc")
             return response
@@ -732,7 +736,7 @@ def ensure_current_revision(directory):
         raise ValueError("remote workspace revision changed; reconnect before changing the view")
 
 
-def start_status_monitor(directory, on_metrics=None):
+def start_status_monitor(directory, on_metrics=None, *, share=False):
     """Wake the supervisor when the origin reports an observed session missing."""
     config = json.loads((directory / "remote.json").read_text())
     if config.get("state_home", "") != origin_state_home(config["host"]):
@@ -749,9 +753,82 @@ def start_status_monitor(directory, on_metrics=None):
     gate = network.get() if host else None
     health.bind_network(gate)
     wake = threading.Event()
+    channels = getattr(_local, "channels", None) if share and host else None
+    notified = None
+    next_metrics = 0.0
+
+    def notify(current, next_cursor, metrics):
+        nonlocal notified, next_metrics
+        if (not isinstance(current, dict) or type(current.get("revision")) is not int or
+                not isinstance(current.get("live"), list) or not isinstance(current.get("missing"), list) or
+                not isinstance(current.get("confirmed_missing"), list) or
+                any(not isinstance(p, str) or not PANE.fullmatch(p)
+                    for p in current["live"] + current["missing"] + current["confirmed_missing"]) or
+                not set(current["confirmed_missing"]).issubset(current["missing"])):
+            raise ValueError("invalid workspace status notification")
+        missing = sorted(set(current["confirmed_missing"]))
+        notice = (current["revision"], tuple(missing), next_cursor)
+        if notice != notified:
+            atomic_write(directory / "remote-status.changed",
+                         json.dumps({"missing": missing, "revision": current["revision"],
+                                     "event_cursor": next_cursor, "id": uuid.uuid4().hex}) + "\n")
+            notified = notice
+        health.success("status")
+        if on_metrics is not None and time.monotonic() >= next_metrics:
+            next_metrics = time.monotonic() + 5
+            try:
+                on_metrics(metrics)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+
+    def poll_cached():
+        """Use an idle foreground stream; return False only for an older build."""
+        _local.channels = channels
+        request = {"method": "workspace.status.cached", "workspace": name, "host_metrics": on_metrics is not None}
+        key = (host, origin_state_home(host))
+        while not stop.is_set():
+            if not gate.wait_online(stop):
+                break
+            resumed = gate.resumes
+            if _channel_lock.acquire(blocking=False):
+                try:
+                    if not stop.is_set():
+                        timeout = 2 if key in channels else 4
+                        health.begin("status", None, timeout, wake)
+                        try:
+                            result = direct_call(host, request, timeout=timeout)
+                        except RemoteRejected as exc:
+                            if exc.code == "build_mismatch":
+                                return False
+                            raise
+                    else:
+                        result = None
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    health.failed("status")
+                    result = None
+                finally:
+                    _channel_lock.release()
+                if result is not None:
+                    try:
+                        if not isinstance(result, dict) or "status" not in result:
+                            raise ValueError("invalid cached workspace status")
+                        if result["status"] is None:
+                            health.success("status")  # Connected, but observation is unknown.
+                        else:
+                            next_cursor = result.get("event_cursor")
+                            if type(next_cursor) is not int or next_cursor < 0:
+                                raise ValueError("invalid cached workspace cursor")
+                            notify(result["status"], max(cursor, next_cursor), result.get("host_metrics"))
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        health.failed("status")
+            gate.wait_retry(2, wake, stop, since=resumed)
+            wake.clear()
+        return True
 
     def monitor():
         nonlocal cursor
+        if channels is not None and poll_cached():
+            return
         while not stop.is_set():
             if gate is not None and not gate.wait_online(stop):
                 break
@@ -764,8 +841,7 @@ def start_status_monitor(directory, on_metrics=None):
                     active[0] = channel
                     if stop.is_set():
                         continue
-                known, notified = None, None
-                next_metrics = 0.0
+                known = None
                 while not stop.is_set():
                     if gate is not None and not gate.wait_online(stop):
                         break
@@ -775,14 +851,6 @@ def start_status_monitor(directory, on_metrics=None):
                         request["host_metrics"] = True
                     current = channel.request(request, timeout=15)
                     metrics = current.pop("host_metrics", None) if isinstance(current, dict) else None
-                    if (not isinstance(current, dict) or type(current.get("revision")) is not int or
-                            not isinstance(current.get("live"), list) or not isinstance(current.get("missing"), list) or
-                            not isinstance(current.get("confirmed_missing"), list) or
-                            any(not isinstance(p, str) or not PANE.fullmatch(p)
-                                for p in current["live"] + current["missing"] + current["confirmed_missing"]) or
-                            not set(current["confirmed_missing"]).issubset(current["missing"])):
-                        raise ValueError("invalid workspace status notification")
-                    missing = sorted(set(current["confirmed_missing"]))
                     next_cursor = cursor
                     while not stop.is_set():
                         if gate is not None and not gate.wait_online(stop):
@@ -800,21 +868,9 @@ def start_status_monitor(directory, on_metrics=None):
                             next_cursor = event["seq"]
                         if len(events) < 100:
                             break
-                    notice = (current["revision"], tuple(missing), next_cursor)
-                    if notice != notified:
-                        atomic_write(directory / "remote-status.changed",
-                                     json.dumps({"missing": missing, "revision": current["revision"],
-                                                 "event_cursor": next_cursor, "id": uuid.uuid4().hex}) + "\n")
-                        notified = notice
+                    notify(current, next_cursor, metrics)
                     cursor = next_cursor
                     known = current
-                    health.success("status")
-                    if on_metrics is not None and time.monotonic() >= next_metrics:
-                        next_metrics = time.monotonic() + 5
-                        try:
-                            on_metrics(metrics)
-                        except (OSError, ValueError, subprocess.SubprocessError):
-                            pass  # Display failures must not interrupt lifecycle monitoring.
             except (OSError, ValueError, subprocess.SubprocessError):
                 health.failed("status")
                 if not stop.is_set():
@@ -839,7 +895,7 @@ def start_status_monitor(directory, on_metrics=None):
             channel = active[0]
             if channel is not None and channel.process.poll() is None:
                 channel.process.terminate()
-        thread.join(timeout=3)
+        thread.join(timeout=7)
 
     return close
 

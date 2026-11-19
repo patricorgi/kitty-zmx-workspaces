@@ -53,10 +53,11 @@ def executable(source):
     ).encode()
 
 
-def install(host, enable=True):
+def install(host, enable=True, *, stage=False):
     check_host(host)
     source = encoded_source()
     expected = hashlib.sha256(source).hexdigest()
+    target = "kzw-bridge-" + expected if stage else "kzw-bridge"
     # Stage and validate before replacing the launcher. Existing processes have
     # their own copy of the source and are not restarted or signalled.
     script = (
@@ -64,7 +65,7 @@ def install(host, enable=True):
         'stage=$(mktemp "$dir/.kzw-bridge.XXXXXXXX"); trap \'rm -f -- "$stage"\' EXIT; '
         'cat > "$stage"; chmod 700 "$stage"; '
         f'test "$("$stage" --build)" = {expected}; '
-        'test ! -d "$dir/kzw-bridge"; mv -f -- "$stage" "$dir/kzw-bridge"'
+        f'test ! -d "$dir/{target}"; mv -f -- "$stage" "$dir/{target}"'
     )
     subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, script],
                    input=executable(source), check=True, timeout=30)
@@ -76,13 +77,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("host")
     parser.add_argument("--no-enable", action="store_true", help="install without enabling this SSH host locally")
+    parser.add_argument("--stage", action="store_true", help="install alongside the current bridge for a rolling upgrade")
     args = parser.parse_args()
     try:
-        install(args.host, enable=not args.no_enable)
+        install(args.host, enable=not args.no_enable, stage=args.stage)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"kzw bridge: {exc}", file=sys.stderr)
         return 1
-    print(f"Installed ~/.local/bin/kzw-bridge on {args.host}")
+    print(f"Installed {'versioned ' if args.stage else ''}kzw-bridge in ~/.local/bin on {args.host}")
     return 0
 
 

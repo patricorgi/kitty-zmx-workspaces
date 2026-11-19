@@ -1432,7 +1432,7 @@ def kitty_launch_command(args, env):
     return command + ["--args", "-c", "NONE", *args[1:]]
 
 
-@remote_client.persistent_rpc()
+@remote_client.persistent_rpc(reuse=True)
 def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session=None, create_empty=False,
         appearance=None, new_instance=False):
     directory = state_dir(name, host) if remote_attached else state_dir(name)
@@ -1551,7 +1551,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         display = None
         try:
             display = Display(directory, name, host) if remote_attached else None
-            status_stop = remote_client.start_status_monitor(directory, on_metrics=display.metrics) if remote_attached else lambda: None
+            status_stop = (remote_client.start_status_monitor(directory, on_metrics=display.metrics, share=True)
+                           if remote_attached else lambda: None)
         except Exception:
             if display is not None:
                 display.close()
@@ -2053,6 +2054,7 @@ def retire_empty_coordinator_workspace(directory, name, host):
         return True
 
 
+@remote_client.persistent_rpc()
 def attach_remote(name, host, create_empty=False, appearance=None, new_instance=False):
     directory = state_dir(name, host)
     executable = shutil.which("kzw-pane")

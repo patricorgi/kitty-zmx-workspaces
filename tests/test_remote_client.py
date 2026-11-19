@@ -93,6 +93,64 @@ class RemoteClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             channel.request({"data": "x" * remote_client.MAX_MESSAGE})
 
+    def test_shared_status_skips_busy_stream_and_reuses_foreground_channel(self):
+        directory = self.directory("cached-status")
+        remote_client.save_config(directory, {"host": "origin", "workspace": "Test",
+                                             "state_home": "", "event_cursor": 5})
+        notified, skipped, poll_again = (threading.Event() for _ in range(3))
+        requests = []
+
+        class FakeChannel:
+            def __init__(self, command):
+                pass
+
+            def request(self, request, timeout=30):
+                requests.append(request["method"])
+                if request["method"] == "workspace.status.cached":
+                    return {"status": {"revision": 1, "live": [], "missing": [PANE],
+                                       "confirmed_missing": [PANE]}, "event_cursor": 6}
+                return "foreground"
+
+            def close(self):
+                pass
+
+        class Gate:
+            resumes = 0
+            offline = False
+
+            def subscribe(self, callback):
+                return lambda: None
+
+            def wait_online(self, stop):
+                return not stop.is_set()
+
+            def wait_retry(self, seconds, wake, stop, **kwargs):
+                skipped.set()
+                poll_again.wait(3)
+                wake.wait(0.01)
+
+        with remote_client.persistent_rpc(), patch("kzw.remote_client.Channel", side_effect=FakeChannel) as start, \
+                patch("kzw.network.require"), patch("kzw.network.get", return_value=Gate()), \
+                patch.dict("os.environ", {"KZW_REMOTE_STATE_HOME": ""}):
+            with remote_client._channel_lock:
+                self.assertEqual(remote_client.direct_call("origin", {"method": "workspace.get"}), "foreground")
+                stop = remote_client.start_status_monitor(directory, on_metrics=lambda _: notified.set(), share=True)
+                try:
+                    self.assertTrue(skipped.wait(3))
+                    self.assertEqual(requests, ["workspace.get"])
+                except BaseException:
+                    poll_again.set()
+                    raise
+            try:
+                poll_again.set()
+                self.assertTrue(notified.wait(3))
+                notice = json.loads((directory / "remote-status.changed").read_text())
+                self.assertEqual((notice["event_cursor"], notice["missing"]), (6, [PANE]))
+            finally:
+                stop()
+            self.assertEqual(remote_client.direct_call("origin", {"method": "workspace.get"}), "foreground")
+            start.assert_called_once()
+
     def test_monitor_notifies_only_after_observing_live_session(self):
         directory = self.directory("monitor")
         remote_client.save_config(directory, {"host": "origin", "workspace": "Test", "state_home": ""})

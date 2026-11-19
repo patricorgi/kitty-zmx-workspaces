@@ -43,6 +43,21 @@ class RemoteStoreTests(unittest.TestCase):
         with patch.dict(os.environ, {"XDG_STATE_HOME": self.temp.name, "KZW_LOCAL_COORDINATOR": ""}):
             self.assertEqual(state_root(), Path(self.temp.name) / "kzw")
 
+    def test_cached_status_is_read_only_and_failed_observation_is_unknown(self):
+        self.store.sampler = ObservationSampler()
+        self.put(panes=[A])
+        request = {"method": "workspace.status.cached", "workspace": "Test"}
+        self.assertIsNone(self.store.dispatch(request)["status"])
+        self.store.observe_detached()
+        # In-progress inventory sampling must not block a cached foreground RPC.
+        with self.store.sampler.lock, patch.object(self.store, "query_sessions", side_effect=AssertionError):
+            result = self.store.dispatch(request)
+        self.assertEqual(result["status"]["live"], [A])
+        self.assertGreater(result["event_cursor"], 0)
+        with patch.object(self.store, "observe_inventory", side_effect=OSError("unavailable")):
+            self.store.observe_detached()
+        self.assertIsNone(self.store.dispatch(request)["status"])
+
     def test_dispatch_preserves_original_error_if_rollback_reports_inactive(self):
         self.put(panes=[A])
         connection = self.store.db
@@ -317,6 +332,45 @@ class RemoteStoreTests(unittest.TestCase):
             self.store.dispatch(new)
             self.store.observe_detached()
             self.assertTrue(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
+
+    def test_observer_archives_proven_final_exit_without_client(self):
+        self.put(panes=[A])
+        receipt = {"kind": "zmx-1.0.1-reaped", "pane": A}
+        with patch.dict(os.environ, {"KZW_LOCAL_COORDINATOR": ""}), \
+                patch.object(self.store, "query_sessions", return_value=[]), \
+                patch.object(self.store, "exit_receipts", return_value={A: receipt}) as verify:
+            self.store.observe_detached()
+            self.store.observe_detached()
+        verify.assert_called_once()
+        self.assertEqual(self.store.dispatch({"method": "workspace.list"}), {"workspaces": []})
+        event = self.store.dispatch({"method": "workspace.events", "workspace": "Test"})["events"][-1]
+        self.assertEqual((event["revision"], event["kind"], event["data"]),
+                         (2, "workspace.retired", {"reason": "confirmed_exit", "panes": [A],
+                                                  "exit_receipts": {A: receipt}}))
+        self.assertEqual(self.store.dispatch({"method": "cleanup.list", "workspace": "Test"}), {"panes": []})
+        self.store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "recreate",
+                             "revision": 2, "snapshot": "# kzw-dormant-workspace\n", "panes": []})
+        self.assertEqual(self.store.db.execute("SELECT revision,snapshot,panes FROM retired_exit_layouts").fetchall(),
+                         [(1, layout(A), json.dumps([A]))])
+
+    def test_observer_requires_all_receipts_and_no_active_lease_or_pending_work(self):
+        self.put()
+        token = "a" * 32
+        self.store.dispatch({"method": "workspace.lease.acquire", "workspace": "Test", "token": token})
+        with patch.dict(os.environ, {"KZW_LOCAL_COORDINATOR": ""}), \
+                patch.object(self.store, "query_sessions", return_value=[]), \
+                patch.object(self.store, "exit_receipts", return_value={A: {"pane": A}}) as verify:
+            self.store.observe_detached()
+            verify.assert_not_called()
+            self.store.dispatch({"method": "workspace.lease.release", "workspace": "Test", "token": token})
+            self.store.db.execute("INSERT INTO staged_layouts VALUES ('Test',1,?,?)", (layout(A, B), json.dumps([A, B])))
+            self.store.observe_detached()
+            verify.assert_not_called()
+            self.store.db.execute("DELETE FROM staged_layouts")
+            self.store.observe_detached()
+            verify.assert_called_once()
+        self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["panes"], [A, B])
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM retired_exit_layouts").fetchone(), (0,))
 
     def test_active_lease_prevents_detached_retirement(self):
         self.put(panes=[A])

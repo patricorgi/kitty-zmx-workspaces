@@ -19,6 +19,12 @@ from workspace_fixtures import layout
 @unittest.skipUnless(os.environ.get("KZW_RUN_SERVER_INTEGRATION") == "1", "remote exits test is opt-in")
 class RemoteExitIntegration(unittest.TestCase):
     def test_disconnect_is_retained_but_shell_exit_is_committed(self):
+        self.check_exit(detached=False)
+
+    def test_coordinator_retires_last_shell_exit_without_a_view_or_lease(self):
+        self.check_exit(detached=True)
+
+    def check_exit(self, detached):
         host = os.environ["KZW_INTEGRATION_HOST"]
         root = subprocess.check_output(
             ["ssh", "-o", "BatchMode=yes", host,
@@ -40,6 +46,7 @@ class RemoteExitIntegration(unittest.TestCase):
 
                 def attach(existing=False):
                     command = ('PATH="$HOME/.local/bin:$PATH"; export PATH; unset ZMX_SESSION ZMX_SESSION_PREFIX; ' +
+                               'export XDG_STATE_HOME=' + shlex.quote(root) + '; ' +
                                ('zmx list --short | grep -Fx ' + pane + ' >/dev/null || exit 1; ' if existing else '') +
                                'exec zmx attach ' + pane + ('' if existing else ' /bin/sh'))
                     child = subprocess.Popen(["ssh", "-tt", "-o", "BatchMode=yes", host, command],
@@ -67,10 +74,22 @@ class RemoteExitIntegration(unittest.TestCase):
                 current = next(line for line in zmx_command(host, "list").splitlines() if "name=" + pane + "\t" in line)
                 after = dict(field.split("=", 1) for field in current.strip().split("\t"))
                 self.assertEqual((fields["pid"], fields["created"]), (after["pid"], after["created"]))
+                if detached:
+                    stop()
+                    stop = lambda: None
+                    remote_client.release_lease(directory)
                 resumed = attach(existing=True)
                 # A complete prompt is unnecessary; a shell reads queued input.
                 resumed.stdin.write(b"exit 7\n")
                 resumed.stdin.flush()
+                if detached:
+                    wait_for(lambda: not remote_client.call(host, {"method": "workspace.get", "workspace": "Test"})["exists"])
+                    events = remote_client.call(host, {"method": "workspace.events", "workspace": "Test"})["events"]
+                    event = events[-1]
+                    self.assertEqual((event["kind"], event["data"]["reason"]), ("workspace.retired", "confirmed_exit"))
+                    self.assertEqual(event["data"]["exit_receipts"][pane]["shell_pid"], int(fields["pid"]))
+                    self.assertNotIn(pane, zmx_command(host, "list", "--short").splitlines())
+                    return
                 wait_for(lambda: bool(remote_client.exit_receipts(directory, [pane])))
                 receipt = remote_client.exit_receipts(directory, [pane])
                 self.assertEqual(receipt[pane]["shell_pid"], int(fields["pid"]))

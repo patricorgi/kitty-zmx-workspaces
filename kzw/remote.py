@@ -298,6 +298,16 @@ class ObservationSampler:
         self.lock = threading.Lock()
         self.sample = None
         self.sampled = 0.0
+        # Only the background observer publishes; readers never wait for a scan.
+        self.status_snapshot = (0.0, {}, None)
+
+    def cached_status(self, name, metrics):
+        sampled, statuses, host_metrics = self.status_snapshot
+        if time.monotonic() - sampled > 6 or name not in statuses:
+            return {"status": None}
+        status, cursor = statuses[name]
+        return {"status": status, "event_cursor": cursor,
+                "host_metrics": host_metrics if metrics else None}
 
     def get(self, store):
         with self.lock:
@@ -361,6 +371,11 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS retired_workspaces (
                 name TEXT PRIMARY KEY, revision INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS retired_exit_layouts (
+                name TEXT NOT NULL, revision INTEGER NOT NULL,
+                snapshot TEXT NOT NULL, panes TEXT NOT NULL,
+                PRIMARY KEY (name, revision)
             );
             CREATE TABLE IF NOT EXISTS workspace_kills (
                 workspace TEXT PRIMARY KEY
@@ -560,9 +575,10 @@ class Store:
                 "query_source": self.inventory_source(self.zmx_environment()), "observation": sample,
                 "sessions": sessions, "workspaces": workspaces}
 
-    def exit_receipts(self, panes):
+    def exit_receipts(self, panes, *, sample=None):
         """Origin-side positive evidence; inventory can veto, never authorize."""
-        sample = self.read_inventory()
+        if sample is None:
+            sample = self.read_inventory()
         candidates = set(panes) - set(sample["sessions"])
         if not candidates:
             return {}
@@ -599,7 +615,7 @@ class Store:
         self.db.close()
 
     def observe_detached(self):
-        """Journal status even when no client is connected; never prune here."""
+        """Journal status and finish fully proven remote exits without a view."""
         if os.environ.get("KZW_LOCAL_COORDINATOR") == "1":
             for owner, pane in list(self.db.execute("SELECT owner,pane FROM local_tabs WHERE state='closing'")):
                 try:
@@ -618,37 +634,59 @@ class Store:
         try:
             sample = self.observe_inventory()
         except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
+            if self.sampler is not None:
+                self.sampler.status_snapshot = (0.0, {}, None)
             return  # Failure or a concurrent mutation is unknown; retry later.
+        statuses = {}
         for name in names:
             try:
-                self.workspace_status(name, sample=sample)
-            except (ValueError, OSError, sqlite3.Error):
+                status = self.workspace_status(name, sample=sample)
+                if (os.environ.get("KZW_LOCAL_COORDINATOR") != "1" and not status["live"]
+                        and status["confirmed_missing"] and self.retire_if_empty(name, status, sample=sample)):
+                    continue
+                if self.sampler is not None:
+                    cursor, = self.db.execute("SELECT COALESCE(MAX(seq),0) FROM workspace_events WHERE workspace=?",
+                                              (name,)).fetchone()
+                    statuses[name] = status, cursor
+            except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
                 continue
+        if self.sampler is not None:
+            self.sampler.status_snapshot = (time.monotonic(), statuses, HOST_METRICS.get())
 
-    def retire_if_empty(self, name, status):
-        """Retire an explicitly killed workspace after cleanup and lease release."""
+    def retire_if_empty(self, name, status, *, sample=None):
+        """Finalize an explicit kill or archive a detached layout with proven exits."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            row = self.db.execute("SELECT revision,panes FROM workspaces WHERE name=?", (name,)).fetchone()
+            row = self.db.execute("SELECT revision,snapshot,panes FROM workspaces WHERE name=?", (name,)).fetchone()
             if not row or row[0] != status["revision"]:
                 self.db.execute("COMMIT")
                 return False
-            panes = set(json.loads(row[1]))
+            panes = set(json.loads(row[2]))
             if panes != set(status["confirmed_missing"]) or status["live"]:
                 self.db.execute("COMMIT")
                 return False
-            busy = any(self.db.execute(query, (name,)).fetchone() for query in (
-                "SELECT 1 FROM leases WHERE workspace=? AND expires > strftime('%s','now')",
+            lease = self.db.execute("SELECT expires FROM leases WHERE workspace=?", (name,)).fetchone()
+            busy = (lease and lease[0] > time.time()) or any(self.db.execute(query, (name,)).fetchone() for query in (
                 "SELECT 1 FROM reservations WHERE workspace=?",
                 "SELECT 1 FROM staged_layouts WHERE workspace=?",
                 "SELECT 1 FROM cleanup WHERE workspace=?"))
             killing = self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone()
-            # Inventory describes existence, not permission to discard layout.
-            if not killing or busy:
+            if busy or (not killing and (not panes or sample is None or
+                    self.inventory_generation(sample["source"]) != sample["generation"])):
                 self.db.execute("COMMIT")
                 return False
+            event = {"reason": "managed_kill", "panes": sorted(panes)}
+            if not killing:
+                receipts = self.exit_receipts(panes, sample=sample)
+                if receipts.keys() != panes:
+                    self.db.execute("COMMIT")
+                    return False
+                # Preserve the exact authoritative layout independently of the
+                # retirement tombstone, which a later explicit create consumes.
+                self.db.execute("INSERT INTO retired_exit_layouts VALUES (?,?,?,?)", (name, *row))
+                event.update(reason="confirmed_exit", exit_receipts=receipts)
             revision = row[0] + 1
-            self.add_event(name, revision, "workspace.retired", {"reason": "managed_kill", "panes": sorted(panes)})
+            self.add_event(name, revision, "workspace.retired", event)
             self.db.execute("INSERT OR REPLACE INTO retired_workspaces VALUES (?,?)", (name, revision))
             self.db.execute("DELETE FROM workspace_kills WHERE workspace=?", (name,))
             for table in ("workspaces", "leases", "observed_sessions", "session_presence"):
@@ -773,6 +811,8 @@ class Store:
         name = req.get("workspace", "")
         if not isinstance(name, str) or not NAME.fullmatch(name):
             raise ValueError("invalid workspace")
+        if method == "workspace.status.cached":
+            return self.sampler.cached_status(name, req.get("host_metrics") is True) if self.sampler else {"status": None}
         if method == "workspace.rename":
             return self.rename_workspace(name, req)
         killing = self.db.execute("SELECT 1 FROM workspace_kills WHERE workspace=?", (name,)).fetchone()

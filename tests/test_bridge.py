@@ -34,9 +34,20 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(bridge.installed_hosts(), {"origin"})
         self.assertIn("python3 -u -c", remote_client.ssh_command("other")[-1])
         command = remote_client.ssh_command("origin")[-1]
-        self.assertLess(len(command), 400)
+        self.assertLess(len(command), 500)
         self.assertTrue(command.endswith(hashlib.sha256(bridge.encoded_source()).hexdigest()))
         self.assertFalse(list((self.home / ".local/bin").glob(".kzw-bridge.*")))
+
+    def test_staged_install_preserves_the_previous_launcher(self):
+        path = self.home / ".local/bin/kzw-bridge"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"previous")
+        with patch("kzw.bridge.subprocess.run", side_effect=self.install_locally):
+            bridge.install("origin", stage=True)
+        build = hashlib.sha256(bridge.encoded_source()).hexdigest()
+        self.assertEqual(path.read_bytes(), b"previous")
+        staged = path.with_name(path.name + "-" + build)
+        self.assertEqual(self.run_process([str(staged), "--build"], capture_output=True, text=True).stdout.strip(), build)
 
     def test_failed_validation_preserves_existing_executable_and_config(self):
         with patch("kzw.bridge.subprocess.run", side_effect=self.install_locally):
