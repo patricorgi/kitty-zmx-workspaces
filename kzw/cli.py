@@ -647,10 +647,17 @@ def write_snapshot_if_changed(path, text):
     atomic_write(path, text)
 
 
-def capture_locked(directory, executable, allow_removals=False, expected_panes=None, confirmed_exits=False, confirmed_close=False, close_panes=None):
+def capture_locked(directory, executable, allow_removals=False, **kwargs):
+    tree = capture_tree_locked(directory, executable, allow_removals, **kwargs)
+    return sum(len(tab["windows"]) for window in tree for tab in window["tabs"])
+
+
+def capture_tree_locked(directory, executable, allow_removals=False, *, before_tree=None, expected_panes=None,
+                        confirmed_exits=False, confirmed_close=False, close_panes=None):
     if (directory / "pending-exit.json").exists():
         raise ValueError("an acknowledged exit is awaiting view cleanup; snapshot deferred")
-    before_tree = json.loads(view_query(directory, "ls"))
+    if before_tree is None:
+        before_tree = json.loads(view_query(directory, "ls"))
     before = pane_map(before_tree)
     after_tree, export = scoped_snapshot(directory, before_tree)
     after = pane_map(after_tree)
@@ -658,7 +665,7 @@ def capture_locked(directory, executable, allow_removals=False, expected_panes=N
     if before != after:
         raise ValueError("panes or focus changed while taking snapshot")
     if expected_panes is not None and after != expected_panes:
-        raise ValueError("unexpected pane change while saving a close; refusing cleanup")
+        raise ValueError("unexpected pane change while saving layout")
     snapshot = FOCUS_PREFIX + json.dumps({"pane": focus}, separators=(",", ":")) + "\n"
     snapshot += rewrite_export(export, after, executable)
     target = directory / "workspace.kitty-session"
@@ -703,7 +710,7 @@ def capture_locked(directory, executable, allow_removals=False, expected_panes=N
             stage.unlink()
     from .local_tabs import sync_focus
     sync_focus(directory)
-    return len(after)
+    return after_tree
 
 
 def capture_stable_locked(directory, executable):
@@ -996,13 +1003,16 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
             remote_client.renew_lease(directory)
         if (directory / "pending-close.json").exists() or (directory / "pending-create.json").exists():
             raise ValueError("an earlier workspace mutation is incomplete")
+        tree = json.loads(view_query(directory, "ls"))
         if coordinated:
             from .exits import synchronize
-            synchronize(directory, executable, locked=True)
-        capture_locked(directory, executable)
+            if synchronize(directory, executable, locked=True, tree=tree):
+                tree = json.loads(view_query(directory, "ls"))
+        if pane_map(tree).get(window_id) != (expected_pane, host):
+            raise ValueError("creation target changed; nothing created")
+        tree = capture_tree_locked(directory, executable, before_tree=tree)
         if coordinated:
             remote_client.ensure_current_revision(directory)
-        tree = json.loads(view_query(directory, "ls"))
         before = pane_map(tree)
         if before.get(window_id) != (expected_pane, host):
             raise ValueError("creation target changed; nothing created")
@@ -1046,8 +1056,10 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
             command += ["--initial-program", initial_program]
         if cwd:
             command += ["--initial-cwd", cwd]
-        # launch matches tabs: id:N can select an unrelated tab before pane N.
-        result = view_query(directory, "launch", "--match", f"window_id:{window_id}", *options, *context_options, *command)
+        # Match the target tab again at launch, after remote preflight calls.
+        # A bare id:N can select an unrelated tab before it matches a window.
+        match = f"window_id:{window_id} and var:kzw_pane=^{expected_pane}$"
+        result = view_query(directory, "launch", "--match", match, *options, *context_options, *command)
         try:
             new_id = int(result.strip())
         except ValueError:
@@ -1058,9 +1070,9 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
         expected[new_id] = (pane, host)
         for _ in range(100):
             try:
-                current = pane_map(json.loads(view_query(directory, "ls")))
-                if current == expected:
-                    capture_locked(directory, executable, expected_panes=expected)
+                current = json.loads(view_query(directory, "ls"))
+                if pane_map(current) == expected:
+                    capture_tree_locked(directory, executable, before_tree=current, expected_panes=expected)
                     pending.unlink()
                     log_pane_event("tab_created" if kind == "tab" else "pane_created", [pane])
                     return

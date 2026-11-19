@@ -23,6 +23,9 @@ class ManagedCreateTests(unittest.TestCase):
         lookup = patch("kzw.shell_cwd.from_session", return_value="")
         self.cwd_lookup = lookup.start()
         self.addCleanup(lookup.stop)
+        capture = patch("kzw.cli.capture_tree_locked", side_effect=lambda *args, before_tree, **kwargs: before_tree)
+        self.capture_tree = capture.start()
+        self.addCleanup(capture.stop)
 
     def test_local_bootstrap_recovery_requires_original_session_after_launch(self):
         from kzw.cli import EMPTY_SNAPSHOT, mark_bootstrap_launching, prepare_bootstrap, recover_bootstrap
@@ -132,14 +135,14 @@ class ManagedCreateTests(unittest.TestCase):
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
              patch("kzw.cli.uuid.uuid4") as uid, \
-             patch("kzw.cli.capture_locked") as capture, \
              patch("sys.stdout", new_callable=io.StringIO) as output, \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query, \
              patch("kzw.cli.zmx_command", side_effect=["", B + "\n"]):
             uid.return_value.hex = "b" * 32
             create_pane("Test", "right", 1, A, "")
-            self.assertEqual(capture.call_count, 2)
-            self.assertEqual(capture.call_args.kwargs["expected_panes"], {1: (A, ""), 2: (B, "")})
+            self.assertEqual(self.capture_tree.call_count, 2)
+            self.assertEqual(self.capture_tree.call_args.kwargs["expected_panes"], {1: (A, ""), 2: (B, "")})
+            self.assertEqual(query.call_count, 3)
             self.assertIn("--location=hsplit", query.call_args_list[1].args)
             self.assertFalse((Path(tmp) / "pending-create.json").exists())
             self.assertEqual(output.getvalue(), "pane_created:" + "b" * 32 + "\n")
@@ -149,7 +152,7 @@ class ManagedCreateTests(unittest.TestCase):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp, \
                  patch("kzw.cli.state_dir", return_value=Path(tmp)), \
                  patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
-                 patch("kzw.cli.uuid.uuid4") as uid, patch("kzw.cli.capture_locked"), \
+                 patch("kzw.cli.uuid.uuid4") as uid, \
                  patch("kzw.cli.zmx_command", return_value=""), \
                  patch("kzw.shell_cwd.resolve") as reported, \
                  patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query:
@@ -159,7 +162,7 @@ class ManagedCreateTests(unittest.TestCase):
                 self.cwd_lookup.assert_called_with(A, "")
                 reported.assert_not_called()
                 launched = query.call_args_list[1].args
-                self.assertEqual(launched[launched.index("--match") + 1], "window_id:1")
+                self.assertEqual(launched[launched.index("--match") + 1], f"window_id:1 and var:kzw_pane=^{A}$")
                 self.assertEqual(launched[launched.index("--initial-cwd") + 1], self.cwd_lookup.return_value)
 
     def test_automatic_split_uses_managed_creation(self):
@@ -167,13 +170,12 @@ class ManagedCreateTests(unittest.TestCase):
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
              patch("kzw.cli.uuid.uuid4") as uid, \
-             patch("kzw.cli.capture_locked") as capture, \
              patch("kzw.cli.zmx_command", side_effect=["", B + "\n"]), \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query:
             uid.return_value.hex = "b" * 32
             create_pane("Test", "split", 1, A, "")
             self.assertIn("--location=split", query.call_args_list[1].args)
-            self.assertEqual(capture.call_args.kwargs["expected_panes"], {1: (A, ""), 2: (B, "")})
+            self.assertEqual(self.capture_tree.call_args.kwargs["expected_panes"], {1: (A, ""), 2: (B, "")})
             self.assertFalse((Path(tmp) / "pending-create.json").exists())
 
     def test_cwd_lookup_failure_uses_validated_report_or_default(self):
@@ -182,7 +184,7 @@ class ManagedCreateTests(unittest.TestCase):
             with self.subTest(cwd=reported_cwd), tempfile.TemporaryDirectory() as tmp, \
                  patch("kzw.cli.state_dir", return_value=Path(tmp)), \
                  patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
-                 patch("kzw.cli.uuid.uuid4") as uid, patch("kzw.cli.capture_locked"), \
+                 patch("kzw.cli.uuid.uuid4") as uid, \
                  patch("kzw.cli.zmx_command", return_value=""), \
                  patch("kzw.shell_cwd.resolve", side_effect=[reported_cwd]) as reported, \
                  patch("sys.stderr", new_callable=io.StringIO) as errors, \
@@ -202,7 +204,6 @@ class ManagedCreateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
-             patch("kzw.cli.capture_locked"), \
              patch("kzw.cli.query", return_value=json.dumps(tree([(1, A)]))) as query:
             with self.assertRaisesRegex(ValueError, "target changed"):
                 create_pane("Test", "tab", 1, A, "another-host")
@@ -214,7 +215,6 @@ class ManagedCreateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
-             patch("kzw.cli.capture_locked"), \
              patch("kzw.cli.zmx_command", return_value=""), \
              patch("sys.stdout", new_callable=io.StringIO) as output, \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), OSError("lost reply")]):
@@ -232,7 +232,6 @@ class ManagedCreateTests(unittest.TestCase):
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
              patch("kzw.cli.uuid.uuid4") as uid, \
-             patch("kzw.cli.capture_locked"), \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query, \
              patch("kzw.cli.zmx_command", return_value=""), \
              patch("sys.stdout", new_callable=io.StringIO) as output:
@@ -245,7 +244,6 @@ class ManagedCreateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
-             patch("kzw.cli.capture_locked"), \
              patch("kzw.cli.query", return_value=json.dumps(tree([(1, B)]))) as query:
             with self.assertRaisesRegex(ValueError, "target changed"):
                 create_pane("Test", "below", 1, A, "")
@@ -257,7 +255,6 @@ class ManagedCreateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
              patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
-             patch("kzw.cli.capture_locked") as capture, \
              patch("kzw.cli.query", return_value=json.dumps(tree([(1, B)]))):
             started = threading.Event()
             finished = threading.Event()
@@ -274,6 +271,6 @@ class ManagedCreateTests(unittest.TestCase):
                 thread.start()
                 self.assertTrue(started.wait(2))
                 self.assertFalse(finished.wait(0.1))
-                capture.assert_not_called()
+                self.capture_tree.assert_not_called()
             thread.join(timeout=2)
             self.assertTrue(finished.is_set())

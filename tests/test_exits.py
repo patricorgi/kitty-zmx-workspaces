@@ -185,7 +185,7 @@ class ExitTests(unittest.TestCase):
         self.ended(B)
         self.disappear(B)
 
-        def capture(directory, executable):
+        def capture(directory, executable, *, before_tree):
             self.assertEqual(json.loads((directory / "panes.json").read_text()), [A, C])
             raise ValueError("stop before launching")
 
@@ -193,7 +193,7 @@ class ExitTests(unittest.TestCase):
         with patch("kzw.cli.state_dir", return_value=self.directory), \
              patch("kzw.cli.shutil.which", side_effect=lambda name, **kw: "/bin/kzw-pane" if name == "kzw-pane"
                    else which(name, **kw)), \
-             patch("kzw.cli.capture_locked", side_effect=capture) as check, \
+             patch("kzw.cli.capture_tree_locked", side_effect=capture) as check, \
              self.assertRaisesRegex(ValueError, "stop before launching"):
             cli.create_pane("Test", "tab", 1, A, "")
         check.assert_called_once()

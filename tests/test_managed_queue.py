@@ -72,7 +72,7 @@ class ManagedQueueTests(unittest.TestCase):
                 with patch("kzw.cli.state_dir", return_value=directory), \
                      patch("kzw.cli.uuid.uuid4", return_value=SimpleNamespace(hex="b" * 32)), \
                      patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
-                     patch("kzw.cli.capture_locked") as capture, \
+                     patch("kzw.cli.capture_tree_locked", side_effect=lambda *a, before_tree, **kw: before_tree) as capture, \
                      patch("kzw.cli.view_query", side_effect=query), \
                      patch("kzw.cli.remote_client.renew_lease"), patch("kzw.cli.remote_client.ensure_current_revision"), \
                      patch("kzw.cli.remote_client.reserve_pane", side_effect=lambda *a: events.append("reserve")), \
@@ -87,7 +87,8 @@ class ManagedQueueTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             with patch("kzw.cli.state_dir", return_value=directory), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), patch("kzw.cli.capture_locked"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.capture_tree_locked", side_effect=lambda *a, before_tree: before_tree), \
                  patch("kzw.shell_cwd.from_session", return_value=""), patch("kzw.cli.zmx_command", return_value=""), \
                  patch("kzw.cli.view_query", side_effect=[json.dumps(tree("")), OSError("lost launch reply")]) as query:
                 with self.assertRaisesRegex(OSError, "lost launch reply"):

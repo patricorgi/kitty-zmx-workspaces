@@ -52,7 +52,7 @@ def snapshot_for_exit(directory, executable, tree):
         session, mapping, executable)
 
 
-def synchronize(directory, executable, locked=False):
+def synchronize(directory, executable, locked=False, *, tree=None):
     from . import cli
     if not (directory / "remote.json").is_file():
         return 0  # Legacy mixed-origin layouts lack this coordinator contract.
@@ -72,7 +72,8 @@ def synchronize(directory, executable, locked=False):
             if config.get("pending") or not config.get("panes"):
                 return 0
             view = cli.view_state(directory)
-            tree = json.loads(cli.view_query(directory, "ls"))
+            if tree is None:
+                tree = json.loads(cli.view_query(directory, "ls"))
             if len(tree) != 1 or (view is not None and tree[0].get("id") != view["os_window_id"]):
                 return 0  # Never reconcile an entirely vanished or ambiguous view.
             mapping = pane_map(tree)
