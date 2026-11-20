@@ -19,6 +19,11 @@ export PATH="$HOME/.local/bin:$PATH"
 Keep the checkout in place. Add the PATH line to your shell configuration to
 use the installed commands in new terminals.
 
+On Kitty 0.51+, the installer adds a native tab hook without changing
+`kitty.conf` or your key bindings. Existing kzw installs can run
+`python3 install.py --kitty-hook-only`, then reload Kitty's configuration.
+An existing `launch_wrapper.py` is left untouched.
+
 ## Basic commands
 
 ```sh
@@ -42,6 +47,10 @@ Add `--host HOST` for a remote workspace. For example, run
 - A workspace uses one origin host. To attach in the current Kitty instance,
   Kitty must run in single-instance mode with remote control enabled and a
   listening socket. Use `--new-kitty-instance` to open a separate instance.
+- With the Kitty 0.51+ hook, plain native `new_tab` from a managed pane starts
+  another zmx session in that workspace. Explicit commands and tabs opened
+  from ordinary terminals are not adopted. This does not add native close
+  support; use `kzw close-tab` for a managed close.
 - Detach saves the layout. `kzw save` currently fails.
 - Explicit right and below splits are currently reversed.
 - Rename and kill require a detached workspace. Unmanaged pane and tab closes

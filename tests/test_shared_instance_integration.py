@@ -41,10 +41,23 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         session = self.tmp / "keep.session"
         # One unmanaged OS window proves that detach only closes our workspace.
         session.write_text("new_tab Keep\nlaunch /bin/sh\n")
+        config = "NONE"
+        if self._testMethodName == "test_native_tab_uses_shared_workspace_without_helper_mapping":
+            from install import install_kitty_hook
+            version = subprocess.check_output(["kitty", "--version"], text=True).split()[1]
+            if tuple(map(int, version.split("."))) < (0, 51):
+                shutil.rmtree(self.tmp)
+                self.skipTest("Kitty 0.51+ required")
+            confdir = self.tmp / "kitty"
+            install_kitty_hook(confdir, REPO)
+            self.env["KITTY_CONFIG_DIRECTORY"] = str(confdir)
+            self.env["KITTY_CACHE_DIRECTORY"] = str(self.tmp / "kitty-cache")
+            config = str(confdir / "kitty.conf")
+            Path(config).write_text("shell /bin/sh\n")
         self.instance = subprocess.Popen(
             ["kitty", "--single-instance", "--instance-group", self.group,
              "--start-as=hidden", "--listen-on", "unix:" + str(self.sock),
-             "-c", "NONE", "-o", "allow_remote_control=socket-only",
+             "-c", config, "-o", "allow_remote_control=socket-only",
              "--session", str(session)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
         self.env.update({
@@ -136,6 +149,54 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
     def tab_style(self):
         output = self.raw("kitten", str(self.probe))
         return json.loads(output)
+
+    def test_native_tab_uses_shared_workspace_without_helper_mapping(self):
+        self.baseline = self.sessions()
+        created = self.kzw("create", "Test", "--attach")
+        self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
+        directory = self.state / "kzw" / "Test"
+        view = json.loads((directory / "view.json").read_text())
+        initial = json.loads((directory / "panes.json").read_text())
+
+        def add_tab(in_workspace, use_last=False):
+            windows = json.loads(self.raw("ls"))
+            ow = next(w for w in windows if (w["id"] == view["os_window_id"]) == in_workspace)
+            window_id = ow["tabs"][-1 if use_last else 0]["windows"][0]["id"]
+            self.raw("focus-window", "--match", f"id:{window_id}")
+            self.raw("action", "--match", f"id:{window_id}", "new_tab")
+
+        for count in (2, 3):
+            add_tab(True, use_last=True)
+            deadline = time.monotonic() + 20
+            while len(panes := json.loads((directory / "panes.json").read_text())) != count:
+                if time.monotonic() >= deadline:
+                    tree = json.loads(self.raw("ls"))
+                    summary = [(w["id"], [(p["id"], p["user_vars"].get("kzw_pane")) for t in w["tabs"] for p in t["windows"]])
+                               for w in tree]
+                    self.fail(f"native tab was not captured: {summary}\n" + (directory / "supervisor.log").read_text())
+                time.sleep(0.1)
+        self.assertTrue(set(initial) < set(panes))
+        self.assertEqual(self.sessions() - self.baseline, set(panes))
+        add_tab(False)
+        deadline = time.monotonic() + 10
+        while True:
+            ordinary = next(w for w in json.loads(self.raw("ls")) if w["id"] != view["os_window_id"])
+            if len(ordinary["tabs"]) == 2:
+                break
+            if time.monotonic() >= deadline:
+                self.fail(f"ordinary tab did not open: {self.raw('ls')}")
+            time.sleep(0.1)
+        self.assertTrue(all(not w.get("user_vars", {}).get("kzw_pane")
+                            for t in ordinary["tabs"] for w in t["windows"]))
+        result = self.kzw("detach", "Test")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.kzw("attach", "Test")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sessions() - self.baseline, set(panes))
+        attached = json.loads((directory / "view.json").read_text())
+        restored = next(w for w in json.loads(self.raw("ls")) if w["id"] == attached["os_window_id"])
+        self.assertEqual(len(restored["tabs"]), 3)
+        self.assertEqual({w["user_vars"]["kzw_pane"] for t in restored["tabs"] for w in t["windows"]}, set(panes))
 
     def test_managed_queue_tab_is_listed_saved_and_resumed(self):
         from kzw.core import saved_focus
