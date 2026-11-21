@@ -625,11 +625,16 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
 
         elapsed = []
         for pane, text in ((split, "\x04"), (tab, "exit 7\r"), (first, "\x04")):
+            match = "id:" + str(original[pane]["id"])
+            token = "KZW_EXIT_READY_" + str(original[pane]["id"])
+            self.raw("send-text", "--match", match, "printf '%s%s\\n' KZW_EXIT_READY_ " +
+                     str(original[pane]["id"]) + "\r")
+            wait_for(lambda: token in self.raw("get-text", "--match", match))
             started = time.monotonic()
-            self.raw("send-text", "--match", "id:" + str(original[pane]["id"]), text)
-            wait_for(lambda: pane not in panes() and pane not in manifest() and
-                     not (directory / "pending-exit.json").exists())
+            self.raw("send-text", "--match", match, text)
+            wait_for(lambda: pane not in panes())
             elapsed.append(round(time.monotonic() - started, 2))
+            wait_for(lambda: pane not in manifest() and not (directory / "pending-exit.json").exists())
             for survivor, window in panes().items():
                 self.assertEqual(window["pid"], original[survivor]["pid"])
         wait_for(lambda: not (directory / "view.json").exists())

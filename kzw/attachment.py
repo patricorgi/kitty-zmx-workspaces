@@ -52,6 +52,8 @@ class Attachment:
         self.stop = threading.Event()
         self.process = None
         self.process_group = None
+        self.child_changed = threading.Event()
+        self.transport_ended = False
         self.network = network.get()
         self.resumed = self.network.resumes
         self.offline_phase = None
@@ -104,6 +106,7 @@ class Attachment:
                 return
             self.direct = True
             self.wake.set()
+            self.child_changed.set()
             self.set_phase("reconnecting")
             if self.process is not None and self.process.poll() is None:
                 try:
@@ -111,14 +114,15 @@ class Attachment:
                 except ProcessLookupError:
                     pass
 
-    def ended(self):
+    def ended(self, *, show_reconnecting=True):
         with self.lock:
             if self.process is not None:
                 self.initial_phase = "restoring"
             self.process = None
             self.process_group = None
             self.direct = True
-            self.set_phase("reconnecting")
+            if show_reconnecting:
+                self.set_phase("reconnecting")
 
     def signal_child(self, signum):
         if self.process_group is not None:
@@ -129,6 +133,7 @@ class Attachment:
             self.process.kill()
 
     def run(self, command, env):
+        self.transport_ended = False
         self.network.require(True)
         from .ssh_transport import kitten_command, prepare_attachment
         use_kitten = (not self.direct and env.get("KZW_SSH_KITTEN") == "1"
@@ -184,6 +189,7 @@ class Attachment:
             except OSError as exc:
                 raise NotStarted(str(exc)) from exc
             process = self.process
+            self.child_changed.clear()
             if use_kitten:
                 self.process_group = process.pid
                 try:
@@ -209,9 +215,11 @@ class Attachment:
                 if env.get("KZW_DEBUG") == "1" or ssh_diagnostic_visible(line):
                     print(line, end="", file=sys.stderr, flush=True)
 
+        acknowledged = False
+
         def output():
+            nonlocal acknowledged
             pending = b""
-            acknowledged = False
             while True:
                 chunk = os.read(process.stdout.fileno(), 65536)
                 if not chunk:
@@ -234,15 +242,21 @@ class Attachment:
         output_thread = threading.Thread(target=output, daemon=True)
         thread.start()
         output_thread.start()
+
+        def wait_for_exit():
+            process.wait()
+            self.child_changed.set()
+
+        waiter = threading.Thread(target=wait_for_exit, daemon=True)
+        waiter.start()
         try:
-            # Escalate only the exact local SSH child if cancellation is ignored.
-            while process.poll() is None:
-                if self.wake.wait(0.2):
-                    try:
-                        process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        self.signal_child(signal.SIGKILL)
-                    break
+            self.child_changed.wait()
+            if self.wake.is_set():
+                # Escalate only the exact local SSH child if cancellation is ignored.
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self.signal_child(signal.SIGKILL)
             return subprocess.CompletedProcess(command, process.wait())
         finally:
             if process.poll() is None:
@@ -262,9 +276,11 @@ class Attachment:
                     pass  # Kitty can close the terminal before the child exits.
             thread.join(timeout=1)
             output_thread.join(timeout=1)
+            waiter.join()
+            self.transport_ended = acknowledged and not self.wake.is_set() and not self.stop.is_set()
             process.stderr.close()
             process.stdout.close()
-            self.ended()
+            self.ended(show_reconnecting=not self.transport_ended)
 
     def close(self):
         self.stop.set()

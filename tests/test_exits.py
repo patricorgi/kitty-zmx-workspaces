@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import select
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from kzw import cli, exits, remote_client
+from kzw.pane import ssh_diagnostic_visible
 from kzw.layout_prune import prune_snapshot
 from kzw.remote import Store, response, zmx_exit_receipt
 from test_layout_prune import snapshot
@@ -20,6 +22,20 @@ A, B, C = ("kzw-" + c * 32 for c in "abc")
 
 
 class ExitKittenTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(select, "kqueue"), "requires kqueue")
+    def test_existing_change_file_wakes_supervisor_on_touch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "watcher.changed"
+            with cli.watch_workspace_changes(path) as wait:
+                old = path.stat().st_mtime_ns
+                os.utime(path, ns=(old - 1_000_000_000, old - 1_000_000_000))
+                self.assertTrue(wait(1))
+
+    def test_only_informational_ssh_teardown_is_hidden(self):
+        self.assertFalse(ssh_diagnostic_visible("Shared connection to lhcb-login closed.\r\n"))
+        self.assertTrue(ssh_diagnostic_visible("Connection to lhcb-login reset by peer\r\n"))
+        self.assertTrue(ssh_diagnostic_visible("Shared connection to lhcb-login closed unexpectedly.\n"))
+
     def test_exact_pid_matches_kitty_listing_including_launch_wrappers(self):
         window = SimpleNamespace(id=17, os_window_id=2, child=SimpleNamespace(pid=40, root_pid=41),
                                  user_vars={"kzw_pane": A, "kzw_attach_ended": "1"})
@@ -299,6 +315,33 @@ class ExitTests(unittest.TestCase):
                 self.assertEqual(self.sync(), 0)
         self.assertEqual((self.directory / "workspace.kitty-session").read_text(), self.source)
         self.assertEqual(self.closes, [])
+
+    def test_transport_end_preserves_live_session_and_prunes_only_proven_exit(self):
+        self.assertTrue(exits.record_transport_end(self.directory, B))
+        self.assertTrue(exits.record_transport_end(self.directory, C))
+        self.tree[0]["tabs"][0]["windows"] = self.tree[0]["tabs"][0]["windows"][:1]
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual((self.directory / "workspace.kitty-session").read_text(), self.source)
+        self.ended(B)
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.request({"method": "workspace.get", "workspace": "Test"})["panes"], [A, C])
+        self.assertEqual(self.closes, [])
+
+    def test_transport_end_can_reconcile_after_last_view_disappears(self):
+        for pane in (A, B, C):
+            self.assertTrue(exits.record_transport_end(self.directory, pane))
+        self.ended(A, B, C)
+        self.tree = []
+        self.assertEqual(exits.synchronize(self.directory, "/bin/kzw-pane", tree=[]), 3)
+        self.assertEqual((self.directory / "workspace.kitty-session").read_text(), cli.EMPTY_SNAPSHOT)
+        self.assertEqual(self.closes, [])
+
+    def test_coordinator_state_override_does_not_move_zmx_logs(self):
+        with patch.dict(os.environ, {"XDG_STATE_HOME": "/isolated-coordinator",
+                                     "KZW_ORIGIN_ZMX_STATE_HOME": "/origin-state"}):
+            self.assertEqual(self.store.zmx_environment()["XDG_STATE_HOME"], "/origin-state")
+            os.environ["KZW_ORIGIN_ZMX_STATE_HOME"] = ""
+            self.assertNotIn("XDG_STATE_HOME", self.store.zmx_environment())
 
     def test_live_socket_live_inventory_or_unknown_version_veto_old_receipt(self):
         self.ended(B)

@@ -64,7 +64,9 @@ def ssh_command(host, *, allow_configured_master=False):
         fallback = ("import base64,os;os.environ.pop('KZW_LOCAL_COORDINATOR',None);os.environ['KZW_COORDINATOR_SOURCE']=%r;"
                     "exec(base64.b64decode(os.environ['KZW_COORDINATOR_SOURCE']))") % source.decode()
         program = "exec python3 -u -c " + shlex.quote(fallback)
-    command = ("export XDG_STATE_HOME=" + shlex.quote(state_override) + "; " if state_override else "") + program
+    # Keep a coordinator-state override from moving zmx's lifecycle log lookup.
+    command = ('export KZW_ORIGIN_ZMX_STATE_HOME="${XDG_STATE_HOME-}" XDG_STATE_HOME='
+               + shlex.quote(state_override) + "; " if state_override else "") + program
     options = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                "-o", "ControlMaster=no", "-o", "ControlPersist=no"]
     if allow_configured_master:
@@ -965,11 +967,11 @@ def create(directory, name, host):
                 raise ValueError("local workspace already exists; refusing to overwrite it")
             allowed = {"lock", "capture.lock", "lease.lock", "watcher.changed", "remote-status.changed", "remote.json",
                        "lease.json", "workspace.kitty-session", "panes.json", "bootstrap.kitty-session",
-                       "native-pending", "supervisor.log", "supervisor.startup.json", "local-tab-owner"}
+                       "native-pending", "transport-ended", "supervisor.log", "supervisor.startup.json", "local-tab-owner"}
             for path in directory.iterdir():
                 if path.name in ("pending-create.json", "pending-close.json", "native-stage.json", "kitty.sock", "view.json"):
                     raise ValueError("local workspace has unfinished operations; refusing to overwrite it")
-                if (path.name == "exit-backups" or
+                if (path.name in ("exit-backups", "transport-ended") or
                         re.fullmatch(r"backup-confirmed-exit-[a-z0-9_]{8}", path.name)):
                     if not stat.S_ISDIR(path.lstat().st_mode):
                         raise ValueError("unsafe workspace backup; refusing to overwrite it")

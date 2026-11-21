@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -18,7 +19,11 @@ import test_cwd_integration as cwd_tests
 class RemoteExitLatencyIntegrationTests(unittest.TestCase):
     def test_remote_disconnect_then_split_tab_and_final_exit(self):
         fixture = cwd_tests.CwdIntegrationTests("test_remote_tabs_and_splits_inherit_selected_shell_cwd")
-        fixture.setUp()
+        config = tempfile.TemporaryDirectory()
+        self.addCleanup(config.cleanup)
+        # Both Kitty and its children must use the isolated checkout bridge.
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}):
+            fixture.setUp()
         self.addCleanup(lambda: self.assertTrue(fixture.doCleanups(), "remote exit fixture cleanup failed"))
         kit, host = fixture.kitty, os.environ["KZW_INTEGRATION_HOST"]
         unrelated = json.loads(kit.raw("ls"))[0]
@@ -52,10 +57,17 @@ class RemoteExitLatencyIntegrationTests(unittest.TestCase):
                    and int(fields[1]) == original[split]["pid"] and Path(fields[2]).name == "ssh"]
         self.assertEqual(len(clients), 1)
         os.kill(clients[0], signal.SIGKILL)
-        fixture.wait(lambda: next(w for w in fixture.windows() if w["id"] == split)["user_vars"].get("kzw_attach_ended") == "1")
+        fixture.wait(lambda: split not in {w["id"] for w in fixture.windows()})
         self.assertEqual(set(json.loads((directory / "panes.json").read_text())), owned)
         self.assertEqual(remote_identities(), before)
-        fixture.wait(lambda: next(w for w in fixture.windows() if w["id"] == split)["user_vars"].get("kzw_attach_ended") == "0")
+        result = kit.kzw("detach", "Test", "--host", host)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = kit.kzw("attach", "Test", "--host", host)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = fixture.wait(lambda: rows if len(rows := fixture.windows()) == 3 else None)
+        original = {w["id"]: w for w in rows}
+        source, split, tab = sorted(original)
+        self.assertEqual(remote_identities(), before)
 
         timings = []
         for wid, text in ((split, "\x04"), (tab, "exit 7\r"), (source, "\x04")):
@@ -75,7 +87,12 @@ class RemoteExitLatencyIntegrationTests(unittest.TestCase):
             kit.raw("send-text", "--match", "id:" + str(wid), text)
             fixture.wait(lambda: wid not in {w["id"] for w in fixture.windows()})
             timings.append(round(time.monotonic() - start, 3))
-            fixture.wait(lambda: not (directory / "pending-exit.json").exists())
+            pane = original[wid]["user_vars"]["kzw_pane"]
+            try:
+                fixture.wait(lambda: pane not in json.loads((directory / "panes.json").read_text()) and
+                             not (directory / "pending-exit.json").exists())
+            except AssertionError as exc:
+                self.fail(f"{exc}\nView close timings: {timings}\n{(directory / 'supervisor.log').read_text()}")
             for w in fixture.windows():
                 self.assertEqual(w["pid"], original[w["id"]]["pid"])
         fixture.wait(lambda: not (directory / "view.json").exists())

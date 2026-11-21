@@ -404,6 +404,12 @@ class Store:
 
     def zmx_environment(self):
         env = os.environ.copy()
+        origin_state = env.pop("KZW_ORIGIN_ZMX_STATE_HOME", None)
+        if origin_state is not None:
+            if origin_state:
+                env["XDG_STATE_HOME"] = origin_state
+            else:
+                env.pop("XDG_STATE_HOME", None)
         env.pop("ZMX_SESSION", None)
         env.pop("ZMX_SESSION_PREFIX", None)
         env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
@@ -1331,6 +1337,9 @@ LEGACY_WORKSPACE_BUILDS = frozenset((
     "9199b10641d57c7c07a1c278cfe0eb2d02332924a394efe5486c32c46946c37e",
     # zmx 1.0.1 lifecycle build, before the monitoring-only sampler change.
     "058a4858843fe23950c986ca848b98c97ded9a30e1861ae6e25a8e18da01d454",
+    # Same workspace protocol, before separating coordinator and zmx state homes.
+    "3d5892c6a3158cfde8ffaf0723fb5a15d44f457d2daff4db4a1a5e3588fb758f",
+    "8e624211311c420913979a9b73a4c11037c71c0986ff5260b9cf5fe87946e4b9",
     PRE_LOCAL_EXIT_BUILD,
 ))
 LEGACY_WORKSPACE_METHODS = frozenset((

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import stat
 from pathlib import Path
@@ -345,6 +346,30 @@ def startup_status(ok, error=None, directory=None):
         atomic_write(Path(path), json.dumps(data, separators=(",", ":")) + "\n")
     except OSError:
         pass
+
+
+@contextmanager
+def watch_workspace_changes(path):
+    """Wake on the existing change file on macOS; retain the periodic fallback."""
+    with ExitStack() as stack:
+        if hasattr(select, "kqueue"):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                stack.callback(os.close, fd)
+                queue = select.kqueue()
+                stack.callback(queue.close)
+                event = select.kevent(fd, filter=select.KQ_FILTER_VNODE,
+                                      flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                                      fflags=select.KQ_NOTE_ATTRIB | select.KQ_NOTE_WRITE)
+                queue.control([event], 0, 0)
+            except OSError:
+                pass
+            else:
+                def wait(timeout):
+                    return queue.control(None, 1, timeout)
+                yield wait
+                return
+        yield time.sleep
 
 
 @contextmanager
@@ -764,12 +789,31 @@ def detach(name, origin=""):
         if local_tabs.detach_only(directory):
             count = 0
         else:
-            count = capture_stable_locked(directory, executable)
+            detached_panes = set()
+            if (directory / "transport-ended").is_dir():
+                from .exits import transport_candidates
+                saved = set(json.loads((directory / "panes.json").read_text()))
+                current = pane_map(json.loads(view_query(directory, "ls")))
+                detached_panes = saved - {pane for pane, _ in current.values()}
+                if not detached_panes.issubset(transport_candidates(directory, saved)):
+                    detached_panes = set()
+            if detached_panes:
+                if (directory / "pending-exit.json").exists():
+                    raise ValueError("shell exit reconciliation is pending")
+                config = json.loads((directory / "remote.json").read_text())
+                portable, manifest = remote_client.translate(
+                    (directory / "workspace.kitty-session").read_text(), "", config["host"], True)
+                if (set(manifest) != saved or remote_client.snapshot_hash(portable, manifest) != config["published_hash"]):
+                    raise ValueError("saved layout differs from published revision; refusing to detach")
+                count = len(saved)
+            else:
+                count = capture_stable_locked(directory, executable)
             if (directory / "remote.json").exists():
                 remote_client.ensure_current_revision(directory)
             tree = json.loads(view_query(directory, "ls"))
             mapped = pane_map(tree)
-            if {pane for pane, _ in mapped.values()} != set(json.loads((directory / "panes.json").read_text())):
+            if ({pane for pane, _ in mapped.values()} !=
+                    set(json.loads((directory / "panes.json").read_text())) - detached_panes):
                 raise ValueError("workspace changed after final snapshot; refusing to detach")
             ids = sorted(mapped)
             if local_tabs.owner(directory) is not None:
@@ -1503,7 +1547,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
     if not host and not shutil.which("zmx"):
         raise ValueError("zmx not found on PATH; install it before starting a local workspace")
     lock_context = nullcontext(existing_lock) if existing_lock is not None else open(directory / "lock", "a+")
-    with lock_context as lock:
+    with lock_context as lock, ExitStack() as resources:
         if existing_lock is None:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1707,6 +1751,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         pending_focus = focus
         local_restored = False
         change_signal = directory / "watcher.changed"
+        wait_for_change = resources.enter_context(watch_workspace_changes(change_signal))
         last_signal = None
         next_capture = 0.0
         next_exit_check = 0.0
@@ -1821,7 +1866,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                         print(f"kzw: snapshot deferred: {message}", file=sys.stderr, flush=True)
                         last_error = message
                 try:
-                    time.sleep(0.1)
+                    wait_for_change(0.1)
                 except KeyboardInterrupt:
                     if child is not None:
                         raise
@@ -1839,9 +1884,11 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                         capability.unlink()
                 except (OSError, ValueError):
                     pass  # Never let advisory capability cleanup strand a broker/lease.
-                if (directory / "pending-exit.json").exists():
+                if (directory / "pending-exit.json").exists() or (
+                        (directory / "transport-ended").is_dir() and child is not None and child.poll() is not None):
                     try:
-                        synchronize_exits(directory, pane_executable)
+                        from .exits import synchronize
+                        synchronize(directory, pane_executable, tree=[] if child is not None and child.poll() is not None else None)
                     except (OSError, ValueError, subprocess.SubprocessError) as exc:
                         print(f"kzw: exit cleanup remains pending: {exc}", file=sys.stderr, flush=True)
                 status_stop()
@@ -2175,7 +2222,17 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
                     return run_attached()
                 session = recover_bootstrap(directory, name, host, executable)
                 return run_attached(bootstrap_session=session)
+            disconnected = (directory / "transport-ended").is_dir()
+            if disconnected:
+                from .exits import synchronize, transport_candidates
+                synchronize(directory, executable, tree=[])
             remote_client.pull(directory, name, host, executable)
+            if disconnected:
+                # Successful pull verified the remaining sessions. A new view
+                # must record its own SSH termination rather than reuse this one.
+                saved = set(json.loads((directory / "panes.json").read_text()))
+                for pane in transport_candidates(directory, saved):
+                    (directory / "transport-ended" / pane).unlink(missing_ok=True)
             return run_attached(create_empty=True) if create_empty else run_attached()
         finally:
             stop_heartbeat()

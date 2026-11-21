@@ -26,9 +26,10 @@ _retry_network = None
 
 
 def ssh_diagnostic_visible(line):
-    """Hide only known multiplexing fallback noise, not SSH failures."""
+    """Hide expected SSH teardown and known multiplexing fallback noise."""
     return not (line.startswith("mux_client_request_session: session request failed: Session open refused by peer") or
-                (line.startswith("ControlSocket ") and line.rstrip().endswith(" already exists, disabling multiplexing")))
+                (line.startswith("ControlSocket ") and line.rstrip().endswith(" already exists, disabling multiplexing")) or
+                re.fullmatch(r"Shared connection to [^\s]+ closed\.", line.rstrip()))
 
 
 def run_attachment(cmd, env, remote):
@@ -351,6 +352,10 @@ def _main():
             set_attachment_ended(False)
             with attachment_terminal():
                 result = run_attachment(cmd, env, bool(args.host))
+            if coordinated and args.host and _attachment is not None and _attachment.transport_ended is True:
+                from .exits import record_transport_end
+                if record_transport_end(Path(os.environ["KZW_WORKSPACE_DIRECTORY"]), pane):
+                    return  # Kitty closes this local wrapper; origin cleanup is separate.
             if result.returncode:
                 raise RuntimeError(f"attachment exited with status {result.returncode}")
             last_error = None

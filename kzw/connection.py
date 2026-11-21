@@ -57,6 +57,10 @@ class RetryServer:
 
     def close(self):
         self.stop.set()
+        try:
+            self.server.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # Fall back to the accept timeout on platforms that reject this.
         self.thread.join(timeout=1)
         self.server.close()
         if self.thread.is_alive():

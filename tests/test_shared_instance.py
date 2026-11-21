@@ -15,7 +15,7 @@ import shlex
 import subprocess
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from unittest.mock import Mock, patch
 
 from kzw import cli, kitty_instance
@@ -441,7 +441,8 @@ class SharedSupervisorTests(unittest.TestCase):
                     "finish_bootstrap": {"side_effect": finish}, "startup_status": {"side_effect": acknowledge},
                     "capture": {"side_effect": capture}, "subprocess.run": {"side_effect": launch},
                     "subprocess.Popen": {"side_effect": AssertionError("shared attachment must not spawn a private Kitty")},
-                    "time.monotonic": {"side_effect": itertools.count().__next__}, "time.sleep": {"side_effect": sleep},
+                     "time.monotonic": {"side_effect": itertools.count().__next__}, "time.sleep": {"side_effect": sleep},
+                     "watch_workspace_changes": {"return_value": nullcontext(sleep)},
                     "os.kill": {"side_effect": ProcessLookupError if mode == "instance-exited" else None},
                 }
                 mocks = {target: patches.enter_context(patch("kzw.cli." + target, **kwargs)) for target, kwargs in replacements.items()}

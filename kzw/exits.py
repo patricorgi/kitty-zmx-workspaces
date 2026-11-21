@@ -7,7 +7,7 @@ import subprocess
 from contextlib import nullcontext
 
 from . import remote_client
-from .core import FOCUS_PREFIX, atomic_write, focused_pane, pane_map, rewrite_export
+from .core import FOCUS_PREFIX, PANE, atomic_write, focused_pane, pane_map, rewrite_export
 from .layout_prune import prune_snapshot
 
 
@@ -33,8 +33,7 @@ def current_windows(directory, targets):
     try:
         return windows(json.loads(cli.view_query(directory, "ls")))
     except (OSError, ValueError, subprocess.SubprocessError):
-        # Used only AFTER the server commits the exit removal. A private Kitty
-        # may disappear with its last pane before replying to the close request.
+        # A private Kitty may disappear with its last pane before replying.
         if wrappers_gone(targets):
             return {}
         raise
@@ -50,6 +49,30 @@ def snapshot_for_exit(directory, executable, tree):
     focus = focused_pane(current)
     return FOCUS_PREFIX + json.dumps({"pane": focus}, separators=(",", ":")) + "\n" + rewrite_export(
         session, mapping, executable)
+
+
+def record_transport_end(directory, pane):
+    """Only auto-close views already present in the durable layout."""
+    manifest = directory / "panes.json"
+    if not PANE.fullmatch(pane) or not manifest.is_file() or pane not in json.loads(manifest.read_text()):
+        return False
+    signals = directory / "transport-ended"
+    signals.mkdir(mode=0o700, exist_ok=True)
+    if signals.is_symlink():
+        raise ValueError("unsafe transport end directory")
+    atomic_write(signals / pane, "")
+    try:
+        (directory / "watcher.changed").touch()
+    except OSError:
+        pass
+    return True
+
+
+def transport_candidates(directory, saved):
+    signals = directory / "transport-ended"
+    if signals.is_symlink() or not signals.is_dir():
+        return set()
+    return {pane for pane in saved if (signals / pane).is_file() and not (signals / pane).is_symlink()}
 
 
 def synchronize(directory, executable, locked=False, *, tree=None):
@@ -73,36 +96,45 @@ def synchronize(directory, executable, locked=False, *, tree=None):
             if config.get("pending") or not config.get("panes"):
                 return 0
             view = cli.view_state(directory)
+            saved = set(config["panes"])
+            disconnected = transport_candidates(directory, saved)
             if tree is None:
                 tree = json.loads(cli.view_query(directory, "ls"))
-            if len(tree) != 1 or (view is not None and tree[0].get("id") != view["os_window_id"]):
-                return 0  # Never reconcile an entirely vanished or ambiguous view.
-            mapping = pane_map(tree)
-            saved = set(config["panes"])
+            if not tree and disconnected:
+                mapping = {}
+            elif len(tree) == 1 and (view is None or tree[0].get("id") == view["os_window_id"]):
+                mapping = pane_map(tree)
+            else:
+                return 0  # A vanished view alone is not an exit candidate.
             visible = {p for p, host in mapping.values()}
             if not visible.issubset(saved) or any(host != config["host"] for p, host in mapping.values()):
                 return 0  # Unregistered creation or mismatched origin.
             missing = saved - visible
             views = windows(tree)
-            candidates = missing | {w["pane"] for w in views.values() if w["ended"] == "1"}
+            candidates = (missing if tree else missing & disconnected) | {
+                w["pane"] for w in views.values() if w["ended"] == "1"}
             if not candidates:
                 return 0
             receipts = remote_client.exit_receipts(directory, candidates)
-            if not receipts or not missing.issubset(receipts):
+            if not receipts or (tree and not (missing - set(receipts)).issubset(disconnected)):
                 return 0
             # Already absent leaves are not in the export. Prune only proven
             # exits that still have a view, using the current layout and focus.
-            source = snapshot_for_exit(directory, executable, tree)
-            present_exits = visible.intersection(receipts)
-            snapshot = prune_snapshot(source, present_exits) if present_exits else source
-            if cli.view_state(directory) != view:
-                raise ValueError("workspace attachment changed during exit capture")
             if missing:
                 previous = (directory / "workspace.kitty-session").read_text()
                 portable, panes = remote_client.translate(previous, "", config["host"], True)
                 if set(panes) != saved or remote_client.snapshot_hash(portable, panes) != config["published_hash"]:
                     raise ValueError("saved layout differs from the published revision; exit removal deferred")
                 atomic_write(directory / "exit-backups" / f"revision-{config['revision']}.kitty-session", previous)
+            if not tree or missing - set(receipts):
+                # The live view omits disconnected sessions that must survive.
+                snapshot = prune_snapshot(previous, set(receipts))
+            else:
+                source = snapshot_for_exit(directory, executable, tree)
+                present_exits = visible.intersection(receipts)
+                snapshot = prune_snapshot(source, present_exits) if present_exits else source
+            if cli.view_state(directory) != view:
+                raise ValueError("workspace attachment changed during exit capture")
             data = {"snapshot": snapshot, "panes": sorted(saved - set(receipts)),
                     "receipts": receipts, "targets": {k: w for k, w in views.items() if w["pane"] in receipts},
                     "view": view}
@@ -115,7 +147,8 @@ def synchronize(directory, executable, locked=False, *, tree=None):
         if not data.get("view_closed"):
             # The initial atomic capture already checked these identities.
             # Kitty checks again inside its event loop immediately before close.
-            current = current_windows(directory, data["targets"]) if replay else views
+            current = views if not replay else (
+                current_windows(directory, data["targets"]) if data["targets"] else {})
             targets = {}
             for key, expected in data["targets"].items():
                 if key in current:
@@ -146,5 +179,7 @@ def synchronize(directory, executable, locked=False, *, tree=None):
         atomic_write(directory / "workspace.kitty-session", data["snapshot"])
         atomic_write(directory / "panes.json", json.dumps(data["panes"]) + "\n")
         journal.unlink()
+        for pane in data["receipts"]:
+            (directory / "transport-ended" / pane).unlink(missing_ok=True)
         cli.log_pane_event("pane_destroyed", sorted(data["receipts"]))
         return len(data["receipts"])

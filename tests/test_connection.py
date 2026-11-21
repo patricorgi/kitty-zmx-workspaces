@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -126,6 +127,23 @@ class EndpointTests(unittest.TestCase):
 
 
 class AttachmentTests(unittest.TestCase):
+    def test_transport_completion_requires_origin_readiness(self):
+        popen = subprocess.Popen
+        for ready in (False, True):
+            with self.subTest(ready=ready), patch("kzw.attachment.user_var"):
+                attachment = Attachment("Test", "origin", PANE)
+                attachment.direct = True
+                try:
+                    data = attachment.marker if ready else b""
+                    def launch(_command, **options):
+                        return popen([sys.executable, "-c", f"import os; os.write(1, {data!r}); raise SystemExit(255)"],
+                                     **options)
+                    with patch("kzw.attachment.subprocess.Popen", side_effect=launch):
+                        self.assertEqual(attachment.run(["ssh", "-t", "origin", "command"], {}).returncode, 255)
+                    self.assertIs(attachment.transport_ended, ready)
+                finally:
+                    attachment.close()
+
     def test_new_pane_connects_and_existing_pane_restores_including_transport_start(self):
         endpoint = types.SimpleNamespace(identity={}, close=Mock())
         for existing, expected in ((False, "connecting"), (True, "restoring")):
