@@ -82,8 +82,9 @@ def run():
     import subprocess
 
     sys.path.insert(0, str(ROOT))
-    from kzw.cli import list_os_windows, view_state
+    from kzw.cli import view_state
     from kzw.core import PANE
+    from kzw.kitty_instance import remote_raw
 
     instance_pid, source_id, pane, encoded, _, *original = sys.argv[1:]
     workspace = json.loads(encoded)
@@ -92,12 +93,15 @@ def run():
     context.update(workspace)
     try:
         target_id = int(context["KITTY_WINDOW_ID"])
+        source_id, instance_pid = int(source_id), int(instance_pid)
         if not PANE.fullmatch(pane):
             raise ValueError("invalid source pane ID")
         view = view_state(Path(context["KZW_WORKSPACE_DIRECTORY"]))
-        if view is not None and view["instance_pid"] == int(instance_pid) and view["address"] == context.get("KITTY_LISTEN_ON"):
-            tree = list_os_windows(view["address"])
-            if check_target(view, tree, int(instance_pid), int(source_id), pane, target_id, context):
+        if view is not None and view["instance_pid"] == instance_pid and view["address"] == context.get("KITTY_LISTEN_ON"):
+            # Match whole tabs, not just the two panes: the target must be a singleton.
+            tree = json.loads(remote_raw(view["address"], "ls", "--match-tab",
+                                         f"window_id:{source_id} or window_id:{target_id}"))
+            if check_target(view, tree, instance_pid, source_id, pane, target_id, context):
                 executable = str(ROOT / "bin/kzw-pane")
                 return os.execve(executable, [executable], context)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:

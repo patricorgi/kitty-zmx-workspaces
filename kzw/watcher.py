@@ -60,6 +60,6 @@ def on_cmd_startstop(boss, window, data):
 
 
 def on_close(boss, window, data):
-    # This event does not contain a close reason: it is only a hint to
-    # reconcile, never permission to remove a pane or kill a session.
+    # This watcher only signals view changes. Confirmed Kitty 0.51 closes
+    # in shared instances are handled separately by native_close.py.
     _notify(window)

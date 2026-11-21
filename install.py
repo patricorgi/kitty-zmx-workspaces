@@ -39,10 +39,14 @@ def install_kitty_hook(config, root):
     """Kitty has one launch wrapper slot. Never replace an existing hook."""
     path = Path(config) / "launch_wrapper.py"
     expected = root / "kzw" / "native_tab.py"
-    if path.is_symlink() and path.resolve() == expected:
-        return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.symlink_to(expected)
+    if not (path.is_symlink() and path.resolve() == expected):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(expected)
+    conf = path.with_name("kitty.conf")
+    watcher = f"watcher {root / 'kzw/native_close.py'}"
+    if not conf.exists() or watcher not in conf.read_text().splitlines():
+        with conf.open("a", encoding="utf-8") as file:
+            file.write(f"\n# kzw native pane-close integration\n{watcher}\n")
     return path
 
 
@@ -64,7 +68,7 @@ def main():
         Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "kitty")
     try:
         path = install_kitty_hook(config, root)
-        print(f"Native tab hook installed at {path} (Kitty 0.51+; reload Kitty config if already running).")
+        print(f"Native tab and pane-close hooks installed in {path.parent} (Kitty 0.51+; reload Kitty config).")
         return 0
     except FileExistsError:
         print(f"kzw install: leaving {Path(config) / 'launch_wrapper.py'} unchanged; "

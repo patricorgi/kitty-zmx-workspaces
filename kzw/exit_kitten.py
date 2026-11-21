@@ -3,6 +3,7 @@
 import json
 
 from kittens.tui.handler import result_handler
+from kitty.constants import version
 
 
 def main(args):
@@ -17,7 +18,9 @@ def handle_result(args, answer, target_window_id, boss):
         window = boss.window_id_map.get(int(key))
         if window is None:
             continue
-        actual = {"id": window.id, "pid": window.child.pid, "os_window_id": window.os_window_id,
+        # Kitty 0.50+ reports the root PID (without launch wrappers) in ls.
+        pid = window.child.root_pid if version >= (0, 50, 0) else window.child.pid
+        actual = {"id": window.id, "pid": pid, "os_window_id": window.os_window_id,
                   "pane": window.user_vars.get("kzw_pane"), "ended": window.user_vars.get("kzw_attach_ended")}
         if actual != expected or actual["ended"] != "1":
             raise ValueError("pane changed before acknowledged exit close")

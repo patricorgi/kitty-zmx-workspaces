@@ -42,18 +42,19 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         # One unmanaged OS window proves that detach only closes our workspace.
         session.write_text("new_tab Keep\nlaunch /bin/sh\n")
         config = "NONE"
-        if self._testMethodName == "test_native_tab_uses_shared_workspace_without_helper_mapping":
+        if self._testMethodName.startswith("test_native_"):
             from install import install_kitty_hook
             version = subprocess.check_output(["kitty", "--version"], text=True).split()[1]
             if tuple(map(int, version.split("."))) < (0, 51):
                 shutil.rmtree(self.tmp)
                 self.skipTest("Kitty 0.51+ required")
             confdir = self.tmp / "kitty"
-            install_kitty_hook(confdir, REPO)
+            confdir.mkdir()
             self.env["KITTY_CONFIG_DIRECTORY"] = str(confdir)
             self.env["KITTY_CACHE_DIRECTORY"] = str(self.tmp / "kitty-cache")
             config = str(confdir / "kitty.conf")
             Path(config).write_text("shell /bin/sh\n")
+            install_kitty_hook(confdir, REPO)
         self.instance = subprocess.Popen(
             ["kitty", "--single-instance", "--instance-group", self.group,
              "--start-as=hidden", "--listen-on", "unix:" + str(self.sock),
@@ -158,14 +159,34 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         view = json.loads((directory / "view.json").read_text())
         initial = json.loads((directory / "panes.json").read_text())
 
+        probe = self.tmp / "native_tab_timing.py"
+        probe.write_text(
+            "import json, time\n"
+            "from kittens.tui.handler import result_handler\n"
+            "def main(args): pass\n"
+            "@result_handler(no_ui=True)\n"
+            "def handle_result(args, answer, target_window_id, boss):\n"
+            "    source = boss.window_id_map[target_window_id]\n"
+            "    manager = boss.active_tab_manager\n"
+            "    assert source.os_window_id == manager.os_window_id\n"
+            "    before = {t.id for t in manager}\n"
+            "    started = time.perf_counter()\n"
+            "    boss.new_tab()\n"
+            "    ms = (time.perf_counter() - started) * 1000\n"
+            "    assert manager.active_tab.id not in before\n"
+            "    return json.dumps(ms)\n")
+
         def add_tab(in_workspace, use_last=False):
             windows = json.loads(self.raw("ls"))
             ow = next(w for w in windows if (w["id"] == view["os_window_id"]) == in_workspace)
             window_id = ow["tabs"][-1 if use_last else 0]["windows"][0]["id"]
             self.raw("focus-window", "--match", f"id:{window_id}")
-            self.raw("action", "--match", f"id:{window_id}", "new_tab")
+            ms = json.loads(self.raw("kitten", "--match", f"id:{window_id}", str(probe)))
+            if os.environ.get("KZW_TIME_TAB") == "1":
+                print(f"{'managed' if in_workspace else 'ordinary'} native tab create + focus: {ms:.1f} ms", flush=True)
 
         for count in (2, 3):
+            started = time.monotonic()
             add_tab(True, use_last=True)
             deadline = time.monotonic() + 20
             while len(panes := json.loads((directory / "panes.json").read_text())) != count:
@@ -175,6 +196,8 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
                                for w in tree]
                     self.fail(f"native tab was not captured: {summary}\n" + (directory / "supervisor.log").read_text())
                 time.sleep(0.1)
+            if os.environ.get("KZW_TIME_TAB") == "1":
+                print(f"native tab + saved layout: {(time.monotonic() - started)*1000:.0f} ms", flush=True)
         self.assertTrue(set(initial) < set(panes))
         self.assertEqual(self.sessions() - self.baseline, set(panes))
         add_tab(False)
@@ -197,6 +220,54 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         restored = next(w for w in json.loads(self.raw("ls")) if w["id"] == attached["os_window_id"])
         self.assertEqual(len(restored["tabs"]), 3)
         self.assertEqual({w["user_vars"]["kzw_pane"] for t in restored["tabs"] for w in t["windows"]}, set(panes))
+
+    def test_native_confirmed_close_from_a_native_tab_and_last_pane(self):
+        self.baseline = self.sessions()
+        result = self.kzw("create", "Test", "--attach")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        directory = self.state / "kzw" / "Test"
+        view = json.loads((directory / "view.json").read_text())
+
+        def panes():
+            return {w["user_vars"]["kzw_pane"]: w["id"] for ow in json.loads(self.raw("ls"))
+                    if ow["id"] == view["os_window_id"] for t in ow["tabs"] for w in t["windows"]
+                    if w["user_vars"].get("kzw_pane")}
+
+        def wait_for(condition):
+            deadline = time.monotonic() + 20
+            while not condition():
+                if time.monotonic() >= deadline:
+                    self.fail((directory / "supervisor.log").read_text())
+                time.sleep(0.1)
+
+        original, anchor = next(iter(panes().items()))
+        self.raw("focus-window", "--match", f"id:{anchor}")
+        self.raw("action", "--match", f"id:{anchor}", "new_tab")
+        wait_for(lambda: len(json.loads((directory / "panes.json").read_text())) == 2)
+        second = next(p for p in panes() if p != original)
+        # Exercise Kitty's real on_close dispatch and confirmation callback
+        # without posting a physical key to the user's active desktop.
+        confirm = self.tmp / "confirm_close.py"
+        confirm.write_text(
+            "from kittens.tui.handler import result_handler\n"
+            "def main(args): pass\n"
+            "@result_handler(no_ui=True)\n"
+            "def handle_result(args, answer, target_window_id, boss):\n"
+            "    target = int(args[1])\n"
+            "    assert target in boss.window_id_map\n"
+            "    boss.handle_close_window_confirmation(True, target)\n")
+        for pane, survivor in ((second, {original}), (original, set())):
+            wid = panes()[pane]
+            self.raw("kitten", "--match", f"id:{wid}", str(confirm), str(wid))
+            wait_for(lambda: self.sessions() - self.baseline == survivor)
+            self.assertEqual(set(json.loads((directory / "panes.json").read_text())), survivor)
+        wait_for(lambda: "Test" not in self.kzw("list").stdout.splitlines())
+        wait_for(lambda: not (directory / "view.json").exists())
+        result = self.kzw("create", "Test", "--attach")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        replacement, = self.sessions() - self.baseline
+        self.assertNotIn(replacement, {original, second})
+        self.assertIsNone(self.instance.poll())
 
     def test_managed_queue_tab_is_listed_saved_and_resumed(self):
         from kzw.core import saved_focus

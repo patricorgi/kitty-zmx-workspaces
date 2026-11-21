@@ -22,5 +22,6 @@ class NativeTabTests(unittest.TestCase):
         self.assertFalse(check(tree, address="unix:/other"))
         self.assertFalse(check([{"id": 1, "tabs": [a]}, {"id": 2, "tabs": [b]}]))
         self.assertFalse(check([{"id": 1, "tabs": [{"id": 1, "windows": [source, target]}]}]))
+        self.assertFalse(check([{"id": 1, "tabs": [a, {"id": 2, "windows": [target, {"id": 12}]}]}]))
         source["user_vars"]["kzw_origin"] = "other"
         self.assertFalse(check(tree))

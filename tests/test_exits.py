@@ -2,11 +2,14 @@ import copy
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from kzw import cli, exits, remote_client
 from kzw.layout_prune import prune_snapshot
@@ -14,6 +17,27 @@ from kzw.remote import Store, response, zmx_exit_receipt
 from test_layout_prune import snapshot
 
 A, B, C = ("kzw-" + c * 32 for c in "abc")
+
+
+class ExitKittenTests(unittest.TestCase):
+    def test_exact_pid_matches_kitty_listing_including_launch_wrappers(self):
+        window = SimpleNamespace(id=17, os_window_id=2, child=SimpleNamespace(pid=40, root_pid=41),
+                                 user_vars={"kzw_pane": A, "kzw_attach_ended": "1"})
+        for version, pid, wrong_pid in (((0, 49, 2), 40, 41), ((0, 51, 0), 41, 40)):
+            with self.subTest(version=version), patch.dict(sys.modules, {
+                "kittens.tui.handler": SimpleNamespace(result_handler=lambda **kwargs: lambda fn: fn),
+                "kitty.constants": SimpleNamespace(version=version),
+            }):
+                handle = runpy.run_path(str(Path(exits.__file__).with_name("exit_kitten.py")))["handle_result"]
+                boss = SimpleNamespace(window_id_map={17: window}, mark_window_for_close=Mock())
+                target = {"id": 17, "pid": wrong_pid, "os_window_id": 2, "pane": A, "ended": "1"}
+                with self.assertRaisesRegex(ValueError, "pane changed"):
+                    handle(["", json.dumps({"17": target})], None, 17, boss)
+                boss.mark_window_for_close.assert_not_called()
+                target["pid"] = pid
+                self.assertEqual(json.loads(handle(["", json.dumps({"17": target})], None, 17, boss)),
+                                 {"closed": ["17"]})
+                boss.mark_window_for_close.assert_called_once_with(window)
 
 
 def lifecycle(pane, pid=2147483647):
@@ -83,12 +107,12 @@ class ExitTests(unittest.TestCase):
             export = "\n".join(line for line in self.source.splitlines() if not line.startswith("# kzw-focus ")) + "\n"
             return json.dumps({"os_window_id": 5, "tree": self.tree, "session": export})
         targets = json.loads(args[-1])
-        # At the instant of UI mutation both the authoritative and cached
-        # layouts must already exclude the exact ended sessions.
-        committed = self.request({"method": "workspace.get", "workspace": "Test"})
+        # The durable plan must exist, but the view must not wait for publication.
+        plan = json.loads((directory / "pending-exit.json").read_text())
         for target in targets.values():
-            self.assertNotIn(target["pane"], committed["panes"])
-            self.assertNotIn(target["pane"], json.loads((directory / "panes.json").read_text()))
+            self.assertIn(target["pane"], plan["receipts"])
+            self.assertNotIn(target["pane"], plan["panes"])
+            self.assertIn(target["pane"], json.loads((directory / "panes.json").read_text()))
         self.closes.append(targets)
         for ow in self.tree:
             for tab in ow["tabs"]:
@@ -198,7 +222,7 @@ class ExitTests(unittest.TestCase):
             cli.create_pane("Test", "tab", 1, A, "")
         check.assert_called_once()
 
-    def test_positive_exit_commits_before_exact_view_close_without_kill(self):
+    def test_positive_exit_closes_exact_view_before_publish_without_kill(self):
         self.ended(B)
         self.requests.clear()
         self.assertEqual(self.sync(), 1)
@@ -299,7 +323,7 @@ class ExitTests(unittest.TestCase):
         self.assertEqual(self.sync(), 0)
         self.assertFalse(self.closes)
 
-    def test_lost_commit_reply_replays_same_operation_before_closing(self):
+    def test_lost_commit_reply_replays_same_operation_after_closing(self):
         self.ended(B)
         dropped = []
 
@@ -313,7 +337,7 @@ class ExitTests(unittest.TestCase):
         with patch("kzw.remote_client.call", side_effect=lost):
             with self.assertRaises(OSError):
                 self.sync()
-            self.assertFalse(self.closes)
+            self.assertEqual(len(self.closes), 1)
             self.assertTrue((self.directory / "pending-exit.json").exists())
             (self.zmx / "logs" / (B + ".log")).unlink()  # Replay uses the committed receipt.
             with self.assertRaisesRegex(ValueError, "exit"):
@@ -322,8 +346,9 @@ class ExitTests(unittest.TestCase):
         attempts = [r for r in self.requests if r["method"] == "panes.exited"]
         self.assertEqual(len(attempts), 2)
         self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(len(self.closes), 1)
 
-    def test_lost_view_close_ack_is_recoverable_without_republishing(self):
+    def test_lost_view_close_ack_is_recoverable_without_reclosing(self):
         self.ended(B)
 
         def lost(directory, *args):
@@ -336,7 +361,7 @@ class ExitTests(unittest.TestCase):
             self.sync()
         revision = json.loads((self.directory / "remote.json").read_text())["revision"]
         self.assertEqual(self.sync(), 1)
-        self.assertEqual(json.loads((self.directory / "remote.json").read_text())["revision"], revision)
+        self.assertEqual(json.loads((self.directory / "remote.json").read_text())["revision"], revision + 1)
         self.assertEqual(len(self.closes), 1)
 
     def test_server_revalidates_evidence_and_lease_before_layout_removal(self):
@@ -374,8 +399,9 @@ class ExitTests(unittest.TestCase):
 
         with patch("kzw.exits.atomic_write", side_effect=fail), self.assertRaises(OSError):
             self.sync()
-        self.assertFalse(self.closes)
+        self.assertEqual(len(self.closes), 1)
         self.assertEqual(self.sync(), 1)
+        self.assertEqual(len(self.closes), 1)
 
     def test_incomplete_exit_blocks_new_attachment_before_lease_or_view_changes(self):
         journal = self.directory / "pending-exit.json"
@@ -389,7 +415,7 @@ class ExitTests(unittest.TestCase):
         remove.assert_not_called()
         self.assertEqual(journal.read_text(), '{"interrupted":true}\n')
 
-    def test_stale_revision_and_foreign_owner_cannot_close_even_after_commit(self):
+    def test_stale_revision_and_foreign_owner_cannot_replay_view_close(self):
         self.ended(B)
         with patch("kzw.cli.view_query", side_effect=lambda d, *a: (_ for _ in ()).throw(OSError("close failed"))
                    if a[0] == "kitten" and a[3].endswith("/exit_kitten.py") else self.kitty(d, *a)), self.assertRaises(OSError):
@@ -402,7 +428,7 @@ class ExitTests(unittest.TestCase):
             self.sync()
         self.assertFalse(self.closes)
 
-    def test_final_kitty_disappearance_finishes_only_after_commit_and_wrapper_exit(self):
+    def test_final_kitty_disappearance_can_publish_after_wrapper_exit(self):
         self.ended(A, B, C)
         closed = []
 

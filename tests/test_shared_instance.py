@@ -99,7 +99,9 @@ class ViewStateTests(unittest.TestCase):
             directory = Path(tmp)
             self.assertIsNone(cli.view_state(directory))
             cli.write_view(directory, "unix:/tmp/sock", 7, 42, [PANE_B, PANE_A])
-            self.assertEqual(cli.view_state(directory), {
+            view = cli.view_state(directory)
+            self.assertRegex(view.pop("generation"), r"^[a-f0-9]{32}$")
+            self.assertEqual(view, {
                 "address": "unix:/tmp/sock", "instance_pid": 7,
                 "os_window_id": 42, "panes": [PANE_A, PANE_B]})
             self.assertTrue((directory / "kitty.sock").exists())

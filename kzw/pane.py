@@ -185,6 +185,9 @@ def wait_for_native_stage(pane, host):
     if signal:
         with open(signal, "a", encoding="utf-8"):
             os.utime(signal, None)
+    # A local capture can finish just after the first check. Poll briefly at
+    # startup, then back off to the normal rate for slow or offline origins.
+    delay = 0.01
     while True:
         if journal.is_symlink() or not journal.is_file():
             raise RuntimeError("native creation journal disappeared before staging")
@@ -201,7 +204,8 @@ def wait_for_native_stage(pane, host):
                     pane not in data.get("panes", [])):
                 raise RuntimeError("native layout acknowledgement does not match stage")
             return
-        threading.Event().wait(0.1)
+        threading.Event().wait(delay)
+        delay = min(delay * 2, 0.1)
 
 
 def main():

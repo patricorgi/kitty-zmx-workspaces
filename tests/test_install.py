@@ -56,9 +56,14 @@ class InstallTests(unittest.TestCase):
     def test_hook_only_is_idempotent_and_does_not_install_launchers(self):
         with tempfile.TemporaryDirectory() as home:
             config = Path(home) / "kitty"
+            config.mkdir()
+            conf = config / "kitty.conf"
+            conf.write_text("map f9 new_tab\n")
             env = {**os.environ, "HOME": home, "KITTY_CONFIG_DIRECTORY": str(config)}
             for _ in range(2):
                 subprocess.run([sys.executable, str(ROOT / "install.py"), "--kitty-hook-only"], env=env,
                                capture_output=True, text=True, timeout=10, check=True)
             self.assertEqual((config / "launch_wrapper.py").resolve(), ROOT / "kzw/native_tab.py")
+            self.assertTrue(conf.read_text().startswith("map f9 new_tab\n"))
+            self.assertEqual(conf.read_text().count("watcher " + str(ROOT / "kzw/native_close.py")), 1)
             self.assertFalse((Path(home) / ".local/bin/kzw").exists())

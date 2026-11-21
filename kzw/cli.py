@@ -93,6 +93,8 @@ def view_state(directory):
             not data["address"].startswith(("unix:", "tcp:")) or
             type(data.get("instance_pid")) is not int or data["instance_pid"] <= 0 or
             type(data.get("os_window_id")) is not int or data["os_window_id"] <= 0 or
+            ("generation" in data and (not isinstance(data["generation"], str) or
+                                       not re.fullmatch(r"[a-f0-9]{32}", data["generation"]))) or
             not isinstance(data.get("panes"), list) or
             any(not isinstance(pane, str) or not PANE.fullmatch(pane) for pane in data["panes"])):
         raise ValueError("invalid workspace view state")
@@ -274,13 +276,13 @@ def view_marker(window):
 
 def write_view(directory, address, instance_pid, os_window_id, panes):
     data = {"address": address, "instance_pid": instance_pid,
-            "os_window_id": os_window_id, "panes": sorted(panes)}
+            "os_window_id": os_window_id, "panes": sorted(panes), "generation": uuid.uuid4().hex}
     atomic_write(directory / "view.json", json.dumps(data, separators=(",", ":")) + "\n")
     atomic_write(directory / "kitty.sock", "")
 
 
 def remove_view(directory):
-    for item in ("view.json", "kitty.sock"):
+    for item in ("view.json", "kitty.sock", "native-close.jsonl"):
         try:
             (directory / item).unlink()
         except FileNotFoundError:
@@ -882,7 +884,19 @@ def cleanup_close_locked(directory):
     if data.get("remote"):
         if not (directory / "remote.json").exists():
             raise ValueError("remote close record has no remote configuration")
-        remote_client.retry_cleanup(directory)
+        if "retire_revision" not in data:
+            remote_client.retry_cleanup(directory)
+            if data.get("last"):
+                from . import local_tabs
+                if local_tabs.request(directory)["tab"] is None:
+                    config = json.loads((directory / "remote.json").read_text())
+                    if (config.get("pending") or config["panes"] != [] or
+                            (directory / "workspace.kitty-session").read_text() != EMPTY_SNAPSHOT):
+                        raise ValueError("final close has no committed empty workspace to retire")
+                    data["retire_revision"] = config["revision"]
+                    atomic_write(path, json.dumps(data) + "\n")
+        if "retire_revision" in data:
+            retire_after_close(directory, data)
         path.unlink()
         return [entry["pane"] for entry in entries]
     closed = []
@@ -902,6 +916,30 @@ def cleanup_close_locked(directory):
     if data.get("last"):
         retire_local_empty(directory)
     return closed
+
+
+def retire_after_close(directory, record, *, check_only=False):
+    """Replay retirement of the exact empty revision this close produced."""
+    config = json.loads((directory / "remote.json").read_text())
+    revision = record["retire_revision"]
+    host, name = config["host"], config["workspace"]
+    if (record.get("last") is not True or record.get("remote") is not True or
+            type(revision) is not int or config.get("revision") != revision or
+            config.get("state_home", "") != remote_client.origin_state_home(host)):
+        raise ValueError("invalid final-close retirement record")
+    state = remote_client.call(host, {"method": "workspace.get", "workspace": name})
+    if not state.get("exists") and state.get("revision") == revision + 2:
+        return True  # Retirement committed before the client observed the reply.
+    if check_only:
+        return False
+    token = remote_client.lease_token(directory)
+    if (not token or not state.get("exists") or state.get("panes") != [] or
+            state.get("snapshot") != EMPTY_SNAPSHOT or state.get("revision") not in (revision, revision + 1)):
+        raise ValueError("workspace changed before final-close retirement")
+    # The next revision is accepted only by the server's idempotent kill replay.
+    remote_client.call(host, {"method": "workspace.kill", "workspace": name,
+                              "revision": revision, "lease_token": token})
+    return True
 
 
 def close_pane(name, window_id, origin=""):
@@ -1175,12 +1213,23 @@ def resume_partial_close_locked(directory, record, pending):
 
 def retry_close(name, origin=""):
     directory = state_dir(name, origin) if origin else state_dir(name)
+    pending = directory / "pending-close.json"
+    with capture_lock(directory):
+        if pending.is_file():
+            record = json.loads(pending.read_text())
+            if (record.get("phase") == "layout-saved" and "retire_revision" in record and
+                    retire_after_close(directory, record, check_only=True)):
+                pending.unlink()
+                return
     with recovery_lease(directory), capture_lock(directory):
         if not (directory / "pending-close.json").exists():
             raise ValueError("no pending close")
         pending = directory / "pending-close.json"
         record = json.loads(pending.read_text())
-        if record.get("phase") == "closing" and record.get("last") is True:
+        if record.get("phase") == "closing" and record.get("kind") == "native":
+            from .native_close import finish_locked
+            finish_locked(directory, record, pending)
+        elif record.get("phase") == "closing" and record.get("last") is True:
             # The final close was explicitly authorized and journaled before
             # publishing. Replaying the same remote request handles a lost ack.
             if record.get("remote"):
@@ -1668,12 +1717,17 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         workspace_observed = False
         empty_since = None
         next_view_check = 0.0
+        next_native_close_check = 0.0
         source_window = None if shared is not None else supervisor_window.source_window()
         minimize_attempted = False
         try:
             atomic_write(directory / "local-tab-capability.json", json.dumps({"pid": os.getpid()}) + "\n")
             while child is None or child.poll() is None:
                 try:
+                    if view_written and workspace_observed and time.monotonic() >= next_native_close_check:
+                        from .native_close import synchronize
+                        next_native_close_check = time.monotonic() + 0.5
+                        synchronize(directory, pane_executable)
                     # Check for a vanished view even while the first capture is
                     # still pending, so a closed window cannot strand us here.
                     if (view_written or workspace_observed) and time.monotonic() >= next_view_check:
@@ -1804,6 +1858,9 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                         print(f"kzw: restore the supervisor window from the Dock: {exc}", file=sys.stderr, flush=True)
                 if view_written and view_gone:
                     remove_view(directory)
+                    if not remote_attached:
+                        with capture_lock(directory):
+                            retire_local_empty(directory)
                 if view_written and shared is not None:
                     try:
                         kitty_instance.tab_style(shared["address"], shared["pid"], "restore")

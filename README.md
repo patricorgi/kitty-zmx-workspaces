@@ -19,10 +19,10 @@ export PATH="$HOME/.local/bin:$PATH"
 Keep the checkout in place. Add the PATH line to your shell configuration to
 use the installed commands in new terminals.
 
-On Kitty 0.51+, the installer adds a native tab hook without changing
-`kitty.conf` or your key bindings. Existing kzw installs can run
-`python3 install.py --kitty-hook-only`, then reload Kitty's configuration.
-An existing `launch_wrapper.py` is left untouched.
+On Kitty 0.51+, the installer adds a native tab hook and a pane-close watcher
+without changing your key bindings. Existing kzw installs can run
+`python3 install.py --kitty-hook-only`, then reload Kitty's configuration and
+reattach the workspace. An existing custom `launch_wrapper.py` is left untouched.
 
 ## Basic commands
 
@@ -49,9 +49,14 @@ Add `--host HOST` for a remote workspace. For example, run
   listening socket. Use `--new-kitty-instance` to open a separate instance.
 - With the Kitty 0.51+ hook, plain native `new_tab` from a managed pane starts
   another zmx session in that workspace. Explicit commands and tabs opened
-  from ordinary terminals are not adopted. This does not add native close
-  support; use `kzw close-tab` for a managed close.
+  from ordinary terminals are not adopted.
+- In shared Kitty, a native pane close approved in Kitty's confirmation dialog
+  removes that pane from the layout and terminates its zmx session. Use Kitty's
+  `close_window_with_confirmation` action with any key you choose. Plain
+  `close_window`, OS-window close, quit, and SSH loss do not authorize cleanup.
+  A confirmed final pane close retires the workspace after cleanup, unless it
+  still owns a separate local companion terminal.
+  Use `kzw close-tab` when you want a single managed tab-close operation.
 - Detach saves the layout. `kzw save` currently fails.
 - Explicit right and below splits are currently reversed.
-- Rename and kill require a detached workspace. Unmanaged pane and tab closes
-  are unsupported.
+- Rename and kill require a detached workspace.

@@ -1,4 +1,4 @@
-"""Acknowledge origin-proven exits before closing their exact Kitty views."""
+"""Close views for origin-proven exits and reconcile their layouts durably."""
 
 import json
 import os
@@ -60,7 +60,8 @@ def synchronize(directory, executable, locked=False, *, tree=None):
         journal = directory / "pending-exit.json"
         if journal.is_symlink():
             raise ValueError("unsafe exit journal")
-        if not journal.exists():
+        replay = journal.exists()
+        if not replay:
             if any((directory / item).exists() for item in
                    ("pending-create.json", "pending-close.json", "pending-local-kill.json",
                     "native-stage.json", "bootstrap.kitty-session")):
@@ -111,35 +112,39 @@ def synchronize(directory, executable, locked=False, *, tree=None):
 
         if cli.view_state(directory) != data["view"]:
             raise ValueError("workspace attachment changed; exit removal retained")
-        # Idempotent replay also covers a lost reply or a crash between remote
-        # acknowledgement, cache writes and the Kitty close acknowledgement.
+        if not data.get("view_closed"):
+            # The initial atomic capture already checked these identities.
+            # Kitty checks again inside its event loop immediately before close.
+            current = current_windows(directory, data["targets"]) if replay else views
+            targets = {}
+            for key, expected in data["targets"].items():
+                if key in current:
+                    if current[key] != expected or expected["ended"] != "1":
+                        raise ValueError("exited pane identity changed; close acknowledgement pending")
+                    targets[key] = expected
+            if targets:
+                if replay:
+                    # On replay, recheck the fence before acting on older evidence.
+                    remote_client.renew_lease(directory)
+                    remote_client.ensure_current_revision(directory)
+                kitten = str(Path(__file__).with_name("exit_kitten.py"))
+                try:
+                    reply = json.loads(cli.view_query(directory, "kitten", "--match", "id:" + next(iter(targets)),
+                                                      kitten, json.dumps(targets)))
+                    if reply != {"closed": sorted(targets)}:
+                        raise ValueError("exit view close was not acknowledged")
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    if not wrappers_gone(targets):
+                        raise
+                if set(data["targets"]) & set(current_windows(directory, data["targets"])):
+                    return 0
+            data["view_closed"] = True
+            atomic_write(journal, json.dumps(data) + "\n")
+        # Once the exited pane is gone, publication can retry without touching
+        # Kitty again. The origin still revalidates evidence and ownership.
         remote_client.publish(directory, data["snapshot"], data["panes"], exit_receipts=data["receipts"])
-        remote_client.renew_lease(directory)
-        remote_client.ensure_current_revision(directory)
         atomic_write(directory / "workspace.kitty-session", data["snapshot"])
         atomic_write(directory / "panes.json", json.dumps(data["panes"]) + "\n")
-        current = current_windows(directory, data["targets"])
-        targets = {}
-        for key, expected in data["targets"].items():
-            if key in current:
-                if current[key] != expected or expected["ended"] != "1":
-                    raise ValueError("exited pane identity changed; close acknowledgement pending")
-                targets[key] = expected
-        if targets:
-            kitten = str(Path(__file__).with_name("exit_kitten.py"))
-            try:
-                reply = json.loads(cli.view_query(directory, "kitten", "--match", "id:" + next(iter(targets)),
-                                                  kitten, json.dumps(targets)))
-                if reply != {"closed": sorted(targets)}:
-                    raise ValueError("exit view close was not acknowledged")
-            except (OSError, ValueError, subprocess.SubprocessError):
-                if not wrappers_gone(targets):
-                    raise
-            # Kitty schedules child teardown asynchronously. Keep the journal
-            # until a subsequent observation confirms every target disappeared.
-            current = current_windows(directory, data["targets"])
-            if set(data["targets"]) & set(current):
-                return 0
         journal.unlink()
         cli.log_pane_event("pane_destroyed", sorted(data["receipts"]))
         return len(data["receipts"])

@@ -22,7 +22,8 @@ def load_adapter(name, path=None, native_loader=False):
     native.remove_timer = Mock()
     with patch.dict(sys.modules, {"kittens": types.ModuleType("kittens"), "kittens.tui": types.ModuleType("kittens.tui"),
                                   "kittens.tui.handler": handler, "kitty": types.ModuleType("kitty"),
-                                  "kitty.session": session, "kitty.fast_data_types": native}):
+                                  "kitty.session": session, "kitty.fast_data_types": native,
+                                  "kitty.constants": types.SimpleNamespace(version=(0, 49, 2))}):
         path = path or Path(__file__).parents[1] / "kzw" / (name + "_kitten.py")
         if native_loader:
             module = types.ModuleType("kitten")
