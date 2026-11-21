@@ -56,9 +56,10 @@ and supervisor log if attachment fails.
 - A workspace uses one origin host. To attach in the current Kitty instance,
   Kitty must run in single-instance mode with remote control enabled and a
   listening socket. Use `--new-kitty-instance` to open a separate instance.
-- With the Kitty 0.51+ hook, plain native `new_tab` from a managed pane starts
-  another zmx session in that workspace. Explicit commands and tabs opened
-  from ordinary terminals are not adopted.
+- Native `new_tab` in a managed workspace requires Kitty 0.51+ and kzw's
+  launch wrapper. Explicit commands and tabs opened from ordinary terminals
+  are not adopted. In a warm benchmark on an M1 Pro, the wrapper added less
+  than 1 ms to the median paired launch time for ordinary tabs and windows.
 - In shared Kitty, a native pane close approved in Kitty's confirmation dialog
   removes that pane from the layout and terminates its zmx session. Use Kitty's
   `close_window_with_confirmation` action with any key you choose. Plain
