@@ -45,7 +45,7 @@ class AppearanceTests(unittest.TestCase):
              patch("kzw.appearance.capture", return_value=["-o", "font_size=20"]), \
              patch("kzw.cli.attach_remote", return_value=0) as attach:
             self.assertEqual(cli.main(), 0)
-        attach.assert_called_once_with("Test", "origin", appearance=["-o", "font_size=20"])
+        attach.assert_called_once_with("Test", "origin", show_preview=True, appearance=["-o", "font_size=20"])
 
     def test_create_rejects_inheritance_without_attach(self):
         with patch("sys.argv", ["kzw", "create", "Test", "--inherit-appearance"]), \

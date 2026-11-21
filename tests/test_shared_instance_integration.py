@@ -151,6 +151,44 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         output = self.raw("kitten", str(self.probe))
         return json.loads(output)
 
+    def test_attach_preview_populates_only_its_own_os_window(self):
+        from kzw.attach_preview import AttachPreview
+        from unittest.mock import patch
+
+        keep = json.loads(self.raw("ls"))[0]
+        anchor = keep["tabs"][0]["windows"][0]["id"]
+        layout = self.tmp / "preview-test.kitty-session"
+        pane = "kzw-" + "b" * 32
+        layout.write_text(f"new_tab Restored\nlaunch --var=kzw_pane={pane} /bin/sleep 600\n")
+        with patch.dict(os.environ, self.env):
+            preview = AttachPreview("Test", "example")
+            self.addCleanup(preview.close)
+            before = next(ow for ow in json.loads(self.raw("ls")) if ow["id"] != keep["id"])
+            window = before["tabs"][0]["windows"][0]
+            message = "Connecting to Test (example)..."
+            deadline = time.monotonic() + 5
+            while True:
+                screen = self.raw("get-text", "--match", f"id:{preview.window}").splitlines()
+                if any(message in row for row in screen):
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail("Connecting message did not appear")
+                time.sleep(0.05)
+            row = (window["lines"] - 1) // 2
+            self.assertEqual(screen[row].index(message), (window["columns"] - len(message)) // 2)
+            self.raw("focus-window", "--match", f"id:{anchor}")
+            self.assertEqual(int(preview.command("populate", json.dumps([str(layout), pane, 1]))), before["id"])
+            preview.populated = True
+            tree = {ow["id"]: ow for ow in json.loads(self.raw("ls"))}
+            self.assertEqual(tree[keep["id"]]["tabs"][0]["windows"][0]["id"], anchor)
+            restored = next(t for t in tree[before["id"]]["tabs"] if t["title"] == "Restored")
+            self.assertTrue(restored["is_active"])
+            self.assertEqual(restored["windows"][0]["user_vars"]["kzw_pane"], pane)
+            canceled = AttachPreview("Test", "example")
+            self.raw("close-window", "--match", f"id:{canceled.window}")
+            with self.assertRaises(subprocess.CalledProcessError):
+                canceled.command("populate", json.dumps([str(layout), pane, 1]))
+
     def test_native_tab_uses_shared_workspace_without_helper_mapping(self):
         self.baseline = self.sessions()
         created = self.kzw("create", "Test", "--attach")

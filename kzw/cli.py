@@ -333,11 +333,13 @@ def view_alive(directory, view):
     return False
 
 
-def startup_status(ok, error=None, directory=None):
+def startup_status(ok, error=None, directory=None, connecting=False):
     path = os.environ.get("KZW_STARTUP_STATUS")
     if not path:
         return
     data = {"ok": bool(ok)}
+    if connecting:
+        data["connecting"] = True
     if error is not None:
         data["error"] = str(error)
     if directory is not None:
@@ -1535,7 +1537,7 @@ def kitty_launch_command(args, env):
 
 @remote_client.persistent_rpc(reuse=True)
 def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session=None, create_empty=False,
-        appearance=None, new_instance=False):
+        appearance=None, new_instance=False, preview=None):
     directory = state_dir(name, host) if remote_attached else state_dir(name)
     if (directory / "remote.json").exists() and not remote_attached:
         raise ValueError("coordinator workspace: use kzw attach NAME (add --host for a remote origin)")
@@ -1570,7 +1572,9 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             else:
                 raise ValueError(f"socket already exists: {sock}; check for a running Kitty before removing it")
         shared = None
-        if not new_instance:
+        if preview is not None:
+            shared = preview.shared
+        elif not new_instance:
             shared = kitty_instance.context()
             kitty_instance.probe(shared["address"])
         if not remote_attached:
@@ -1668,16 +1672,21 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 if variables is None:
                     raise ValueError("shared Kitty view has no workspace metadata")
                 runtime_session, expected = write_runtime_session(directory, session, env, variables)
-                before_ids = {window.get("id") for window in list_os_windows(shared["address"])}
-                result = subprocess.run(kitty_instance.launch_command(shared["group"], runtime_session),
-                                        env=os.environ.copy(), stdin=subprocess.DEVNULL,
-                                        capture_output=True, text=True, timeout=120)
-                if result.returncode:
-                    detail = (result.stderr or result.stdout or "").strip()
-                    raise ValueError("Kitty did not accept the shared workspace window" +
-                                     (": " + detail.splitlines()[-1] if detail else ""))
-                os_window_id = identify_os_window(shared["address"], before_ids, expected)
+                if preview is not None:
+                    os_window_id = int(preview.command("populate", json.dumps([str(runtime_session), focus, len(expected)])))
+                else:
+                    before_ids = {window.get("id") for window in list_os_windows(shared["address"])}
+                    result = subprocess.run(kitty_instance.launch_command(shared["group"], runtime_session),
+                                            env=os.environ.copy(), stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=120)
+                    if result.returncode:
+                        detail = (result.stderr or result.stdout or "").strip()
+                        raise ValueError("Kitty did not accept the shared workspace window" +
+                                         (": " + detail.splitlines()[-1] if detail else ""))
+                    os_window_id = identify_os_window(shared["address"], before_ids, expected)
                 write_view(directory, shared["address"], shared["pid"], os_window_id, expected)
+                if preview is not None:
+                    preview.populated = True
                 view_written = True
                 try:
                     kitty_instance.tab_style(shared["address"], shared["pid"], "apply")
@@ -1748,7 +1757,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             raise
         last_error = None
         reported_started = False
-        pending_focus = focus
+        pending_focus = focus if preview is None else None
         local_restored = False
         change_signal = directory / "watcher.changed"
         wait_for_change = resources.enter_context(watch_workspace_changes(change_signal))
@@ -2167,7 +2176,7 @@ def retire_empty_coordinator_workspace(directory, name, host):
 
 
 @remote_client.persistent_rpc()
-def attach_remote(name, host, create_empty=False, appearance=None, new_instance=False):
+def attach_remote(name, host, create_empty=False, appearance=None, new_instance=False, show_preview=False):
     directory = state_dir(name, host)
     executable = shutil.which("kzw-pane")
     if not executable:
@@ -2185,6 +2194,8 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
             view = None
         if view is not None or (directory / "kitty.sock").exists() or (directory / "pending-close.json").exists():
             raise ValueError("local workspace may still be active or has a pending close")
+        if (directory / "pending-local-kill.json").exists():
+            raise ValueError("workspace termination is incomplete; retry kzw kill")
         pending = directory / "pending-create.json"
         recovering_bootstrap = False
         recovering_managed = False
@@ -2192,11 +2203,17 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
             record = json.loads(pending.read_text())
             recovering_bootstrap = record.get("kind") == "bootstrap"
             recovering_managed = not recovering_bootstrap
-        with remote_client.reuse_configured_ssh_once(host):
-            remote_client.acquire_lease(directory, name, host)
+        preview = None
+        if show_preview and host and not new_instance and not create_empty and not pending.exists():
+            from .attach_preview import AttachPreview
+            preview = AttachPreview(name, host)
+            startup_status(True, directory=directory, connecting=True)
+            os.environ.pop("KZW_STARTUP_STATUS", None)
         stop_heartbeat = lambda: None
         appearance_arg = {"appearance": appearance} if appearance is not None else {}
         run_arg = {"new_instance": True} if new_instance else {}
+        if preview is not None:
+            run_arg["preview"] = preview
 
         def run_attached(**kwargs):
             result = run(name, host, remote_attached=True, existing_lock=lock, **appearance_arg, **run_arg, **kwargs)
@@ -2208,7 +2225,13 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
                     print(f"kzw: empty workspace retirement deferred: {exc}", file=sys.stderr, flush=True)
             return result
 
+        leased = False
         try:
+            with remote_client.reuse_configured_ssh_once(host):
+                remote_client.acquire_lease(directory, name, host)
+            leased = True
+            if preview is not None:
+                preview.command("check")
             stop_heartbeat = remote_client.start_lease_heartbeat(directory)
             if recovering_managed:
                 if create_empty:
@@ -2234,10 +2257,17 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
                 for pane in transport_candidates(directory, saved):
                     (directory / "transport-ended" / pane).unlink(missing_ok=True)
             return run_attached(create_empty=True) if create_empty else run_attached()
+        except Exception as exc:
+            if preview is not None and not preview.populated:
+                preview.error(exc)
+            raise
         finally:
+            if preview is not None and not preview.populated and sys.exc_info()[0] in (None, KeyboardInterrupt):
+                preview.close()
             stop_heartbeat()
             try:
-                remote_client.release_lease(directory)
+                if leased:
+                    remote_client.release_lease(directory)
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 print(f"kzw: remote lease release deferred: {exc}", file=sys.stderr, flush=True)
 
@@ -2392,7 +2422,9 @@ def spawn_background(args):
                 status.unlink()
             except FileNotFoundError:
                 pass
-            print(f"Workspace {args.name!r} started in the background; log: {log}")
+            action = "Connecting" if data.get("connecting") else "Workspace"
+            detail = "" if data.get("connecting") else " started in the background"
+            print(f"{action} {args.name!r}{detail}; log: {log}")
             return 0
         if isinstance(data, dict) and isinstance(data.get("error"), str):
             try:
@@ -2587,7 +2619,8 @@ def main():
             rename_workspace(args.name, args.destination, args.host)
             return 0
         if args.command == "attach":
-            return attach_remote(args.name, args.host, **appearance_arg, **run_arg)
+            preview_arg = {"show_preview": True} if args.host and not run_arg else {}
+            return attach_remote(args.name, args.host, **preview_arg, **appearance_arg, **run_arg)
         if args.command == "inspect":
             inspect_remote(args.name, args.host, args.json)
             return 0

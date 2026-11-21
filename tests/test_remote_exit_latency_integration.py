@@ -62,9 +62,15 @@ class RemoteExitLatencyIntegrationTests(unittest.TestCase):
         self.assertEqual(remote_identities(), before)
         result = kit.kzw("detach", "Test", "--host", host)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        started = time.monotonic()
         result = kit.kzw("attach", "Test", "--host", host)
+        preview_elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Connecting 'Test'", result.stdout)
         rows = fixture.wait(lambda: rows if len(rows := fixture.windows()) == 3 else None)
+        fixture.wait(lambda: (directory / "view.json").is_file())
+        print(f"Remote attach: {preview_elapsed:.2f}s to preview acknowledgement; "
+              f"{time.monotonic() - started:.2f}s to registered layout", flush=True)
         original = {w["id"]: w for w in rows}
         source, split, tab = sorted(original)
         self.assertEqual(remote_identities(), before)
@@ -82,7 +88,10 @@ class RemoteExitLatencyIntegrationTests(unittest.TestCase):
                     last_send[0] = time.monotonic()
                 return False
 
-            fixture.wait(ready)
+            try:
+                fixture.wait(ready)
+            except AssertionError as exc:
+                self.fail(f"{exc}\n{(directory / 'supervisor.log').read_text()}")
             start = time.monotonic()
             kit.raw("send-text", "--match", "id:" + str(wid), text)
             fixture.wait(lambda: wid not in {w["id"] for w in fixture.windows()})

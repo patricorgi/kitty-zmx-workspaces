@@ -40,6 +40,11 @@ kzw --help                 # Show all commands
 Add `--host HOST` for a remote workspace. For example, run
 `kzw create Demo --attach --host HOST`.
 
+When you run `kzw attach Demo --host HOST` from shared Kitty, a **Connecting**
+window opens before SSH validation finishes. The saved layout loads into that
+same window once verified. Close the preview to cancel, or check the window
+and supervisor log if attachment fails.
+
 ## Limitations
 
 - An established SSH attachment ending closes its pane if the pane was already
