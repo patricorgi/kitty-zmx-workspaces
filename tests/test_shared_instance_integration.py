@@ -55,12 +55,25 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
             config = str(confdir / "kitty.conf")
             Path(config).write_text("shell /bin/sh\n")
             install_kitty_hook(confdir, REPO)
+        kitty_env = self.env.copy()
+        if self._testMethodName == "test_managed_split_uses_installed_launcher_without_kitty_path":
+            home_bin = Path.home() / ".local/bin"
+            if not os.access(home_bin / "kzw", os.X_OK):
+                shutil.rmtree(self.tmp)
+                self.skipTest("requires the installed ~/.local/bin/kzw launcher")
+            kitty_env["PATH"] = os.pathsep.join(
+                entry for entry in os.get_exec_path(kitty_env)
+                if Path(entry).resolve() != home_bin.resolve() and not (Path(entry) / "kzw").is_file())
+            tools = self.tmp / "tools"
+            tools.mkdir()
+            (tools / "zmx").symlink_to(shutil.which("zmx"))
+            kitty_env["PATH"] = str(tools) + os.pathsep + kitty_env["PATH"]
         self.instance = subprocess.Popen(
             ["kitty", "--single-instance", "--instance-group", self.group,
              "--start-as=hidden", "--listen-on", "unix:" + str(self.sock),
              "-c", config, "-o", "allow_remote_control=socket-only",
              "--session", str(session)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=kitty_env)
         self.env.update({
             "PATH": str(REPO / "bin") + os.pathsep + self.env.get("PATH", ""),
             "PYTHONPATH": str(REPO) + (os.pathsep + self.env["PYTHONPATH"] if self.env.get("PYTHONPATH") else ""),
@@ -151,6 +164,26 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         output = self.raw("kitten", str(self.probe))
         return json.loads(output)
 
+    def test_managed_split_uses_installed_launcher_without_kitty_path(self):
+        self.baseline = self.sessions()
+        result = self.kzw("create", "Test", "--attach", timeout=35)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        directory = self.state / "kzw" / "Test"
+        os_id = json.loads((directory / "view.json").read_text())["os_window_id"]
+        workspace = next(w for w in json.loads(self.raw("ls")) if w["id"] == os_id)
+        source = workspace["tabs"][0]["windows"][0]["id"]
+        self.raw("action", "--match", f"id:{source}",
+                 f"combine : goto_layout splits : kitten {shlex.quote(str(REPO / 'kzw/create_kitten.py'))} split")
+        deadline = time.monotonic() + 20
+        while len(panes := json.loads((directory / "panes.json").read_text())) != 2:
+            if time.monotonic() >= deadline:
+                self.fail((directory / "supervisor.log").read_text())
+            time.sleep(0.1)
+        workspace = next(w for w in json.loads(self.raw("ls")) if w["id"] == os_id)
+        self.assertEqual(len(workspace["tabs"]), 1)
+        self.assertEqual(len(workspace["tabs"][0]["windows"]), 2)
+        self.assertEqual(set(panes), self.sessions() - self.baseline)
+
     def test_attach_preview_populates_only_its_own_os_window(self):
         from kzw.attach_preview import AttachPreview
         from unittest.mock import patch
@@ -160,12 +193,16 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         layout = self.tmp / "preview-test.kitty-session"
         pane = "kzw-" + "b" * 32
         layout.write_text(f"new_tab Restored\nlaunch --var=kzw_pane={pane} /bin/sleep 600\n")
-        with patch.dict(os.environ, self.env):
+        config = self.tmp / "splash-config"
+        path = config / "kzw/splash.txt"
+        path.parent.mkdir(parents=True)
+        path.write_text("Preparing {workspace}\n\nConnecting to {host}...\n", encoding="utf-8")
+        with patch.dict(os.environ, {**self.env, "XDG_CONFIG_HOME": str(config)}):
             preview = AttachPreview("Test", "example")
             self.addCleanup(preview.close)
             before = next(ow for ow in json.loads(self.raw("ls")) if ow["id"] != keep["id"])
             window = before["tabs"][0]["windows"][0]
-            message = "Connecting to Test (example)..."
+            message = "Connecting to example..."
             deadline = time.monotonic() + 5
             while True:
                 screen = self.raw("get-text", "--match", f"id:{preview.window}").splitlines()
@@ -174,8 +211,11 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("Connecting message did not appear")
                 time.sleep(0.05)
-            row = (window["lines"] - 1) // 2
-            self.assertEqual(screen[row].index(message), (window["columns"] - len(message)) // 2)
+            row = (window["lines"] - 3) // 2
+            column = (window["columns"] - len(message)) // 2
+            self.assertEqual(screen[row].index("Preparing Test"), column)
+            self.assertFalse(screen[row + 1].strip())
+            self.assertEqual(screen[row + 2].index(message), column)
             self.raw("focus-window", "--match", f"id:{anchor}")
             self.assertEqual(int(preview.command("populate", json.dumps([str(layout), pane, 1]))), before["id"])
             preview.populated = True

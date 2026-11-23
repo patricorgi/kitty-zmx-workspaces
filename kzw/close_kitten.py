@@ -2,6 +2,8 @@
 
 import json
 import os
+from pathlib import Path
+import shutil
 import subprocess
 
 from kittens.tui.handler import result_handler
@@ -21,7 +23,6 @@ def handle_result(args, answer, target_window_id, boss):
     if tab is None:
         return
     if window.user_vars.get("kzw_local"):
-        from pathlib import Path
         boss.call_remote_control(window, ["kitten", str(Path(args[0]).with_name("local_tab_kitten.py")), "close"])
         return
     if (window.user_vars.get("kzw_utility") == "condor-queue" and not window.user_vars.get("kzw_pane")
@@ -53,7 +54,8 @@ def handle_result(args, answer, target_window_id, boss):
     def confirmed(yes):
         if not yes:
             return
-        cmd = ["kzw", "_confirmed-close", name, kind, str(target), json.dumps(selection)]
+        executable = shutil.which("kzw") or str(Path.home() / ".local/bin/kzw")
+        cmd = [executable, "_confirmed-close", name, kind, str(target), json.dumps(selection)]
         if origin:
             cmd += ["--host", origin]
         try:

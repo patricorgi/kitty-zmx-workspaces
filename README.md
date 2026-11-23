@@ -45,6 +45,19 @@ window opens before SSH validation finishes. The saved layout loads into that
 same window once verified. Close the preview to cancel, or check the window
 and supervisor log if attachment fails.
 
+To customize the centered splash, create `~/.config/kzw/splash.txt` (or
+`$XDG_CONFIG_HOME/kzw/splash.txt`). It is UTF-8 plain text and can contain
+multiple lines, blank lines, and the placeholders `{workspace}` and `{host}`:
+
+```text
+Preparing {workspace}
+
+Connecting to {host}…
+```
+
+Missing, empty, invalid, or oversized files fall back to the default message.
+No Kitty configuration or helper is needed.
+
 ## Limitations
 
 - An established SSH attachment ending closes its pane if the pane was already

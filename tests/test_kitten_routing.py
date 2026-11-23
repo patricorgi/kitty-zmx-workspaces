@@ -62,10 +62,11 @@ class KittenRoutingTests(unittest.TestCase):
                 with self.subTest(kind=kind, origin=origin):
                     _, boss = view(origin)
                     origin = origin or ""
-                    with patch.object(module.subprocess, "Popen") as popen:
+                    with patch.object(module.shutil, "which", return_value="/on-path/kzw"), \
+                            patch.object(module.subprocess, "Popen") as popen:
                         module.handle_result(["kitten", kind], None, 7, boss)
                     command = popen.call_args.args[0]
-                    self.assertEqual(command[:8], ["kzw", "_managed-create", "Test", kind, "7", A, "--host", origin])
+                    self.assertEqual(command[:8], ["/on-path/kzw", "_managed-create", "Test", kind, "7", A, "--host", origin])
                     self.assertIn("file://host/a%20b", command)
                     if origin:
                         self.assertEqual(command[-2:], ["--origin", origin])
@@ -98,7 +99,8 @@ class KittenRoutingTests(unittest.TestCase):
                 with self.subTest(kind=kind, origin=origin):
                     windows, boss = view(origin)
                     origin = origin or ""
-                    with patch.object(module.subprocess, "Popen") as popen:
+                    with patch.object(module.shutil, "which", return_value="/on-path/kzw"), \
+                            patch.object(module.subprocess, "Popen") as popen:
                         module.handle_result(["kitten", kind], None, 7, boss)
                         confirm = boss.confirm.call_args
                         self.assertFalse(confirm.kwargs["confirm_on_accept"])
@@ -109,12 +111,26 @@ class KittenRoutingTests(unittest.TestCase):
                         windows[0].user_vars["kzw_pane"] = "kzw-" + "f" * 32
                         callback(True)
                     command = popen.call_args.args[0]
-                    self.assertEqual(command[:5], ["kzw", "_confirmed-close", "Test", kind, "7" if kind == "pane" else "4"])
+                    self.assertEqual(command[:5], ["/on-path/kzw", "_confirmed-close", "Test", kind, "7" if kind == "pane" else "4"])
                     expected = {"7": [A, origin]}
                     if kind == "tab":
                         expected["8"] = [B, origin]
                     self.assertEqual(json.loads(command[5]), expected)
                     self.assertEqual(command[6:], ["--host", origin] if origin else [])
+
+    def test_create_and_close_find_installed_launcher_without_shell_path(self):
+        for name, kind, operation in (("create", "split", "_managed-create"),
+                                      ("close", "pane", "_confirmed-close")):
+            with self.subTest(name=name):
+                module = kitten(name)
+                _, boss = view("origin")
+                with patch.dict(os.environ, {"HOME": "/example-home", "PATH": "/usr/bin:/bin"}), \
+                        patch.object(module.shutil, "which", return_value=None), \
+                        patch.object(module.subprocess, "Popen") as popen:
+                    module.handle_result(["kitten", kind], None, 7, boss)
+                    if name == "close":
+                        boss.confirm.call_args.args[1](True)
+                self.assertEqual(popen.call_args.args[0][:2], ["/example-home/.local/bin/kzw", operation])
 
     def test_detach_routes_by_view_context_and_launch_failures_are_reported(self):
         for name, kind in (("create", "tab"), ("close", "pane"), ("detach", None)):

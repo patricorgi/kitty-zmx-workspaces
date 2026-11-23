@@ -1,6 +1,8 @@
 """Start a serialized managed creation from a Kitty key binding."""
 
 import os
+from pathlib import Path
+import shutil
 import subprocess
 
 from kittens.tui.handler import result_handler
@@ -26,7 +28,9 @@ def handle_result(args, answer, target_window_id, boss):
     # Window context is authoritative in a shared instance, including an empty
     # local origin. Older private instances can still use their environment.
     host = variables.get("kzw_host", "" if "kzw_workspace" in variables else os.environ.get("KZW_HOST", ""))
-    cmd = ["kzw", "_managed-create", name, kind, str(target_window_id), pane, "--host", host]
+    # GUI-launched Kitty need not inherit the user's shell PATH.
+    executable = shutil.which("kzw") or str(Path.home() / ".local/bin/kzw")
+    cmd = [executable, "_managed-create", name, kind, str(target_window_id), pane, "--host", host]
     cwd = getattr(window.screen, "last_reported_cwd", "")
     if isinstance(cwd, bytes):
         try:
