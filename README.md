@@ -2,7 +2,7 @@
 
 <img src="assets/ai-slop-stamp.png" alt="AI SLOP warning" width="180">
 
-https://github.com/user-attachments/assets/c602f153-64fb-479f-bbda-e4553450ae67
+https://github.com/user-attachments/assets/9a65a9ae-26fe-43d1-8700-7f1a89547301
 
 ## Installation
 
