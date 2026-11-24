@@ -112,10 +112,10 @@ def tab_style_state(address, pid):
     return root / (key + ".json")
 
 
-def tab_style(address, pid, action):
+def tab_style(address, pid, action, os_window_id=None):
     """Apply or restore kzw's instance-wide tab template inside Kitty."""
     if action not in ("apply", "restore"):
         raise ValueError("invalid tab-style action")
     kitten = Path(__file__).with_name("tab_style_kitten.py")
-    return remote_raw(address, "kitten", str(kitten), action, str(tab_style_state(address, pid)))
-
+    target = [str(os_window_id)] if os_window_id is not None else []
+    return remote_raw(address, "kitten", str(kitten), action, str(tab_style_state(address, pid)), *target)

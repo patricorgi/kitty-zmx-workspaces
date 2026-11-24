@@ -1694,7 +1694,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                     preview.populated = True
                 view_written = True
                 try:
-                    kitty_instance.tab_style(shared["address"], shared["pid"], "apply")
+                    kitty_instance.tab_style(shared["address"], shared["pid"], "apply", os_window_id)
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     print(f"kzw: tab index unavailable in this Kitty instance: {exc}",
                           file=sys.stderr, flush=True)
@@ -1709,6 +1709,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 args = ["kitty", "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only",
                         "-o", f"shell={pane_executable}", "-o", "enabled_layouts=splits,tall,stack",
                         "-o", "macos_quit_when_last_window_closed=yes",
+                        "-o", "tab_bar_min_tabs=1",
                         "-o", f'tab_title_template="{TAB_TITLE_TEMPLATE}"',
                         "-o", f'active_tab_title_template="{ACTIVE_TAB_TITLE_TEMPLATE}"',
                         "-o", f"watcher={Path(__file__).with_name('watcher.py')}"]

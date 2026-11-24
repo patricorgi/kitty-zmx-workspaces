@@ -86,12 +86,14 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
             "import json\n"
             "from kittens.tui.handler import result_handler\n"
             "from kitty.boss import get_options\n"
+            "from kitty.fast_data_types import is_tab_bar_visible\n"
             "def main(args): pass\n"
             "@result_handler(no_ui=True)\n"
             "def handle_result(args, answer, target_window_id, boss):\n"
             "    o = get_options()\n"
             "    return json.dumps({'tab': o.tab_title_template,"
-            " 'font': list(o.active_tab_font_style)})\n")
+            " 'font': list(o.active_tab_font_style), 'min_tabs': o.tab_bar_min_tabs,\n"
+            " 'bars': {str(i): is_tab_bar_visible(i) for i in boss.os_window_map}})\n")
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             if self.instance.poll() is not None:
@@ -534,9 +536,12 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         attached_style = self.tab_style()
         self.assertIn("kzw-pane", attached_style["tab"])
         self.assertEqual(attached_style["font"], before_style["font"])
+        self.assertEqual(attached_style["min_tabs"], before_style["min_tabs"])
+        self.assertEqual(attached_style["bars"], {str(unrelated_id): False, str(view["os_window_id"]): True})
 
         windows = {window["id"]: window for window in json.loads(self.raw("ls"))}
         self.assertEqual(set(windows), {unrelated_id, view["os_window_id"]})
+        self.assertEqual(len(windows[view["os_window_id"]]["tabs"]), 1)
         workspace_panes = {w["user_vars"]["kzw_pane"]
                            for tab in windows[view["os_window_id"]]["tabs"]
                            for w in tab["windows"]}

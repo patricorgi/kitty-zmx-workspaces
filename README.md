@@ -45,6 +45,10 @@ connection to that host; no configuration is required.
 `kill-workspace` prompts for confirmation. Detach an attached workspace first
 with `kzw detach NAME --host HOST`. The shorter `kzw kill` spelling also works.
 
+The workspace tab bar stays visible with just one tab, unless your Kitty
+tab bar style is explicitly `hidden`. Ordinary Kitty windows keep their usual
+tab count threshold.
+
 To reorder managed tabs within a workspace, drag a tab along the tab bar
 and drop it at the insertion marker, or use Kitty's `move_tab_backward` and
 `move_tab_forward` actions. `kzw detach` saves the new order, including the

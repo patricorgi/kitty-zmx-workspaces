@@ -68,14 +68,31 @@ def write_originals(path, options):
         raise
 
 
-def managed_pane(boss):
-    for manager in boss.os_window_map.values():
-        for tab in manager.tabs:
-            for window in tab:
-                pane = window.user_vars.get("kzw_pane", "")
-                if isinstance(pane, str) and PANE.fullmatch(pane):
-                    return True
+def has_managed_pane(manager):
+    for tab in manager.tabs:
+        for window in tab:
+            pane = window.user_vars.get("kzw_pane", "")
+            if isinstance(pane, str) and PANE.fullmatch(pane):
+                return True
     return False
+
+
+def show_workspace_bar(manager):
+    # tab_bar_min_tabs is process-wide. Only override Kitty's visibility
+    # decision for the OS window that kzw created, for that manager's lifetime.
+    if getattr(type(manager), "_kzw_workspace_bar", False):
+        return
+
+    class WorkspaceTabManager(type(manager)):
+        __slots__ = ()
+        _kzw_workspace_bar = True
+
+        @property
+        def tab_bar_should_be_visible(self):
+            return super().tab_bar_should_be_visible or has_managed_pane(self)
+
+    manager.__class__ = WorkspaceTabManager
+    manager.resize()
 
 
 def options_object(boss):
@@ -104,8 +121,8 @@ def apply(options, boss):
 
 @result_handler(no_ui=True)
 def handle_result(args, answer, target_window_id, boss):
-    if len(args) != 3 or args[1] not in ("apply", "restore"):
-        raise ValueError("usage: tab_style_kitten.py apply|restore STATE")
+    if len(args) not in (3, 4) or args[1] not in ("apply", "restore") or (len(args) == 4 and args[1] != "apply"):
+        raise ValueError("usage: tab_style_kitten.py apply STATE [OS_WINDOW_ID] | restore STATE")
     path = Path(args[2])
     if path.is_symlink():
         raise ValueError("unsafe tab-style state")
@@ -117,11 +134,15 @@ def handle_result(args, answer, target_window_id, boss):
             if not path.exists():
                 write_originals(path, options)
             apply(options, boss)
+            if len(args) == 4:
+                manager = boss.os_window_map.get(int(args[3]))
+                if manager is not None:
+                    show_workspace_bar(manager)
             return "applied"
         if not path.exists():
             return "unchanged"
         originals = read_originals(path)
-        if managed_pane(boss):
+        if any(has_managed_pane(manager) for manager in boss.os_window_map.values()):
             return "busy"
         for name, template in APPLIED_TEMPLATES.items():
             # Preserve any runtime configuration change made while attached.
