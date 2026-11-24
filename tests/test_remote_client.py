@@ -370,6 +370,31 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(remote["revision"], 1)
         self.assertEqual(remote["panes"], [])
 
+    def test_remote_create_keeps_uncertain_put_for_explicit_retry(self):
+        from kzw import cli
+        directory = self.directory("client")
+        with patch.object(cli, "state_dir", return_value=directory), \
+             patch.object(remote_client, "call", side_effect=remote_client.direct_call), \
+             patch.object(remote_client, "Channel") as construct:
+            def respond(req):
+                result = self.store.dispatch(req)
+                if req["method"] == "workspace.put":
+                    raise OSError("reply lost")
+                return result
+            channel = construct.return_value
+            channel.request.side_effect = respond
+            with self.assertRaisesRegex(OSError, "reply lost"):
+                cli.create_remote("Test", "origin")
+            construct.assert_called_once()
+            self.assertEqual([c.args[0]["method"] for c in channel.request.call_args_list],
+                             ["workspace.get", "workspace.put"])
+            pending = json.loads((directory / "remote.json").read_text())["pending"]["request"]
+            channel.request.reset_mock()
+            channel.request.side_effect = self.store.dispatch
+            cli.create_remote("Test", "origin")
+            channel.request.assert_called_once_with(pending)
+            self.assertEqual(json.loads((directory / "remote.json").read_text())["revision"], 1)
+
     def test_two_clients_cannot_hold_same_workspace_lease(self):
         first, second = self.directory("first"), self.directory("second")
         remote_client.create(first, "Test", "origin")
@@ -408,7 +433,7 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["revision"], 2)
 
     def test_detached_retry_close_reacquires_lease_for_cleanup(self):
-        from kzw.cli import retry_close
+        from kzw import cli
         directory = self.directory("first")
         remote_client.create(directory, "Test", "origin")
         remote_client.acquire_lease(directory, "Test", "origin")
@@ -419,14 +444,23 @@ class RemoteClientTests(unittest.TestCase):
         remote_client.release_lease(directory)
         listing = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with patch("kzw.cli.state_dir", return_value=directory), \
-             patch("kzw.remote.subprocess.run", return_value=listing):
-            retry_close("Test", "origin")
+             patch.dict("os.environ", {"KZW_RPC_SOCKET": ""}), \
+             patch.object(remote_client, "call", remote_client.direct_call), \
+             patch.object(remote_client, "Channel") as channel, \
+             patch.object(remote_client, "start_lease_heartbeat", return_value=lambda: None), \
+             patch("kzw.remote.subprocess.run", return_value=listing), \
+             patch("sys.argv", ["kzw", "retry-close", "Test", "--host", "origin"]):
+            channel.return_value.request.side_effect = self.store.dispatch
+            self.assertEqual(cli.main(), 0)
+            channel.assert_called_once()
+            methods = [c.args[0]["method"] for c in channel.return_value.request.call_args_list]
+            self.assertEqual(methods, ["workspace.get", "workspace.lease.acquire", "cleanup.retry", "workspace.lease.release"])
         self.assertFalse((directory / "pending-close.json").exists())
         self.assertFalse((directory / "lease.json").exists())
         self.assertEqual(self.store.dispatch({"method": "cleanup.list", "workspace": "Test"})["panes"], [])
 
     def test_retry_create_publishes_reserved_pane_and_clears_journal(self):
-        from kzw.cli import retry_create
+        from kzw import cli
         second = "kzw-" + "b" * 32
         directory = self.directory("first")
         remote_client.create(directory, "Test", "origin")
@@ -452,8 +486,31 @@ class RemoteClientTests(unittest.TestCase):
              patch("kzw.cli.shutil.which", side_effect=lambda name, **kw: "/bin/kzw-pane" if name == "kzw-pane" else which(name, **kw)), \
              patch("kzw.cli.query", side_effect=kitty), \
              patch("kzw.cli.zmx_command", return_value=second + "\n"), \
-             patch("kzw.remote.subprocess.run", return_value=listing):
-            retry_create("Test", "origin")
+             patch("kzw.remote.subprocess.run", return_value=listing), \
+             patch.dict("os.environ", {"KZW_RPC_SOCKET": ""}), \
+             patch.object(remote_client, "call", remote_client.direct_call), \
+             patch.object(remote_client, "Channel") as channel, \
+             patch.object(remote_client, "start_lease_heartbeat", return_value=lambda: None), \
+             patch("sys.argv", ["kzw", "retry-create", "Test", "--host", "origin"]):
+            def dropped_registration(request):
+                result = self.store.dispatch(request)
+                if request["method"] == "workspace.put":
+                    raise OSError("registration reply lost")
+                return result
+
+            channel.return_value.request.side_effect = dropped_registration
+            self.assertEqual(cli.main(), 1)
+            requests = [c.args[0] for c in channel.return_value.request.call_args_list]
+            lost, = [r for r in requests if r["method"] == "workspace.put"]
+            self.assertTrue((directory / "pending-create.json").exists())
+            self.assertEqual(json.loads((directory / "remote.json").read_text())["pending"]["request"], lost)
+            channel.reset_mock()
+            channel.return_value.request.side_effect = self.store.dispatch
+            self.assertEqual(cli.main(), 0)
+            channel.assert_called_once()
+            requests = [c.args[0] for c in channel.return_value.request.call_args_list]
+            replay, = [r for r in requests if r["method"] == "workspace.put"]
+            self.assertEqual(replay["request_id"], lost["request_id"])
         saved = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
         self.assertEqual(saved["panes"], [PANE, second])
         self.assertEqual(saved["reservations"], [])

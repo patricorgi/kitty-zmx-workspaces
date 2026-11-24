@@ -38,7 +38,9 @@ kzw --help                 # Show all commands
 ```
 
 Add `--host HOST` for a remote workspace. For example, run
-`kzw create Demo --attach --host HOST`.
+`kzw create Demo --attach --host HOST`. Remote `list`, `inspect`, `inventory`,
+`check`, and the session picker's inventory checks can reuse an existing SSH
+connection to that host; no configuration is required.
 
 When you run `kzw attach Demo --host HOST` from shared Kitty, a **Connecting**
 window opens before SSH validation finishes. The saved layout loads into that

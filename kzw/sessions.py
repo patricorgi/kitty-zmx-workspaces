@@ -184,7 +184,7 @@ def choose(name, tabs, live, input_stream=sys.stdin, output=sys.stdout, labels=N
 
 
 def remote_selection(name, host):
-    result = remote_client.call(host, {"method": "session.inventory"})
+    result = remote_client.session_inventory(host)
     if result.get("available") is not True:
         raise ValueError("remote zmx inventory unavailable")
     state = result["workspaces"].get(name)

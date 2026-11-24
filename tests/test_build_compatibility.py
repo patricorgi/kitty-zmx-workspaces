@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 
-from kzw.remote import (LEGACY_WORKSPACE_BUILDS, LEGACY_WORKSPACE_METHODS, PRE_LOCAL_EXIT_BUILD,
+from kzw.remote import (LEGACY_WORKSPACE_BUILDS, LEGACY_WORKSPACE_METHODS, PRE_EVENT_WAIT_BUILDS, PRE_LOCAL_EXIT_BUILD,
                         PRE_LOCAL_EXIT_METHODS, legacy_workspace_request)
 from workspace_fixtures import layout
 
@@ -23,9 +23,11 @@ class BuildCompatibilityTests(unittest.TestCase):
             for method in LEGACY_WORKSPACE_METHODS:
                 self.assertTrue(legacy_workspace_request(info, {"method": method, "workspace": "Test"}))
             for method in PRE_LOCAL_EXIT_METHODS:
-                self.assertEqual(legacy_workspace_request(info, {"method": method}), build == PRE_LOCAL_EXIT_BUILD)
-            for method in ("local.tab.exited", "future.put"):
-                self.assertFalse(legacy_workspace_request(info, {"method": method}))
+                self.assertEqual(legacy_workspace_request(info, {"method": method}),
+                                 build == PRE_LOCAL_EXIT_BUILD or build in PRE_EVENT_WAIT_BUILDS)
+            for method in ("local.tab.exited", "workspace.status.cached"):
+                self.assertEqual(legacy_workspace_request(info, {"method": method}), build in PRE_EVENT_WAIT_BUILDS)
+            self.assertFalse(legacy_workspace_request(info, {"method": "future.put"}))
 
     def test_unknown_versions_protocols_and_malformed_handshakes_still_fail_closed(self):
         build = next(iter(LEGACY_WORKSPACE_BUILDS))

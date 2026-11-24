@@ -182,6 +182,19 @@ def reuse_configured_ssh_once(host):
         _local.shared_startup_host = previous
 
 
+def next_coordinator_command(host):
+    if host and host == getattr(_local, "shared_startup_host", None):
+        _local.shared_startup_host = None
+        return ssh_command(host, allow_configured_master=True)
+    return coordinator_command(host)
+
+
+def session_inventory(host):
+    """Read a fresh inventory on each call, reusing configured SSH when available."""
+    with reuse_configured_ssh_once(host):
+        return call(host, {"method": "session.inventory"})
+
+
 def decode_response(data):
     try:
         response = json.loads(data)
@@ -209,7 +222,7 @@ def direct_call(host, request, *, timeout=None):
     channels = getattr(_local, "channels", None)
     if channels is None:
         try:
-            proc = subprocess.run(coordinator_command(host), input=json.dumps(request, separators=(",", ":")) + "\n",
+            proc = subprocess.run(next_coordinator_command(host), input=json.dumps(request, separators=(",", ":")) + "\n",
                                   text=True, capture_output=True, timeout=30, check=True)
         except subprocess.TimeoutExpired:
             raise TimeoutError("remote coordinator transport timed out; operation outcome may be unknown") from None
@@ -222,12 +235,7 @@ def direct_call(host, request, *, timeout=None):
     with _channel_lock:
         network.require(host)
         if key not in channels:
-            if host and host == getattr(_local, "shared_startup_host", None):
-                _local.shared_startup_host = None
-                command = ssh_command(host, allow_configured_master=True)
-            else:
-                command = coordinator_command(host)
-            channels[key] = Channel(command)
+            channels[key] = Channel(next_coordinator_command(host))
         health = getattr(_local, "connection_health", None)
         if health is not None:
             health.begin("rpc", channels[key], 8, threading.Event())

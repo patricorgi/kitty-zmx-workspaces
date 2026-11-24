@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 import tempfile
 import unittest
@@ -489,6 +490,35 @@ class WorkspaceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "lease lost"):
                     close_target("Test", "pane", 7, "origin")
                 query.assert_not_called()
+
+    def test_remote_final_close_lost_reply_retains_intent_and_view(self):
+        from kzw.cli import close_target
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "remote.json").write_text(json.dumps({
+                "workspace": "Test", "host": "origin", "revision": 1, "panes": [A],
+                "published_hash": "old"}))
+            (path / "lease.json").write_text(json.dumps({"workspace": "Test", "host": "origin", "token": "b" * 32}))
+            current = tree()
+            windows = current[0]["tabs"][0]["windows"]
+            windows.pop()
+            windows[0]["user_vars"]["kzw_host"] = "origin"
+            with patch.dict(os.environ, {"KZW_RPC_SOCKET": "", "KZW_REMOTE_STATE_HOME": ""}), \
+                 patch("kzw.cli.state_dir", return_value=path), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.capture_stable_locked"), patch("kzw.cli.view_query", return_value=json.dumps(current)) as kitty, \
+                 patch("kzw.remote_client.coordinator_command", return_value=["fake"]), \
+                 patch("kzw.remote_client.Channel") as construct:
+                rpc = construct.return_value.request
+                rpc.side_effect = [{}, {"exists": True, "revision": 1}, OSError("lost close reply")]
+                with self.assertRaisesRegex(OSError, "lost close reply"):
+                    close_target("Test", "pane", 7, "origin")
+            construct.assert_called_once()
+            self.assertEqual([c.args[0]["method"] for c in rpc.call_args_list],
+                             ["workspace.lease.renew", "workspace.get", "panes.close"])
+            kitty.assert_called_once_with(path, "ls")
+            self.assertEqual(json.loads((path / "remote.json").read_text())["pending"]["request"], rpc.call_args.args[0])
+            self.assertEqual(json.loads((path / "pending-close.json").read_text())["phase"], "closing")
 
     def test_managed_close_refuses_persistent_unmanaged_overlay(self):
         from kzw.cli import close_target

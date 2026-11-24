@@ -996,12 +996,17 @@ def close_tab(name, tab_id, origin=""):
     return close_target(name, "tab", tab_id, origin) if origin else close_target(name, "tab", tab_id)
 
 
+def remote_operation(host):
+    """Share an RPC stream for the duration of a remote CLI operation."""
+    return remote_client.persistent_rpc(reuse=True) if host else nullcontext()
+
+
 def close_target(name, kind, target_id, origin="", confirmed_selection=None):
     directory = state_dir(name, origin) if origin else state_dir(name)
     executable = shutil.which("kzw-pane")
     if not executable:
         raise ValueError("kzw-pane not found on PATH")
-    with capture_lock(directory):
+    with capture_lock(directory), remote_operation(origin):
         if (directory / "remote.json").exists():
             remote_client.renew_lease(directory)
         if (directory / "pending-create.json").exists():
@@ -1932,7 +1937,8 @@ def create_remote(name, host):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("workspace is already running") from None
-        remote_client.create(directory, name, host)
+        with remote_operation(host):
+            remote_client.create(directory, name, host)
     location = f" on {host}" if host else " locally"
     print(f"Created dormant coordinator workspace {name!r}{location}; use kzw attach to open it")
 
@@ -1979,7 +1985,7 @@ def rename_workspace(name, destination, host=""):
     key = hashlib.sha256(json.dumps([route, name, destination], separators=(",", ":")).encode()).hexdigest()
     journal = intents / (key + ".json")
     # A stable lock also serializes retry of a request whose reply was lost.
-    with ExitStack() as stack:
+    with remote_operation(host), ExitStack() as stack:
         journal_lock = stack.enter_context(open(intents / (key + ".lock"), "a+"))
         try:
             fcntl.flock(journal_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2117,22 +2123,23 @@ def kill_workspace(name, host):
             journal.unlink()
             print(f"Workspace {name!r} and associated local session cleanup complete")
             return
-        remote_client.acquire_lease(directory, name, host)
-        try:
-            token = remote_client.lease_token(directory)
-            remote_client.call(host, {"method": "workspace.kill", "workspace": name,
-                                      "revision": intent["revision"] if intent else state["revision"], "lease_token": token})
-            if local:
-                local_tabs.close(directory, local_pane)
-            result = remote_client.call(host, {"method": "cleanup.retry", "workspace": name, "lease_token": token})
-            if result["remaining"]:
-                raise ValueError("workspace kill is pending cleanup; the server will retry")
-            if local_identity:
-                (directory / "local-tab-owner").unlink()
-            if journal.exists():
-                journal.unlink()
-        finally:
-            remote_client.release_lease(directory)
+        with remote_operation(host):
+            remote_client.acquire_lease(directory, name, host)
+            try:
+                token = remote_client.lease_token(directory)
+                remote_client.call(host, {"method": "workspace.kill", "workspace": name,
+                                          "revision": intent["revision"] if intent else state["revision"], "lease_token": token})
+                if local:
+                    local_tabs.close(directory, local_pane)
+                result = remote_client.call(host, {"method": "cleanup.retry", "workspace": name, "lease_token": token})
+                if result["remaining"]:
+                    raise ValueError("workspace kill is pending cleanup; the server will retry")
+                if local_identity:
+                    (directory / "local-tab-owner").unlink()
+                if journal.exists():
+                    journal.unlink()
+            finally:
+                remote_client.release_lease(directory)
     print(f"Workspace {name!r} termination scheduled; the coordinator will retire it after verified cleanup")
 
 
@@ -2291,7 +2298,8 @@ def remote_snapshot(name, host):
 
 
 def inspect_remote(name, host, as_json=False):
-    result = remote_snapshot(name, host)
+    with remote_client.reuse_configured_ssh_once(host):
+        result = remote_snapshot(name, host)
     view = {"workspace": name, "origin": host, **result}
     if as_json:
         print(json.dumps(view, separators=(",", ":")), flush=True)
@@ -2303,7 +2311,7 @@ def inspect_remote(name, host, as_json=False):
 
 
 def inspect_inventory(host, as_json=False):
-    result = remote_client.call(host, {"method": "session.inventory"})
+    result = remote_client.session_inventory(host)
     if as_json:
         print(json.dumps(result, separators=(",", ":")), flush=True)
     else:
@@ -2319,7 +2327,7 @@ def inspect_inventory(host, as_json=False):
 
 def check_sessions(host, as_json=False):
     from .check import render, summarize
-    inventory = remote_client.call(host, {"method": "session.inventory"})
+    inventory = remote_client.session_inventory(host)
     report = {"origin": host, **inventory, "check": summarize(inventory)}
     print(json.dumps(report, separators=(",", ":")) if as_json else render(report), flush=True)
     return 0 if report["check"]["status"] == "ok" else 1
@@ -2441,7 +2449,7 @@ def spawn_background(args):
     return 1
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(prog="kzw")
     commands = parser.add_subparsers(dest="command", required=True)
     local_parser = commands.add_parser("_local-tab", help=argparse.SUPPRESS)
@@ -2552,7 +2560,12 @@ def main():
     check_parser.add_argument("--json", action="store_true", help="include inventory, provenance and check results as JSON")
     server_stop = commands.add_parser("server-stop", help="stop the remote workspace coordinator")
     server_stop.add_argument("--host", default="", help="remote workspace origin; omit for local coordinator")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main(args=None):
+    if args is None:
+        args = parse_args()
     try:
         if args.command == "_local-attach":
             from .local_tabs import attach
@@ -2679,14 +2692,15 @@ def main():
             program = {"initial_program": args.initial_program} if args.initial_program else {}
             create_pane(args.name, args.kind, args.window_id, args.pane, args.host, args.origin, args.cwd_uri, **program)
             return 0
-        if args.command == "retry-close":
-            retry_close(args.name, args.host)
-            return 0
-        if args.command == "retry-create":
-            retry_create(args.name, args.host)
+        if args.command in ("retry-close", "retry-create"):
+            recover = retry_close if args.command == "retry-close" else retry_create
+            with remote_operation(args.host):
+                recover(args.name, args.host)
             return 0
         if args.host:
-            for workspace in remote_client.call(args.host, {"method": "workspace.list"})["workspaces"]:
+            with remote_client.reuse_configured_ssh_once(args.host):
+                result = remote_client.call(args.host, {"method": "workspace.list"})
+            for workspace in result["workspaces"]:
                 print(workspace["name"])
             return 0
         root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "kzw"
@@ -2711,6 +2725,12 @@ def main():
 
 
 def entrypoint():
+    # The optional Bash hook synchronously invokes exactly this local command
+    # before displaying a prompt. Retain ordinary parsing for every other form.
+    if (len(sys.argv) == 5 and sys.argv[1:3] == ["sessions", "_record"]
+            and PANE.fullmatch(sys.argv[3]) and re.fullmatch(r"[1-9][0-9]{0,9}", sys.argv[4])):
+        return main(argparse.Namespace(command="sessions", sessions_command="_record",
+                                       pane=sys.argv[3], pid=int(sys.argv[4])))
     from .network import observe
     with observe():
         return main()

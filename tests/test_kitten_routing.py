@@ -118,6 +118,21 @@ class KittenRoutingTests(unittest.TestCase):
                     self.assertEqual(json.loads(command[5]), expected)
                     self.assertEqual(command[6:], ["--host", origin] if origin else [])
 
+    def test_confirmed_close_reuses_only_the_selected_panes_broker(self):
+        module = kitten("close")
+        windows, boss = view("origin")
+        windows[0].child = types.SimpleNamespace(environ={"KZW_RPC_SOCKET": "/selected"})
+        with patch.dict(os.environ, {"KZW_RPC_SOCKET": "/wrong"}), \
+                patch.object(module.subprocess, "Popen") as popen:
+            module.handle_result(["kitten", "pane"], None, 7, boss)
+            boss.confirm.call_args.args[1](True)
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual((env["KZW_WORKSPACE"], env["KZW_WORKSPACE_ORIGIN"], env["KZW_RPC_SOCKET"]),
+                             ("Test", "origin", "/selected"))
+            module.handle_result(["kitten", "pane"], None, 8, boss)
+            boss.confirm.call_args.args[1](True)
+            self.assertNotIn("KZW_RPC_SOCKET", popen.call_args.kwargs["env"])
+
     def test_create_and_close_find_installed_launcher_without_shell_path(self):
         for name, kind, operation in (("create", "split", "_managed-create"),
                                       ("close", "pane", "_confirmed-close")):

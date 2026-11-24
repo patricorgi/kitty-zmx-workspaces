@@ -465,6 +465,11 @@ class Store:
         return self.sample_observation(env, source, self.inventory_generation(source))
 
     def workspace_status(self, name, *, sample=None, monitoring=False):
+        status, _ = self.refresh_workspace_status(name, sample=sample, monitoring=monitoring)
+        return status
+
+    def refresh_workspace_status(self, name, *, sample=None, monitoring=False):
+        """Return the status and whether this observation journaled an event."""
         statement = "SELECT revision,panes FROM workspaces WHERE name=?"
         row = self.db.execute(statement, (name,)).fetchone()
         if row is None:
@@ -486,9 +491,11 @@ class Store:
             for pane in live - seen:
                 self.db.execute("INSERT INTO observed_sessions VALUES (?,?)", (name, pane))
             seen.update(live)
+            changed = False
             for pane in sorted(panes & seen):
                 present = int(pane in live)
                 if presence.get(pane) != present:
+                    changed = True
                     self.db.execute("INSERT OR REPLACE INTO session_presence VALUES (?,?,?)", (name, pane, present))
                     self.add_event(name, row[0], "session.live" if present else "session.missing",
                                    {"pane": pane, "inventory_generation": sample["generation"],
@@ -499,7 +506,7 @@ class Store:
             rollback(self.db)
             raise
         return {"revision": row[0], "live": sorted(live), "missing": sorted(panes - live),
-                "confirmed_missing": sorted((panes - live) & seen)}
+                "confirmed_missing": sorted((panes - live) & seen)}, changed
 
     def read_inventory(self):
         """One full, unprefixed zmx inventory, pinned to its origin namespace.
@@ -1013,12 +1020,14 @@ class Store:
                     # A failed zmx listing is an error, never a disappearance.
                     # Poll only after delivering already journaled events.
                     try:
-                        self.workspace_status(name, monitoring=True)
+                        _, changed = self.refresh_workspace_status(name, monitoring=True)
                     except Conflict:
                         # A concurrent committed layout invalidates only this
                         # status sample; fetch the journal again immediately.
                         continue
                     next_status = time.monotonic() + 1
+                    if changed:
+                        continue  # Read the committed journal in sequence before sleeping.
                 time.sleep(min(0.25, remaining))
         if method == "pane.reserve":
             pane, operation, revision = req.get("pane"), req.get("request_id"), req.get("revision")
@@ -1330,6 +1339,10 @@ def build_id():
 # methods/tables, not a new remote workspace layout or lease protocol.
 PRE_LOCAL_EXIT_BUILD = "eea27ec4e00fac3d7c126ba026420f7cd32fcdd6c72ccc21536dfa1da356da4d"
 PRE_LOCAL_EXIT_METHODS = frozenset("local.tab." + action for action in ("get", "reserve", "launch", "focus", "close"))
+PRE_EVENT_WAIT_BUILDS = frozenset((
+    "92c81112b80301e591f7a305f2e14813f33dc7d12c4f23c47d06a1d625e7c203",
+    "58b5416289e9627abf169b93cbbd4986085fcd1218f6575e39c27195b6d3aadf",
+))
 LEGACY_WORKSPACE_BUILDS = frozenset((
     "cdb3e2965288d4aff8499c0fb8fb38bbf97c75aa47fa8e80d57754196286139b",
     "e379b6c6dec43acaaee87693654dd5259f1eb97bf36cb7bb736b23b7214c577f",
@@ -1340,7 +1353,7 @@ LEGACY_WORKSPACE_BUILDS = frozenset((
     # Same workspace protocol, before separating coordinator and zmx state homes.
     "3d5892c6a3158cfde8ffaf0723fb5a15d44f457d2daff4db4a1a5e3588fb758f",
     "8e624211311c420913979a9b73a4c11037c71c0986ff5260b9cf5fe87946e4b9",
-    PRE_LOCAL_EXIT_BUILD,
+    PRE_LOCAL_EXIT_BUILD, *PRE_EVENT_WAIT_BUILDS,
 ))
 LEGACY_WORKSPACE_METHODS = frozenset((
     "host.metrics", "session.inventory", "workspace.list", "workspace.get", "workspace.sync",
@@ -1360,6 +1373,8 @@ def legacy_workspace_request(info, request):
             isinstance(result.get("build"), str) and result["build"] in LEGACY_WORKSPACE_BUILDS and
             isinstance(request, dict) and isinstance(request.get("method"), str) and
             (request["method"] in LEGACY_WORKSPACE_METHODS or
+             (result["build"] in PRE_EVENT_WAIT_BUILDS and
+              request["method"] in PRE_LOCAL_EXIT_METHODS | {"local.tab.exited", "workspace.status.cached"}) or
              (result["build"] == PRE_LOCAL_EXIT_BUILD and request["method"] in PRE_LOCAL_EXIT_METHODS)))
 
 

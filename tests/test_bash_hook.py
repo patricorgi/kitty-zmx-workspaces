@@ -1,3 +1,4 @@
+import io
 import os
 from pathlib import Path
 import pty
@@ -18,6 +19,17 @@ PROMPT = b"KZW_TEST_PROMPT> "
 
 
 class BashHookTests(unittest.TestCase):
+    def test_internal_recorder_matches_cli_input_bound_and_rejects_bad_pid(self):
+        from kzw import cli
+        with patch("sys.argv", ["kzw", "sessions", "_record", PANE, "123"]), \
+             patch("sys.stdin", io.StringIO("x" * 17000)), patch.object(session_meta, "record") as record:
+            self.assertEqual(cli.entrypoint(), 0)
+            record.assert_called_once_with(PANE, 123, "x" * 16384)
+        with patch("sys.argv", ["kzw", "sessions", "_record", PANE, "bad"]), \
+             patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as error:
+            cli.entrypoint()
+        self.assertEqual(error.exception.code, 2)
+
     def shell(self, home):
         master, slave = pty.openpty()
         self.addCleanup(os.close, master)

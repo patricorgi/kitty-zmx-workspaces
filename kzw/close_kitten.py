@@ -45,6 +45,12 @@ def handle_result(args, answer, target_window_id, boss):
     if not name:
         boss.show_error("Cannot close", "Workspace identity is unavailable.")
         return
+    env = os.environ.copy()
+    env.pop("KZW_RPC_SOCKET", None)
+    child_env = getattr(getattr(window, "child", None), "environ", {})
+    if isinstance(child_env, dict) and child_env.get("KZW_RPC_SOCKET"):
+        env["KZW_RPC_SOCKET"] = child_env["KZW_RPC_SOCKET"]
+    env.update(KZW_WORKSPACE=name, KZW_WORKSPACE_ORIGIN=origin)
     count = len(selection)
     message = (f"Close this {kind} and terminate {count} shell(s) and their running programs?\n"
                "This cannot be undone.")
@@ -59,7 +65,7 @@ def handle_result(args, answer, target_window_id, boss):
         if origin:
             cmd += ["--host", origin]
         try:
-            subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, env=env)
         except OSError as exc:
             boss.show_error("Cannot close", str(exc))
 

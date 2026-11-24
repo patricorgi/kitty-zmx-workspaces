@@ -511,10 +511,19 @@ class RemoteStoreTests(unittest.TestCase):
     def test_event_wait_detects_absence_without_fabricating_exit(self):
         self.put(panes=[A])
         cursor = self.store.dispatch({"method": "workspace.sync", "workspace": "Test"})["event_cursor"]
-        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+        with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             patch("kzw.remote.time.sleep", side_effect=AssertionError("committed event should be returned immediately")):
             result = self.store.dispatch({"method": "workspace.events.wait", "workspace": "Test",
                                           "after": cursor, "timeout": 1})
         self.assertEqual([(e["kind"], e["data"]["pane"]) for e in result["events"]], [("session.missing", A)])
+
+    def test_event_wait_still_sleeps_when_nothing_changed(self):
+        self.put(panes=[A])
+        self.store.workspace_status("Test")
+        cursor = self.store.dispatch({"method": "workspace.sync", "workspace": "Test"})["event_cursor"]
+        with patch("kzw.remote.time.sleep", side_effect=StopIteration) as sleep, self.assertRaises(StopIteration):
+            self.store.dispatch({"method": "workspace.events.wait", "workspace": "Test", "after": cursor, "timeout": 1})
+        sleep.assert_called_once_with(.25)
 
     def test_event_wait_listing_failure_does_not_record_absence(self):
         self.put(panes=[A])

@@ -2,9 +2,10 @@ import json
 import fcntl
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from kzw import cli
 
@@ -95,6 +96,26 @@ class WorkspaceOriginTests(unittest.TestCase):
         call.assert_called_once_with("", {"method": "workspace.get", "workspace": "Test"})
         acquire.assert_not_called()
 
+    def test_remote_kill_lost_reply_reconnects_only_to_release_lease(self):
+        # Before confirmation there is only the one-shot state read. Losing
+        # the kill response must not resend the kill or advance to cleanup.
+        state = {"exists": True, "revision": 3, "panes": []}
+        read = subprocess.CompletedProcess([], 0, json.dumps({"ok": True, "result": state}), "")
+        first, release = Mock(), Mock()
+        first.request.side_effect = [state, {}, OSError("kill reply lost")]
+        release.request.return_value = {}
+        with patch.dict(os.environ, {"KZW_RPC_SOCKET": ""}), \
+             patch("kzw.remote_client.coordinator_command", return_value=["fake"]), \
+             patch("kzw.remote_client.subprocess.run", return_value=read) as once, \
+             patch("kzw.remote_client.Channel", side_effect=[first, release]), \
+             patch("builtins.input", return_value="y"), self.assertRaisesRegex(OSError, "kill reply lost"):
+            cli.kill_workspace("Test", "origin")
+        once.assert_called_once()
+        self.assertEqual([c.args[0]["method"] for c in first.request.call_args_list],
+                         ["workspace.get", "workspace.lease.acquire", "workspace.kill"])
+        token = first.request.call_args.args[0]["lease_token"]
+        release.request.assert_called_once_with({"method": "workspace.lease.release", "workspace": "Test", "token": token})
+
     def test_kill_retires_only_a_proven_dead_view_under_a_free_supervisor_lock(self):
         directory = cli.state_dir("Test", "origin")
         pane = "kzw-" + "a" * 32
@@ -145,16 +166,26 @@ class WorkspaceOriginTests(unittest.TestCase):
         store.dispatch({"method": "workspace.put", "workspace": "Test", "request_id": "create",
                         "revision": 0, "snapshot": "# kzw-dormant-workspace\n", "panes": []})
         dropped = [False]
-        def call(host, request):
+        def respond(request):
             result = store.dispatch(request)
             if request["method"] == "workspace.rename" and not dropped[0]:
                 dropped[0] = True
                 raise OSError("connection lost after commit")
             return result
-        with patch("kzw.cli.remote_client.call", side_effect=call):
+        with patch.dict(os.environ, {"KZW_RPC_SOCKET": ""}), \
+             patch("kzw.remote_client.coordinator_command", return_value=["fake"]), \
+             patch("kzw.remote_client.Channel") as channel:
+            send = channel.return_value.request
+            send.side_effect = respond
             with self.assertRaises(OSError):
                 cli.rename_workspace("Test", "Renamed", "origin")
+            channel.assert_called_once()
+            self.assertEqual([c.args[0]["method"] for c in send.call_args_list],
+                             ["workspace.get", "workspace.rename"])
+            request = send.call_args.args[0]
+            send.reset_mock()
             cli.rename_workspace("Test", "Renamed", "origin")
+            send.assert_called_once_with(request)
         self.assertFalse(store.dispatch({"method": "workspace.get", "workspace": "Test"})["exists"])
         self.assertTrue(store.dispatch({"method": "workspace.get", "workspace": "Renamed"})["exists"])
         self.assertFalse(list((Path(self.temp.name) / "kzw/rename-intents").glob("*.json")))

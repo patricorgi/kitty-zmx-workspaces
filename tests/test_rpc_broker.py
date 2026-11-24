@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import subprocess
 import sys
@@ -9,6 +11,46 @@ from kzw import remote_client
 
 
 class BrokerTests(unittest.TestCase):
+    def test_inventory_queries_use_existing_transport_but_observations_are_fresh(self):
+        def observation(generation):
+            return subprocess.CompletedProcess([], 0, json.dumps({"ok": True, "result": {"generation": generation}}))
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(remote_client.subprocess, "run", side_effect=[observation(1), observation(2)]) as run:
+            for generation in (1, 2):
+                self.assertEqual(remote_client.session_inventory("origin"), {"generation": generation})
+        self.assertEqual(run.call_count, 2)
+        for request in run.call_args_list:
+            self.assertEqual(json.loads(request.kwargs["input"]), {"method": "session.inventory"})
+            self.assertIn("ControlMaster=no", request.args[0])
+            self.assertIn("ClearAllForwardings=yes", request.args[0])
+            self.assertNotIn("ControlPath=none", request.args[0])
+
+    def test_remote_read_commands_use_existing_master_without_starting_one(self):
+        from kzw import cli
+        snap = {"exists": True, "snapshot": "# kzw-empty-workspace\n", "panes": [],
+                "revision": 1, "event_cursor": 2}
+        for args, result in ((["list"], {"workspaces": [{"name": "Test"}]}), (["inspect", "Test", "--json"], snap)):
+            for enabled in ("0", "1"):
+                reply = json.dumps({"ok": True, "result": result})
+                with self.subTest(args=args, enabled=enabled), \
+                     patch.dict(os.environ, {"KZW_ATTACH_REUSE_SSH": enabled}, clear=True), \
+                     patch("sys.argv", ["kzw", *args, "--host", "origin"]), \
+                     patch("sys.stdout", new_callable=io.StringIO) as output, \
+                     patch.object(remote_client.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, reply)) as run:
+                    self.assertEqual(cli.main(), 0)
+                self.assertEqual(run.call_count, 1)
+                command = run.call_args.args[0]
+                self.assertIn("ControlMaster=no", command)
+                self.assertIn("ControlPersist=no", command)
+                self.assertEqual("ControlPath=none" in command, enabled == "0")
+                self.assertEqual("ClearAllForwardings=yes" in command, enabled == "1")
+                if args == ["list"]:
+                    self.assertEqual(output.getvalue(), "Test\n")
+                else:
+                    self.assertEqual(json.loads(output.getvalue()), {**snap, "workspace": "Test", "origin": "origin",
+                                                                    "focused_pane": None})
+
     def test_transport_errors_are_bounded_and_never_replay_or_print_shipped_source(self):
         command = ["ssh", "origin", "encoded-private-coordinator-source"]
         failures = (subprocess.CalledProcessError(1, command, stderr="traceback\nserver disconnected"),
