@@ -374,6 +374,7 @@ class RemoteClientTests(unittest.TestCase):
         from kzw import cli
         directory = self.directory("client")
         with patch.object(cli, "state_dir", return_value=directory), \
+             patch.dict("os.environ", {"KZW_ATTACH_REUSE_SSH": "1"}), \
              patch.object(remote_client, "call", side_effect=remote_client.direct_call), \
              patch.object(remote_client, "Channel") as construct:
             def respond(req):
@@ -386,6 +387,11 @@ class RemoteClientTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "reply lost"):
                 cli.create_remote("Test", "origin")
             construct.assert_called_once()
+            ssh = construct.call_args.args[0]
+            self.assertIn("ControlMaster=no", ssh)
+            self.assertIn("ClearAllForwardings=yes", ssh)
+            self.assertNotIn("ControlPath=none", ssh)
+            self.assertEqual(ssh[-2], "origin")
             self.assertEqual([c.args[0]["method"] for c in channel.request.call_args_list],
                              ["workspace.get", "workspace.put"])
             pending = json.loads((directory / "remote.json").read_text())["pending"]["request"]

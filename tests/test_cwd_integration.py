@@ -112,6 +112,32 @@ class CwdIntegrationTests(unittest.TestCase):
         subprocess.run(["ssh", "-o", "BatchMode=yes", host, shlex.join(["mkdir", "-p", "--", *paths])], check=True, timeout=20)
         self.check_inheritance(host, paths)
 
+    @unittest.skipUnless(os.environ.get("KZW_RUN_SERVER_INTEGRATION") == "1", "SSH splash test is opt-in")
+    def test_remote_create_attach_shows_splash_then_uses_same_window(self):
+        kit, host = self.kitty, os.environ["KZW_INTEGRATION_HOST"]
+        config = kit.tmp / "config"
+        (config / "kzw").mkdir(parents=True)
+        (config / "kzw/splash.txt").write_text("Preparing {workspace} on {host}")
+        env = {**kit.env, "XDG_CONFIG_HOME": str(config)}
+        started = time.monotonic()
+        with subprocess.Popen(["kzw", "create", "Test", "--attach", "--host", host], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+            def splash():
+                for ow in json.loads(kit.raw("ls")):
+                    for tab in ow["tabs"]:
+                        for w in tab["windows"]:
+                            if w.get("user_vars", {}).get("kzw_attach_preview"):
+                                if f"Preparing Test on {host}" in kit.raw("get-text", "--match", f"id:{w['id']}"):
+                                    return ow["id"]
+            os_id = self.wait(splash)
+            elapsed = time.monotonic() - started
+            output, _ = proc.communicate(timeout=60)
+            self.assertEqual(proc.returncode, 0, output)
+        pane, = self.wait(self.windows)
+        current = next(ow for ow in json.loads(kit.raw("ls")) if ow["id"] == os_id)
+        self.assertEqual([w["id"] for tab in current["tabs"] for w in tab["windows"]], [pane["id"]])
+        print(f"{elapsed:.2f}s to visible splash; {time.monotonic() - started:.2f}s to registered pane")
+
     @unittest.skipUnless(os.environ.get("KZW_RUN_SERVER_INTEGRATION") == "1", "SSH RPC test is opt-in")
     def test_remote_attachment_reuses_foreground_bridge_for_status(self):
         host = os.environ["KZW_INTEGRATION_HOST"]

@@ -60,13 +60,16 @@ class WorkspaceOriginTests(unittest.TestCase):
             with self.subTest(host=host):
                 argv = ["kzw", "create", "Test", "--attach", "--hold"] + (["--host", host] if host else [])
                 with patch("sys.argv", argv), patch("kzw.cli.create_remote") as create, \
+                     patch("kzw.attach_preview.AttachPreview") as factory, \
                      patch("kzw.cli.attach_remote", return_value=7) as attach:
                     self.assertEqual(cli.main(), 7)
                 create.assert_called_once_with("Test", host)
-                attach.assert_called_once_with("Test", host)
+                factory.assert_called_once_with("Test", host or "local")
+                attach.assert_called_once_with("Test", host, preview=factory.return_value.__enter__.return_value)
 
     def test_create_does_not_attach_on_failure_or_without_flag(self):
         with patch("sys.argv", ["kzw", "create", "Test", "--attach", "--hold"]), \
+             patch("kzw.attach_preview.AttachPreview"), \
              patch("kzw.cli.create_remote", side_effect=ValueError("conflict")), \
              patch("kzw.cli.attach_remote") as attach:
             self.assertEqual(cli.main(), 1)

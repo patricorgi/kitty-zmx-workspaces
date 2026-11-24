@@ -357,6 +357,7 @@ class BackgroundSupervisorTests(unittest.TestCase):
                  (["create", "Test"], "create", {}))
         for argv, expected, kwargs in cases:
             with self.subTest(argv=argv), patch.dict(os.environ, {}, clear=True), patch("sys.argv", ["kzw", *argv]), \
+                 patch("kzw.attach_preview.AttachPreview") as factory, \
                  patch("kzw.cli.spawn_background", return_value=0) as background, \
                  patch("kzw.cli.attach_remote", return_value=0) as attach, patch("kzw.cli.create_remote") as create:
                 self.assertEqual(cli.main(), 0)
@@ -366,6 +367,8 @@ class BackgroundSupervisorTests(unittest.TestCase):
                     create.assert_not_called()
                 elif expected == "attach":
                     background.assert_not_called()
+                    if argv[0] == "create" and "--new-kitty-instance" not in argv:
+                        kwargs = {**kwargs, "preview": factory.return_value.__enter__.return_value}
                     attach.assert_called_once_with("Test", "", **kwargs)
                     self.assertEqual(create.call_count, int(argv[0] == "create"))
                 else:

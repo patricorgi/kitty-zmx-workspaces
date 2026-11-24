@@ -68,11 +68,13 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
             tools.mkdir()
             (tools / "zmx").symlink_to(shutil.which("zmx"))
             kitty_env["PATH"] = str(tools) + os.pathsep + kitty_env["PATH"]
+        bar_options = (["-o", "tab_bar_edge=top", "-o", "tab_bar_margin_height=6 0"]
+                       if self._testMethodName == "test_splash_handoff_reserves_tab_bar_geometry" else [])
         self.instance = subprocess.Popen(
             ["kitty", "--single-instance", "--instance-group", self.group,
              "--start-as=hidden", "--listen-on", "unix:" + str(self.sock),
              "-c", config, "-o", "allow_remote_control=socket-only",
-             "--session", str(session)],
+             *bar_options, "--session", str(session)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=kitty_env)
         self.env.update({
             "PATH": str(REPO / "bin") + os.pathsep + self.env.get("PATH", ""),
@@ -292,6 +294,38 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
             preview.populated = True
             restored = next(ow for ow in json.loads(self.raw("ls")) if ow["id"] == before["id"])
             self.assertEqual([tab["title"] for tab in restored["tabs"]], ["Test"])
+
+    def test_splash_handoff_reserves_tab_bar_geometry(self):
+        from kzw.attach_preview import AttachPreview
+        from unittest.mock import patch
+
+        # Bootstrap creates the window before its child publishes kzw_pane.
+        # Hold that identity back until after the splash and styling handoff.
+        layout = self.tmp / "bootstrap.session"
+        layout.write_text("new_tab Test\nlaunch --var=kzw_workspace=Test /bin/sleep 600\n")
+        probe = self.tmp / "pane_bounds.py"
+        probe.write_text(
+            "import json\nfrom kittens.tui.handler import result_handler\n"
+            "from kitty.fast_data_types import is_tab_bar_visible, viewport_for_window\n"
+            "def main(args): pass\n@result_handler(no_ui=True)\n"
+            "def handle_result(args, answer, target, boss):\n"
+            " w=boss.window_id_map[target]; i=w.os_window_id\n"
+            " central,bar,*_=viewport_for_window(i)\n"
+            " return json.dumps([is_tab_bar_visible(i),bar.bottom,central.top,w.geometry.top])\n")
+        with patch.dict(os.environ, self.env), AttachPreview("Test", "local") as preview:
+            oid = int(preview.command("populate", json.dumps([str(layout), None, 1])))
+            preview.populated = True
+        w, = json.loads(self.raw("ls", "--match", "var:kzw_workspace=^Test$"))[0]["tabs"][0]["windows"]
+        match = f"id:{w['id']}"
+        self.raw("kitten", "--match", match, str(REPO / "kzw/tab_style_kitten.py"),
+                 "apply", str(self.tmp / "style.json"), str(oid))
+        self.raw("set-user-vars", "--match", match, "kzw_pane=kzw-" + "a" * 32)
+        self.raw("set-tab-title", "--match", "window_id:" + str(w["id"]), "Test shell")
+        visible, bar_bottom, central_top, pane_top = json.loads(self.raw("kitten", "--match", match, str(probe)))
+        self.assertTrue(visible)
+        self.assertGreater(bar_bottom, 0)
+        self.assertGreaterEqual(central_top, bar_bottom)
+        self.assertGreaterEqual(pane_top, central_top)
 
     def test_native_tab_uses_shared_workspace_without_helper_mapping(self):
         self.baseline = self.sessions()

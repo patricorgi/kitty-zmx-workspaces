@@ -89,7 +89,9 @@ def show_workspace_bar(manager):
 
         @property
         def tab_bar_should_be_visible(self):
-            return super().tab_bar_should_be_visible or has_managed_pane(self)
+            # The OS window is already identified. Waiting for its shell to
+            # emit kzw_pane can show the bar *after* Kitty laid out the pane.
+            return bool(self.tabs) or super().tab_bar_should_be_visible
 
     manager.__class__ = WorkspaceTabManager
     manager.resize()

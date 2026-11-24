@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from kzw import cli
-from kzw.attach_preview import show_preview, splash_frames, splash_message, splash_screen
+from kzw.attach_preview import AttachPreview, show_preview, splash_frames, splash_message, splash_screen
 
 
 class AttachPreviewTests(unittest.TestCase):
@@ -73,11 +73,27 @@ class AttachPreviewTests(unittest.TestCase):
             order.attach_mock(status, "status")
             order.attach_mock(lease, "lease")
             preview = factory.return_value
+            preview.__enter__.return_value = preview
             preview.populated = False
             preview.command.side_effect = ValueError("preview closed")
             with self.assertRaisesRegex(ValueError, "preview closed"):
                 cli.attach_remote("Test", "origin", show_preview=True)
-            self.assertEqual([c[0] for c in order.mock_calls[:3]], ["preview", "status", "lease"])
+            self.assertEqual([c[0] for c in order.mock_calls if c[0] in ("preview", "status", "lease")],
+                             ["preview", "status", "lease"])
             release.assert_called_once_with(Path(root))
             pull.assert_not_called()
             run.assert_not_called()
+
+    def test_create_conflict_after_splash_reports_error_without_attaching(self):
+        preview = object.__new__(AttachPreview)
+        preview.populated = False
+        with patch("sys.argv", ["kzw", "create", "Test", "--attach", "--host", "origin", "--hold"]), \
+             patch("kzw.attach_preview.AttachPreview", return_value=preview) as opened, \
+             patch.object(preview, "command") as action, patch.object(cli, "attach_remote") as attach:
+            def conflict(*args):
+                opened.assert_called_once_with("Test", "origin")
+                raise ValueError("workspace already exists")
+            with patch.object(cli, "create_remote", side_effect=conflict):
+                self.assertEqual(cli.main(), 1)
+            action.assert_called_once_with("error", "workspace already exists")
+            attach.assert_not_called()

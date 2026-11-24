@@ -1663,6 +1663,8 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
             raise
         try:
             if bootstrap:
+                if preview is not None:
+                    preview.command("check")
                 mark_bootstrap_launching(directory)
             if shared is not None:
                 if variables is None:
@@ -1929,7 +1931,7 @@ def create_remote(name, host):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("workspace is already running") from None
-        with remote_operation(host):
+        with remote_operation(host), remote_client.reuse_configured_ssh_once(host):
             remote_client.create(directory, name, host)
     location = f" on {host}" if host else " locally"
     print(f"Created dormant coordinator workspace {name!r}{location}; use kzw attach to open it")
@@ -2175,10 +2177,11 @@ def retire_empty_coordinator_workspace(directory, name, host):
 
 
 @remote_client.persistent_rpc()
-def attach_remote(name, host, create_empty=False, appearance=None, new_instance=False, show_preview=False):
+def attach_remote(name, host, create_empty=False, appearance=None, new_instance=False, show_preview=False,
+                  preview=None):
     directory = state_dir(name, host)
     executable = kzw_executable()
-    with open(directory / "lock", "a+") as lock:
+    with open(directory / "lock", "a+") as lock, ExitStack() as resources:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -2200,10 +2203,9 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
             record = json.loads(pending.read_text())
             recovering_bootstrap = record.get("kind") == "bootstrap"
             recovering_managed = not recovering_bootstrap
-        preview = None
         if show_preview and host and not new_instance and not create_empty and not pending.exists():
             from .attach_preview import AttachPreview
-            preview = AttachPreview(name, host)
+            preview = resources.enter_context(AttachPreview(name, host))
             startup_status(True, directory=directory, connecting=True)
             os.environ.pop("KZW_STARTUP_STATUS", None)
         stop_heartbeat = lambda: None
@@ -2254,13 +2256,7 @@ def attach_remote(name, host, create_empty=False, appearance=None, new_instance=
                 for pane in transport_candidates(directory, saved):
                     (directory / "transport-ended" / pane).unlink(missing_ok=True)
             return run_attached(create_empty=True) if create_empty else run_attached()
-        except Exception as exc:
-            if preview is not None and not preview.populated:
-                preview.error(exc)
-            raise
         finally:
-            if preview is not None and not preview.populated and sys.exc_info()[0] in (None, KeyboardInterrupt):
-                preview.close()
             stop_heartbeat()
             try:
                 if leased:
@@ -2613,6 +2609,11 @@ def main(args=None):
                     return attach_remote(args.name, "", **appearance_arg, **run_arg)
             return run(args.name, args.host, **appearance_arg, **run_arg)
         if args.command == "create":
+            if args.attach and not run_arg:
+                from .attach_preview import AttachPreview
+                with AttachPreview(check_name(args.name), args.host or "local") as preview:
+                    create_remote(args.name, args.host)
+                    return attach_remote(args.name, args.host, preview=preview, **appearance_arg)
             create_remote(args.name, args.host)
             if args.attach:
                 return attach_remote(args.name, args.host, **appearance_arg, **run_arg)
