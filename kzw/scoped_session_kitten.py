@@ -10,12 +10,14 @@ from kitty.session import default_save_as_session_opts
 try:
     from kzw.core import pane_map, rewrite_export
     from kzw.session_export import serializable_managed_windows
+    from kzw.remote_file_menu_kitten import install as install_remote_file
     from kzw import utility_tabs
 except ModuleNotFoundError as exc:
     if exc.name != "kzw":
         raise
     from core import pane_map, rewrite_export
     from session_export import serializable_managed_windows
+    from remote_file_menu_kitten import install as install_remote_file
     import utility_tabs
 
 
@@ -60,6 +62,8 @@ def handle_result(args, answer, target_window_id, boss):
         raise ValueError("workspace changed during scoped snapshot")
     panes = pane_map(tree)
     windows = [boss.window_id_map[window_id] for window_id in panes]
+    for managed in windows:
+        install_remote_file(boss, managed)
     matched = None
     if has_utilities:
         matched = frozenset(boss.window_id_map[w["id"]] for tab in tree[0]["tabs"] for w in tab["windows"])

@@ -89,12 +89,14 @@ class WorkspaceOriginTests(unittest.TestCase):
 
     def test_workspace_kill_cancel_does_not_acquire_lease_or_mutate(self):
         state = {"exists": True, "revision": 3, "panes": ["kzw-" + "a" * 32]}
-        with patch("kzw.cli.remote_client.call", return_value=state) as call, \
-             patch("kzw.cli.remote_client.acquire_lease") as acquire, \
-             patch("builtins.input", return_value="n"):
-            cli.kill_workspace("Test", "")
-        call.assert_called_once_with("", {"method": "workspace.get", "workspace": "Test"})
-        acquire.assert_not_called()
+        for argv, host in [(["kill-workspace", "Test", "--host", "origin"], "origin"), (["kill", "Test"], "")]:
+            with self.subTest(argv=argv), patch("sys.argv", ["kzw", *argv]), \
+                 patch("kzw.cli.remote_client.call", return_value=state) as call, \
+                 patch("kzw.cli.remote_client.acquire_lease") as acquire, \
+                 patch("builtins.input", return_value="n"):
+                self.assertEqual(cli.main(), 0)
+                call.assert_called_once_with(host, {"method": "workspace.get", "workspace": "Test"})
+                acquire.assert_not_called()
 
     def test_remote_kill_lost_reply_reconnects_only_to_release_lease(self):
         # Before confirmation there is only the one-shot state read. Losing

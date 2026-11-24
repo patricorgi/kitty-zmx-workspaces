@@ -33,7 +33,7 @@ kzw detach Demo            # Close the Kitty view and keep sessions running
 kzw attach Demo            # Reopen the workspace
 kzw sessions list Demo     # Select a pane from an interactive terminal
 kzw rename Demo NewName    # Rename a detached workspace
-kzw kill Demo              # Terminate a detached workspace and its sessions
+kzw kill-workspace Demo --host HOST  # Terminate a detached remote workspace and its sessions
 kzw --help                 # Show all commands
 ```
 
@@ -42,11 +42,21 @@ Add `--host HOST` for a remote workspace. For example, run
 `check`, and the session picker's inventory checks can reuse an existing SSH
 connection to that host; no configuration is required.
 
+`kill-workspace` prompts for confirmation. Detach an attached workspace first
+with `kzw detach NAME --host HOST`. The shorter `kzw kill` spelling also works.
+
 To reorder managed tabs within a workspace, drag a tab along the tab bar
 and drop it at the insertion marker, or use Kitty's `move_tab_backward` and
 `move_tab_forward` actions. `kzw detach` saves the new order, including the
 splits and focused pane, for the next attach. The separate **Local** companion
 tab still restores last.
+
+To download a file from a managed remote pane, run `ls --hyperlink=auto`
+on the remote host (GNU `ls`), **Ctrl+Shift-click** the filename, then choose
+**Save** and a local destination. kzw supplies the pane's SSH alias to Kitty's
+remote-file menu, including when the alias uses a jump host.
+With the personal Linux Yazi keymap, highlight or mark one file and press
+**M**, then **d** to open that menu directly in the active managed remote pane.
 
 When you run `kzw attach Demo --host HOST` from shared Kitty, a **Connecting**
 window opens before SSH validation finishes. The saved layout loads into that

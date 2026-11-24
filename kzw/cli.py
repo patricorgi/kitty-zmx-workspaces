@@ -2528,7 +2528,8 @@ def parse_args():
     retry_create_parser = commands.add_parser("retry-create", help="finish an interrupted pane creation in a live Kitty view")
     retry_create_parser.add_argument("name")
     retry_create_parser.add_argument("--host", default="", help="remote workspace origin")
-    kill_parser = commands.add_parser("kill", help="terminate a detached coordinator workspace and its sessions")
+    kill_parser = commands.add_parser("kill-workspace", aliases=["kill"],
+                                      help="terminate a detached coordinator workspace and its sessions")
     kill_parser.add_argument("name")
     kill_parser.add_argument("--host", default="", help="remote workspace origin")
     rename_parser = commands.add_parser("rename", help="rename a detached coordinator workspace")
@@ -2625,7 +2626,7 @@ def main(args=None):
             if args.attach:
                 return attach_remote(args.name, args.host, **appearance_arg, **run_arg)
             return 0
-        if args.command == "kill":
+        if args.command in ("kill-workspace", "kill"):
             kill_workspace(args.name, args.host)
             return 0
         if args.command == "rename":
