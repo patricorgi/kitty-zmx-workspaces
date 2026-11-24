@@ -367,10 +367,15 @@ def translate(snapshot, executable, host, portable):
             raise ValueError("remote workspace may only contain panes on its origin host")
         if not portable and (command[0] != EXECUTABLE or command[4] != ORIGIN):
             raise ValueError("remote workspace has invalid portable launch")
-        args = args[:-6]
+        if portable and (len(args) < 9 or args[-6] != "pane" or Path(args[-7]).name != "kzw"):
+            raise ValueError("remote workspace contains an unmanaged launch")
+        args = args[:-(7 if portable else 6)]
+        if any(not arg.startswith("--") for arg in args[2:]):
+            raise ValueError("unexpected program in remote workspace launch")
         args = [arg for arg in args if not arg.startswith("--cwd=") and not arg.startswith("--var=kzw_host=")]
         args.append("--var=kzw_host=" + (ORIGIN if portable else host))
-        args.extend([EXECUTABLE if portable else executable, "--pane", command[2], "--host",
+        args.extend([EXECUTABLE] if portable else [executable, "pane"])
+        args.extend(["--pane", command[2], "--host",
                      ORIGIN if portable else host, "--existing"])
         found.append(command[2])
         lines.append(shlex.join(args))

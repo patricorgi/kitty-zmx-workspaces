@@ -293,7 +293,7 @@ class WorkspaceOriginTests(unittest.TestCase):
                         if method == "create":
                             remote_client.create(directory, "Test", "origin")
                         else:
-                            remote_client.pull(directory, "Test", "origin", "/bin/kzw-pane")
+                            remote_client.pull(directory, "Test", "origin", "/bin/kzw")
                     call.assert_not_called()
                     if kind not in ("log-directory", "log-symlink"):
                         self.assertEqual((directory / name).read_text(), "preserve\n")
@@ -322,7 +322,7 @@ class WorkspaceOriginTests(unittest.TestCase):
         pane = "kzw-" + "a" * 32
         (remote / "panes.json").write_text(json.dumps([pane]))
         tree = [{"tabs": [{"windows": [{"id": 7, "user_vars": {"kzw_pane": pane, "kzw_host": "origin"}}]}]}]
-        with patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+        with patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.capture_locked", return_value=1) as capture, \
              patch("kzw.cli.query", side_effect=[json.dumps(tree), ""]) as query:
             cli.detach("Test", "origin")
@@ -337,7 +337,7 @@ class WorkspaceOriginTests(unittest.TestCase):
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return 0
-        with patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+        with patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.remote_client.acquire_lease") as acquire, \
              patch("kzw.cli.remote_client.start_lease_heartbeat", return_value=lambda: None), \
              patch("kzw.cli.remote_client.pull"), \

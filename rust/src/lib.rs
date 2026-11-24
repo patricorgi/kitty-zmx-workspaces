@@ -223,7 +223,21 @@ pub fn translate(
             return Err("duplicate remote pane".into());
         }
         found.push(command[2].clone());
-        let mut rewritten: Vec<String> = args[..args.len() - 6]
+        let cut = if portable { 7 } else { 6 };
+        if portable
+            && (args.len() < 9
+                || command[0] != "pane"
+                || std::path::Path::new(&args[args.len() - 7]).file_name() != Some("kzw".as_ref()))
+        {
+            return Err("unmanaged local launch".into());
+        }
+        if args[2..args.len() - cut]
+            .iter()
+            .any(|opt| !opt.starts_with("--"))
+        {
+            return Err("unexpected program in launch options".into());
+        }
+        let mut rewritten: Vec<String> = args[..args.len() - cut]
             .iter()
             .filter(|arg| !arg.starts_with("--cwd=") && !arg.starts_with("--var=kzw_host="))
             .cloned()
@@ -232,9 +246,12 @@ pub fn translate(
             "--var=kzw_host={}",
             if portable { ORIGIN } else { host }
         ));
+        rewritten.push(if portable { EXECUTABLE } else { executable }.to_owned());
+        if !portable {
+            rewritten.push("pane".into());
+        }
         rewritten.extend(
             [
-                if portable { EXECUTABLE } else { executable },
                 "--pane",
                 &command[2],
                 "--host",
@@ -302,6 +319,7 @@ pub fn rewrite_export(
         launch.extend(
             [
                 executable,
+                "pane",
                 "--pane",
                 &pane.id,
                 "--host",
@@ -417,7 +435,7 @@ mod tests {
         let snapshot = rewrite_export(
             "cd /private/path\nlaunch 'kitty-unserialize-data={\"id\":8}' --cwd=/private/path\n",
             &BTreeMap::from([(8, panes[&8].clone())]),
-            "/private/kzw-pane",
+            "/private/kzw",
         )
         .unwrap();
         let (portable, found) = translate(&snapshot, "", "dev.example", true).unwrap();
@@ -447,7 +465,7 @@ mod tests {
         assert!(!output.contains("cmd_at_shell_startup"));
         assert!(!output.contains("echo bad"));
         assert!(!output.contains("kzw_staging"));
-        assert!(output.contains("'/a path/kzw-pane' --pane"));
+        assert!(output.contains("'/a path/kzw-pane' pane --pane"));
         assert!(rewrite_export(
             "launch 'kitty-unserialize-data={\"id\":7}'\n",
             &panes,

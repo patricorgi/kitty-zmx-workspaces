@@ -31,11 +31,11 @@ class RemoteFileTests(unittest.TestCase):
         ], window=self.w)
 
     def test_ignore_unmanaged_or_mismatched_children_even_with_remote_vars(self):
-        for cmd in (["bash"], ["ssh", "login"], ["/path/kzw-pane", "--pane", A, "--host", "different"]):
+        for cmd in (["bash"], ["ssh", "login"], ["/path/kzw", "pane", "--pane", A, "--host", "different"]):
             with self.subTest(cmd=cmd):
                 self.w.child.cmdline = cmd
                 self.assertFalse(self.module.install(self.boss, self.w))
-        self.w.child.cmdline = ["/path/kzw-pane"]
+        self.w.child.cmdline = ["/path/kzw", "pane"]
         self.w.user_vars["kzw_host"] = "-option"
         self.assertFalse(self.module.install(self.boss, self.w))
         self.w.user_vars["kzw_host"] = "login"

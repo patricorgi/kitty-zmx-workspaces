@@ -18,9 +18,9 @@ class CheckoutLauncherTests(unittest.TestCase):
         env.pop("VIRTUAL_ENV", None)
         env["PATH"] = str(Path(sys.executable).resolve().parent) + os.pathsep + "/usr/bin:/bin"
         with tempfile.TemporaryDirectory() as directory:
-            for program in ("kzw", "kzw-pane"):
-                with self.subTest(program=program):
-                    result = subprocess.run([str(ROOT / "bin" / program), "--help"], cwd=directory,
+            for args in ([], ["pane"]):
+                with self.subTest(args=args):
+                    result = subprocess.run([str(ROOT / "bin/kzw"), *args, "--help"], cwd=directory,
                                             env=env, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("usage:", result.stdout)

@@ -73,7 +73,7 @@ class WorkspaceScopeTests(unittest.TestCase):
             child.poll.return_value = None
             ticks = itertools.count()
             with patch('kzw.cli.state_dir', return_value=root), \
-                 patch('kzw.cli.shutil.which', return_value='/bin/kzw-pane'), \
+                 patch('kzw.cli.shutil.which', return_value='/bin/kzw'), \
                  patch('kzw.cli.prepare_bootstrap', return_value=root / 'bootstrap.kitty-session'), \
                  patch('kzw.cli.mark_bootstrap_launching'), patch('kzw.cli.finish_bootstrap'), \
                  patch('kzw.cli.start_title_monitor', return_value=Mock()), \
@@ -145,9 +145,9 @@ class WorkspaceScopeTests(unittest.TestCase):
                 (root / 'panes.json').write_text(json.dumps([PANE]))
                 with patch('kzw.cli.zmx_command', return_value=PANE + '\n' + second_pane + '\n'), \
                      patch('kzw.cli.state_dir', return_value=root), \
-                     patch('kzw.cli.shutil.which', return_value='/bin/kzw-pane'), \
+                     patch('kzw.cli.shutil.which', return_value='/bin/kzw'), \
                      patch('kzw.cli.remote_client.publish'):
-                    cli.capture_locked(root, '/bin/kzw-pane')
+                    cli.capture_locked(root, '/bin/kzw')
                     self.assertEqual(set(json.loads((root / 'panes.json').read_text())), {PANE, second_pane})
                     cli.detach('Test')
                 self.assertIsNone(proc.poll())

@@ -48,7 +48,7 @@ class DetachedReconcileTests(unittest.TestCase):
 
     def test_missing_and_abandoned_reservation_are_preserved(self):
         with self.assertRaisesRegex(ValueError, 'automatic reconciliation is disabled'):
-            remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
+            remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw')
         result = self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})
         self.assertEqual(result['panes'], [A, B, C])
         self.assertEqual(result['reservations'], [R])
@@ -67,14 +67,14 @@ class DetachedReconcileTests(unittest.TestCase):
     def test_failed_listing_does_not_modify_or_create_journal(self):
         with patch('kzw.remote.subprocess.run', side_effect=subprocess.CalledProcessError(1, ['zmx'])):
             with self.assertRaises(subprocess.CalledProcessError):
-                remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
+                remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw')
         self.assertFalse((self.directory / 'reconcile-pending.json').exists())
         self.assertEqual(self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})['panes'], [A, B, C])
 
     def test_live_reservation_cannot_be_cancelled(self):
         with patch('kzw.remote.subprocess.run', return_value=subprocess.CompletedProcess([], 0, A + '\n' + C + '\n' + R + '\n', '')):
             with self.assertRaisesRegex(ValueError, 'disabled'):
-                remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
+                remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw')
         self.assertEqual(self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})['reservations'], [R])
         self.assertTrue((self.directory / 'native-pending' / (R + '.json')).exists())
 
@@ -90,6 +90,6 @@ class DetachedReconcileTests(unittest.TestCase):
         journal = self.directory / 'reconcile-pending.json'
         journal.write_text(json.dumps({'workspace': 'Test', 'request': {'remove': [B]}}))
         with self.assertRaisesRegex(ValueError, 'retained for manual inspection'):
-            remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw-pane')
+            remote_client.pull(self.directory, 'Test', 'origin', '/bin/kzw')
         self.assertTrue(journal.exists())
         self.assertEqual(self.store.dispatch({'method': 'workspace.get', 'workspace': 'Test'})['revision'], 1)

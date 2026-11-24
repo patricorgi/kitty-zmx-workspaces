@@ -5,4 +5,5 @@ root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
 PATH="$root/bin:$PATH"
 PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
 export PATH PYTHONPATH
+export KZW_EXECUTABLE="$root/bin/kzw"
 exec python3 -m kzw.cli "$@"

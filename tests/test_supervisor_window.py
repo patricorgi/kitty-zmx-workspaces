@@ -34,7 +34,7 @@ class SupervisorWindowTests(unittest.TestCase):
             child.poll.side_effect = [None, 0]
             title_stop = Mock()
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.prepare_bootstrap", return_value=path / "bootstrap.kitty-session"), \
                  patch("kzw.cli.mark_bootstrap_launching"), patch("kzw.cli.finish_bootstrap"), \
                  patch("kzw.cli.start_title_monitor", return_value=title_stop), \

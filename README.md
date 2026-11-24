@@ -6,23 +6,20 @@ https://github.com/user-attachments/assets/9a65a9ae-26fe-43d1-8700-7f1a89547301
 
 ## Installation
 
-Install Python 3.10+, Kitty 0.51+, and zmx. For remote workspaces, make sure
-you can SSH to the host and that it has Python 3 and zmx.
+Requires Python 3.10+, Kitty 0.51+, and zmx. Remote hosts need SSH access, Python 3, and zmx.
 
 ```sh
 git clone https://github.com/patricorgi/kitty-zmx-workspaces.git
 cd kitty-zmx-workspaces
-python3 install.py
+python3 install.py                 # installs only ~/.local/bin/kzw
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Keep the checkout in place. Add the PATH line to your shell configuration to
-use the installed commands in new terminals.
+For a custom directory, use `python3 install.py --bin-dir "$HOME/bin"` and add it to `PATH`.
+The installed `kzw` runs without the checkout.
 
-On Kitty 0.51+, the installer adds a native tab hook and a pane-close watcher
-without changing your key bindings. Existing kzw installs can run
-`python3 install.py --kitty-hook-only`, then reload Kitty's configuration and
-reattach the workspace. An existing custom `launch_wrapper.py` is left untouched.
+Optional: run `python3 install.py --kitty-hook-only` for native tabs
+and confirmed pane closes. Use the same `--bin-dir`, reload Kitty’s config, and reattach.
 
 ## Basic commands
 

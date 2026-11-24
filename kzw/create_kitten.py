@@ -6,6 +6,10 @@ import shutil
 import subprocess
 
 from kittens.tui.handler import result_handler
+try:
+    from kzw.launcher import executable as kzw_executable
+except ModuleNotFoundError:
+    from launcher import executable as kzw_executable
 
 
 def main(args):
@@ -29,7 +33,7 @@ def handle_result(args, answer, target_window_id, boss):
     # local origin. Older private instances can still use their environment.
     host = variables.get("kzw_host", "" if "kzw_workspace" in variables else os.environ.get("KZW_HOST", ""))
     # GUI-launched Kitty need not inherit the user's shell PATH.
-    executable = shutil.which("kzw") or str(Path.home() / ".local/bin/kzw")
+    executable = kzw_executable(window)
     cmd = [executable, "_managed-create", name, kind, str(target_window_id), pane, "--host", host]
     cwd = getattr(window.screen, "last_reported_cwd", "")
     if isinstance(cwd, bytes):

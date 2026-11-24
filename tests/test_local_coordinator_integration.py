@@ -18,8 +18,8 @@ from kzw.core import focused_pane, pane_map
 @unittest.skipUnless(os.environ.get("KZW_RUN_INTEGRATION") == "1", "real integration is opt-in")
 class LocalCoordinatorIntegration(unittest.TestCase):
     def setUp(self):
-        if any(not shutil.which(name) for name in ("kitty", "zmx", "kzw", "kzw-pane")):
-            self.skipTest("requires kitty, zmx, kzw and kzw-pane on PATH")
+        if any(not shutil.which(name) for name in ("kitty", "zmx", "kzw")):
+            self.skipTest("requires kitty, zmx and kzw on PATH")
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="kc-", dir=cache)

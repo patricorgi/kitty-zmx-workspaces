@@ -14,6 +14,7 @@ import uuid
 
 from .core import PANE, atomic_write
 from . import remote_client
+from .launcher import executable as kzw_executable
 from .utility_tabs import is_local as local_window
 
 
@@ -120,9 +121,8 @@ def launch(directory, name, origin="", target=None, create=False, focus=True):
         "KZW_HOST", "KZW_WORKSPACE", "KZW_WORKSPACE_ORIGIN", "KZW_WORKSPACE_COORDINATOR",
         "KZW_WORKSPACE_DIRECTORY", "KZW_RPC_SOCKET", "KZW_CHANGE_SIGNAL", "KZW_CONNECTION_DISPLAY",
         "ZMX_SESSION", "ZMX_SESSION_PREFIX")]
-    executable = shutil.which("kzw")
-    if not executable:
-        raise ValueError("kzw is not installed")
+    executable = kzw_executable()
+    options.append("--env=KZW_EXECUTABLE=" + executable)
     result = view_query(directory, "launch", "--match", f"window_id:{source['id']}", *options,
                         executable, "_local-attach", identity, pane)
     if not result.strip().isdigit():
@@ -198,9 +198,9 @@ def attach(identity, pane):
             env.pop(key, None)
         if source["socket_selector"]:
             env[source["socket_selector"]] = source["socket_base"]
-        # Never inherit -o shell=kzw-pane from a separate workspace instance.
+        # Never inherit the private workspace pane command as a login shell.
         shell = env.get("SHELL", "/bin/sh")
-        if Path(shell).name in ("kzw-pane", "kzw"):
+        if shell.endswith(" pane") or Path(shell).name == "kzw":
             shell = "/bin/sh"
         command = [source["executable"], "attach", pane]
         if reply["create"]:

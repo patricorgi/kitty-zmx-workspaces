@@ -32,7 +32,7 @@ class ServerIntegration(unittest.TestCase):
                     remote_client.create(Path(directory), "Test", host)
                     with tempfile.TemporaryDirectory() as local_state, \
                          patch.dict(os.environ, {"XDG_STATE_HOME": local_state}), \
-                         patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                         patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                          patch("kzw.cli.run", return_value=0) as run:
                         self.assertEqual(cli.attach_remote("Test", host), 0)
                         self.assertTrue(run.call_args.kwargs["remote_attached"])
@@ -49,7 +49,7 @@ class ServerIntegration(unittest.TestCase):
                     self.assertEqual(second["revision"], first["revision"])
                     self.assertEqual(second["live"], [])
                     self.assertEqual(second["missing"], [])
-                    bootstrap = cli.prepare_bootstrap(Path(directory), "Test", host, "/bin/kzw-pane")
+                    bootstrap = cli.prepare_bootstrap(Path(directory), "Test", host, "/bin/kzw")
                     journal = json.loads((Path(directory) / "pending-create.json").read_text())
                     pane, operation = journal["pane"], journal["request_id"]
                     reserved = remote_client.reserve_pane(Path(directory), pane, operation)
@@ -66,7 +66,7 @@ class ServerIntegration(unittest.TestCase):
                             if attachment.poll() is not None or time.monotonic() >= deadline:
                                 self.fail("disposable remote zmx session did not start")
                             time.sleep(0.1)
-                        self.assertEqual(cli.recover_bootstrap(Path(directory), "Test", host, "/bin/kzw-pane"), bootstrap)
+                        self.assertEqual(cli.recover_bootstrap(Path(directory), "Test", host, "/bin/kzw"), bootstrap)
                         self.assertIn("--existing", bootstrap.read_text())
                         remote_client.call(host, {"method": "workspace.put", "workspace": "Test", "request_id": "own-pane",
                                                   "revision": first["revision"], "snapshot": layout(pane), "panes": [pane],
@@ -102,7 +102,7 @@ class ServerIntegration(unittest.TestCase):
                     remote_client.call(host, {"method": "pane.reserve", "workspace": "Test", "revision": revision,
                                               "pane": abandoned, "request_id": uuid.uuid4().hex, "lease_token": token})
                     with self.assertRaisesRegex(ValueError, "disabled"):
-                        remote_client.pull(Path(directory), "Test", host, "/bin/kzw-pane")
+                        remote_client.pull(Path(directory), "Test", host, "/bin/kzw")
                     self.assertEqual(remote_client.call(host, {"method": "workspace.get", "workspace": "Test"})["reservations"], [abandoned])
                     remote_client.release_lease(Path(directory))
             finally:

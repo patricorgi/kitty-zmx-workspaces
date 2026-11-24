@@ -246,7 +246,7 @@ class TransientExportTests(unittest.TestCase):
             "--var=kzw_workspace=Test", "--var=kzw_marker=m", "--var=keep=1",
             "--env=KZW_WORKSPACE=Test", "--env=OTHER=1", "--cwd=/tmp",
             "/bin/shell"]) + "\n"
-        rewritten = cli.rewrite_export(export, {1: (PANE_A, "")}, "/bin/kzw-pane")
+        rewritten = cli.rewrite_export(export, {1: (PANE_A, "")}, "/bin/kzw")
         args = shlex.split(rewritten.splitlines()[0])
         self.assertNotIn("--var=kzw_workspace=Test", args)
         self.assertNotIn("--var=kzw_marker=m", args)
@@ -255,7 +255,7 @@ class TransientExportTests(unittest.TestCase):
         self.assertIn("--env=OTHER=1", args)
         self.assertIn("--cwd=/tmp", args)
         self.assertEqual(args[2:], ["--var=keep=1", "--env=OTHER=1", "--cwd=/tmp",
-                                    "/bin/kzw-pane", "--pane", PANE_A, "--host", "",
+                                    "/bin/kzw", "pane", "--pane", PANE_A, "--host", "",
                                     "--existing"])
 
 
@@ -432,7 +432,7 @@ class SharedSupervisorTests(unittest.TestCase):
                     self.assertLess(state["sleeps"], 20, "supervisor failed to release a vanished view")
 
                 replacements = {
-                    "state_dir": {"return_value": directory}, "shutil.which": {"return_value": "/bin/kzw-pane"},
+                    "state_dir": {"return_value": directory}, "shutil.which": {"return_value": "/bin/kzw"},
                     "kitty_instance.context": {"return_value": context}, "kitty_instance.probe": {},
                     "kitty_instance.tab_style": {},
                     "list_os_windows": {"side_effect": windows}, "start_title_monitor": {"return_value": title_stop},

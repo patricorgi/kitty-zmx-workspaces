@@ -166,6 +166,39 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
         output = self.raw("kitten", str(self.probe))
         return json.loads(output)
 
+    def test_installed_bundle_restores_single_pane_without_checkout_on_path(self):
+        self.baseline = self.sessions()
+        bindir = self.tmp / "custom bin"
+        env = {**self.env, "XDG_DATA_HOME": str(self.tmp / "data")}
+        env.pop("PYTHONPATH", None)
+        env.pop("KZW_EXECUTABLE", None)
+        env["PATH"] = os.pathsep.join(p for p in env["PATH"].split(os.pathsep)
+                                      if not (Path(p) / "kzw").exists())
+        tools = self.tmp / "dependencies"
+        tools.mkdir()
+        (tools / "zmx").symlink_to(shutil.which("zmx"))
+        env["PATH"] = str(tools) + os.pathsep + env["PATH"]
+        program = str(bindir / "kzw")
+        subprocess.run([sys.executable, str(REPO / "install.py"), "--bin-dir", str(bindir)],
+                       cwd=self.tmp, env=env, check=True)
+        def run(*args):
+            result = subprocess.run([program, *args], cwd=self.tmp, env=env, text=True,
+                                    capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        run("create", "Test", "--attach")
+        created = self.sessions() - self.baseline
+        self.assertEqual(len(created), 1)
+        run("detach", "Test")
+        directory = self.state / "kzw/Test"
+        snapshot = (directory / "workspace.kitty-session").read_text()
+        launch, = [shlex.split(line) for line in snapshot.splitlines() if line.startswith("launch ")]
+        self.assertEqual(launch[-7:], [program, "pane", "--pane", next(iter(created)), "--host", "", "--existing"])
+        with (directory / "lock").open() as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        run("attach", "Test")
+        self.assertEqual(self.sessions() - self.baseline, created)
+        run("detach", "Test")
+
     def test_managed_split_uses_installed_launcher_without_kitty_path(self):
         self.baseline = self.sessions()
         result = self.kzw("create", "Test", "--attach", timeout=35)

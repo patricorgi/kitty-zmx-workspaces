@@ -36,7 +36,7 @@ class LeaseRecoveryIntegration(unittest.TestCase):
                 remote_client.create(directory, "Test", host)
                 original = remote_client.acquire_lease(directory, "Test", host)
                 remote_client.reserve_pane(directory, pane, uuid.uuid4().hex)
-                snapshot, panes = remote_client.translate(layout(pane), "/bin/kzw-pane", host, False)
+                snapshot, panes = remote_client.translate(layout(pane), "/bin/kzw", host, False)
                 remote_client.stage_layout(directory, snapshot, panes)
                 command = ('PATH="$HOME/.local/bin:$PATH"; export PATH; unset ZMX_SESSION ZMX_SESSION_PREFIX; '
                            'exec zmx attach ' + pane + ' /bin/sleep 180')

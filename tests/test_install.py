@@ -18,9 +18,10 @@ class InstallTests(unittest.TestCase):
             env["KITTY_CONFIG_DIRECTORY"] = str(Path(home) / "kitty")
             subprocess.run([sys.executable, str(ROOT / "install.py")], env=env, cwd=home,
                            capture_output=True, text=True, timeout=10, check=True)
-            self.assertEqual((Path(home) / "kitty/launch_wrapper.py").resolve(), ROOT / "kzw/native_tab.py")
-            for name in ("kzw", "kzw-pane"):
-                result = subprocess.run([str(Path(home) / ".local/bin" / name), "--help"], env=env,
+            self.assertFalse((Path(home) / "kitty").exists())
+            self.assertEqual([p.name for p in (Path(home) / ".local/bin").iterdir()], ["kzw"])
+            for args in ([], ["pane"]):
+                result = subprocess.run([str(Path(home) / ".local/bin/kzw"), *args, "--help"], env=env,
                                         cwd=home, capture_output=True, text=True, timeout=10, check=True)
                 self.assertIn("usage:", result.stdout)
 
@@ -29,7 +30,7 @@ class InstallTests(unittest.TestCase):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as home:
                 bindir = Path(home) / ".local/bin"
                 bindir.mkdir(parents=True)
-                target = bindir / "kzw-pane"
+                target = bindir / "kzw"
                 if kind == "file":
                     target.write_text("preserve me")
                 else:
@@ -38,7 +39,6 @@ class InstallTests(unittest.TestCase):
                 result = subprocess.run([sys.executable, str(ROOT / "install.py")], env=env,
                                         capture_output=True, text=True, timeout=10)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertFalse((bindir / "kzw").exists())
                 self.assertTrue(os.path.lexists(target))
                 if kind == "file":
                     self.assertEqual(target.read_text(), "preserve me")
@@ -60,10 +60,15 @@ class InstallTests(unittest.TestCase):
             conf = config / "kitty.conf"
             conf.write_text("map f9 new_tab\n")
             env = {**os.environ, "HOME": home, "KITTY_CONFIG_DIRECTORY": str(config)}
+            bindir = Path(home) / "custom bin"
+            install_cmd = [sys.executable, str(ROOT / "install.py"), "--bin-dir", str(bindir)]
+            subprocess.run(install_cmd, env=env, cwd=home, check=True, capture_output=True)
             for _ in range(2):
-                subprocess.run([sys.executable, str(ROOT / "install.py"), "--kitty-hook-only"], env=env,
+                subprocess.run([*install_cmd, "--kitty-hook-only"], env=env,
                                capture_output=True, text=True, timeout=10, check=True)
-            self.assertEqual((config / "launch_wrapper.py").resolve(), ROOT / "kzw/native_tab.py")
+            hook = (config / "launch_wrapper.py").resolve()
+            self.assertTrue(hook.is_file() and hook.is_relative_to(Path(home).resolve()))
             self.assertTrue(conf.read_text().startswith("map f9 new_tab\n"))
-            self.assertEqual(conf.read_text().count("watcher " + str(ROOT / "kzw/native_close.py")), 1)
+            watchers = [Path(line[8:]).resolve() for line in conf.read_text().splitlines() if line.startswith("watcher ")]
+            self.assertEqual(watchers, [hook.with_name("native_close.py")])
             self.assertFalse((Path(home) / ".local/bin/kzw").exists())

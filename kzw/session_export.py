@@ -40,7 +40,7 @@ def managed_terminal(window):
     if not command:
         return False
     launcher = Path(command[0]).name
-    if launcher != "kzw-pane" and not (
+    if not (launcher == "kzw" and command[1:2] == ["pane"]) and not (
             launcher.startswith("python") and command[1:3] == ["-m", "kzw.pane"]):
         return False
     return (command.count("--pane") == 1 and command.count("--host") == 1 and

@@ -84,7 +84,7 @@ class ExitTests(unittest.TestCase):
         self.token = remote_client.acquire_lease(self.directory, "Test", "")
         portable = "\n".join(line + " --host KZW_ORIGIN --existing" if line.startswith("launch ") else line
                               for line in snapshot().splitlines()) + "\n"
-        self.source, _ = remote_client.translate(portable, "/bin/kzw-pane", "", False)
+        self.source, _ = remote_client.translate(portable, "/bin/kzw", "", False)
         remote_client.publish(self.directory, self.source, [A, B, C])
         (self.directory / "workspace.kitty-session").write_text(self.source)
         (self.directory / "panes.json").write_text(json.dumps([A, B, C]))
@@ -149,7 +149,7 @@ class ExitTests(unittest.TestCase):
                         w["user_vars"]["kzw_attach_ended"] = "1"
 
     def sync(self):
-        return cli.synchronize_exits(self.directory, "/bin/kzw-pane")
+        return cli.synchronize_exits(self.directory, "/bin/kzw")
 
     def test_zmx_1_0_1_exit_requires_ordered_suffix_and_absent_pid(self):
         self.version = "1.0.1"
@@ -231,7 +231,7 @@ class ExitTests(unittest.TestCase):
 
         which = shutil.which
         with patch("kzw.cli.state_dir", return_value=self.directory), \
-             patch("kzw.cli.shutil.which", side_effect=lambda name, **kw: "/bin/kzw-pane" if name == "kzw-pane"
+             patch("kzw.cli.shutil.which", side_effect=lambda name, **kw: "/bin/kzw" if name == "kzw"
                    else which(name, **kw)), \
              patch("kzw.cli.capture_tree_locked", side_effect=capture) as check, \
              self.assertRaisesRegex(ValueError, "stop before launching"):
@@ -336,7 +336,7 @@ class ExitTests(unittest.TestCase):
             (signals / pane).touch()
         self.ended(A, B, C)
         self.tree = []
-        self.assertEqual(exits.synchronize(self.directory, "/bin/kzw-pane", tree=[]), 3)
+        self.assertEqual(exits.synchronize(self.directory, "/bin/kzw", tree=[]), 3)
         self.assertEqual((self.directory / "workspace.kitty-session").read_text(), cli.EMPTY_SNAPSHOT)
         self.assertEqual(self.closes, [])
 
@@ -388,7 +388,7 @@ class ExitTests(unittest.TestCase):
             self.assertTrue((self.directory / "pending-exit.json").exists())
             (self.zmx / "logs" / (B + ".log")).unlink()  # Replay uses the committed receipt.
             with self.assertRaisesRegex(ValueError, "exit"):
-                cli.capture(self.directory, "/bin/kzw-pane")
+                cli.capture(self.directory, "/bin/kzw")
             self.assertEqual(self.sync(), 1)
         attempts = [r for r in self.requests if r["method"] == "panes.exited"]
         self.assertEqual(len(attempts), 2)
@@ -454,7 +454,7 @@ class ExitTests(unittest.TestCase):
         journal = self.directory / "pending-exit.json"
         journal.write_text('{"interrupted":true}\n')
         with patch("kzw.cli.state_dir", return_value=self.directory), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.remote_client.acquire_lease") as lease, \
              patch("kzw.cli.remove_view") as remove, self.assertRaisesRegex(ValueError, "exit reconciliation"):
             cli.attach_remote("Test", "")

@@ -169,8 +169,8 @@ class RemoteOriginIntegration(unittest.TestCase):
     def setUp(self):
         self.host = os.environ.get("KZW_INTEGRATION_HOST")
         self.name = "Test"
-        if not self.host or not shutil.which("kitty") or not shutil.which("kzw") or not shutil.which("kzw-pane"):
-            self.skipTest("requires KZW_INTEGRATION_HOST, kitty, kzw and kzw-pane on PATH")
+        if not self.host or not shutil.which("kitty") or not shutil.which("kzw"):
+            self.skipTest("requires KZW_INTEGRATION_HOST, kitty and kzw on PATH")
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)
         self.local = tempfile.TemporaryDirectory(prefix="kr-", dir=cache)
@@ -437,7 +437,7 @@ class RemoteOriginIntegration(unittest.TestCase):
             directory = state_dir("Test", self.host)
             remote_client.acquire_lease(directory, "Test", self.host)
             try:
-                session = prepare_bootstrap(directory, "Test", self.host, shutil.which("kzw-pane"))
+                session = prepare_bootstrap(directory, "Test", self.host, shutil.which("kzw"))
                 record = json.loads((directory / "pending-create.json").read_text())
                 pane = record["pane"]
                 self.owned.add(pane)
@@ -504,7 +504,7 @@ class RemoteOriginIntegration(unittest.TestCase):
             self.assertIn("has no live panes", self.kzw("b", "attach", "Test", "--host", self.host))
         finally:
             result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
-            if result.returncode == 0 and "kzw-pane" in result.stdout and pane in result.stdout:
+            if result.returncode == 0 and "-m kzw.pane" in result.stdout and pane in result.stdout:
                 os.kill(pid, signal.SIGCONT)
 
     def test_kitten_confirmation_cancel_and_accept(self):

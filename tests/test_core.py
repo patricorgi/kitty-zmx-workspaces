@@ -79,17 +79,17 @@ class WorkspaceTests(unittest.TestCase):
     def test_rewrites_commands_without_losing_layout(self):
         source = "\n".join(["new_tab work", "layout splits", launch(7, "echo bad"), launch(8),
                             'set_layout_state {"pairs":{"one":7,"two":8}}'])
-        out = rewrite_export(source, pane_map(tree()), "/a path/kzw-pane")
+        out = rewrite_export(source, pane_map(tree()), "/a path/kzw")
         self.assertIn('set_layout_state {"pairs":{"one":7,"two":8}}', out)
         self.assertNotIn("rm -rf", out)
         self.assertNotIn("echo bad", out)
         launches = [shlex.split(line) for line in out.splitlines() if line.startswith("launch ")]
-        self.assertEqual(launches[0][-6:], ["/a path/kzw-pane", "--pane", A, "--host", "", "--existing"])
-        self.assertEqual(launches[1][-6:], ["/a path/kzw-pane", "--pane", B, "--host", "dev.example", "--existing"])
+        self.assertEqual(launches[0][-7:], ["/a path/kzw", "pane", "--pane", A, "--host", "", "--existing"])
+        self.assertEqual(launches[1][-7:], ["/a path/kzw", "pane", "--pane", B, "--host", "dev.example", "--existing"])
 
     def test_incomplete_and_duplicate_panes_fail_closed(self):
         with self.assertRaises(ValueError):
-            rewrite_export(launch(7), pane_map(tree()), "/bin/kzw-pane")
+            rewrite_export(launch(7), pane_map(tree()), "/bin/kzw")
         bad = tree()
         bad[0]["tabs"][0]["windows"][1]["user_vars"]["kzw_pane"] = A
         with self.assertRaises(ValueError):
@@ -103,11 +103,11 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_invalid_export_fails_closed(self):
         with self.assertRaises(ValueError):
-            rewrite_export("launch --cwd=/tmp bash", pane_map(tree()), "/bin/kzw-pane")
+            rewrite_export("launch --cwd=/tmp bash", pane_map(tree()), "/bin/kzw")
 
     def test_transient_attachment_ended_marker_not_restored(self):
         output = rewrite_export(launch(7) + " --var=kzw_attach_ended=1\n" + launch(8),
-                                pane_map(tree()), "/bin/kzw-pane")
+                                pane_map(tree()), "/bin/kzw")
         self.assertNotIn("kzw_attach_ended", output)
 
     def test_workspace_path_validation(self):
@@ -135,9 +135,9 @@ class WorkspaceTests(unittest.TestCase):
             (path / "panes.json").write_text(json.dumps([A, B]))
             (path / "workspace.kitty-session").write_text("previous complete snapshot")
             with self.assertRaises(ValueError):
-                capture(path, "/bin/kzw-pane")
+                capture(path, "/bin/kzw")
             self.assertEqual((path / "workspace.kitty-session").read_text(), "previous complete snapshot")
-            self.assertEqual(capture(path, "/bin/kzw-pane", allow_removals=True), 1)
+            self.assertEqual(capture(path, "/bin/kzw", allow_removals=True), 1)
 
     def test_capture_refuses_racing_layout(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -146,7 +146,7 @@ class WorkspaceTests(unittest.TestCase):
             responses = [json.dumps(tree()), snapshot_reply(("--with-tree",), changed, launch(7))]
             with patch("kzw.cli.query", side_effect=responses):
                 with self.assertRaises(ValueError):
-                    capture(Path(directory), "/bin/kzw-pane")
+                    capture(Path(directory), "/bin/kzw")
             self.assertFalse((Path(directory) / "workspace.kitty-session").exists())
 
     def test_capture_persists_focus_inside_snapshot(self):
@@ -158,7 +158,7 @@ class WorkspaceTests(unittest.TestCase):
             return snapshot_reply(args, current, export)
         with tempfile.TemporaryDirectory() as directory, patch("kzw.cli.query", side_effect=query), \
              patch("kzw.cli.zmx_command", return_value=A + "\n" + B + "\n"):
-            capture(Path(directory), "/bin/kzw-pane")
+            capture(Path(directory), "/bin/kzw")
             text = (Path(directory) / "workspace.kitty-session").read_text()
             self.assertEqual(saved_focus(text), B)
 
@@ -172,10 +172,10 @@ class WorkspaceTests(unittest.TestCase):
             path = Path(directory)
             atomic_write(path / "panes.json", json.dumps([A, B]) + "\n")
             with patch("kzw.cli.subprocess.run", side_effect=raw) as run:
-                capture(path, "/bin/kzw-pane")
+                capture(path, "/bin/kzw")
                 run.reset_mock()
                 with patch("kzw.cli.atomic_write") as write:
-                    self.assertEqual(capture(path, "/bin/kzw-pane"), 2)
+                    self.assertEqual(capture(path, "/bin/kzw"), 2)
                     write.assert_not_called()
                 self.assertEqual([call.args[0][4] for call in run.call_args_list], ["ls", "kitten"])
 
@@ -189,7 +189,7 @@ class WorkspaceTests(unittest.TestCase):
              patch("kzw.cli.zmx_command", return_value=A + "\n" + B + "\n"):
             path = Path(directory)
             with self.assertRaisesRegex(ValueError, "layout changed"):
-                capture(path, "/bin/kzw-pane")
+                capture(path, "/bin/kzw")
             self.assertFalse((path / "workspace.kitty-session").exists())
 
     def test_local_capture_preserves_native_journal_until_session_is_confirmed(self):
@@ -207,11 +207,11 @@ class WorkspaceTests(unittest.TestCase):
                 return snapshot_reply(args, tree(), export)
             with patch("kzw.cli.query", side_effect=kitty), patch("kzw.cli.zmx_command", return_value=""):
                 with self.assertRaisesRegex(ValueError, "not yet ready"):
-                    capture(path, "/bin/kzw-pane")
+                    capture(path, "/bin/kzw")
             self.assertTrue(journal.exists())
             self.assertEqual((path / "workspace.kitty-session").read_text(), "previous complete snapshot\n")
             with patch("kzw.cli.query", side_effect=kitty), patch("kzw.cli.zmx_command", return_value=B + "\n"):
-                capture(path, "/bin/kzw-pane")
+                capture(path, "/bin/kzw")
             self.assertFalse(journal.exists())
             self.assertEqual(set(json.loads((path / "panes.json").read_text())), {A, B})
 
@@ -243,19 +243,19 @@ class WorkspaceTests(unittest.TestCase):
             journal = pending / (B + ".json")
             journal.write_text(json.dumps({"pane": B, "host": "dev.example", "workspace": "Test"}))
             snapshot = rewrite_export(launch(7) + "\n" + launch(8),
-                                      {7: (A, "dev.example"), 8: (B, "dev.example")}, "/bin/kzw-pane")
+                                      {7: (A, "dev.example"), 8: (B, "dev.example")}, "/bin/kzw")
             stage = path / "native-stage.json"
             stage.write_text(json.dumps({"kind": "kzw-native-stage-v1", "snapshot": snapshot,
                                          "base_hash": hashlib.sha256(baseline.encode()).hexdigest(),
                                          "panes": [A, B], "added": [B]}))
             with patch("kzw.cli.zmx_command", return_value=A + "\n"):
                 with self.assertRaisesRegex(ValueError, "refusing to recreate"):
-                    recover_local_native_stage(path, "/bin/kzw-pane")
+                    recover_local_native_stage(path, "/bin/kzw")
             self.assertEqual(target.read_text(), baseline)
             self.assertTrue(stage.exists())
             self.assertTrue(journal.exists())
             with patch("kzw.cli.zmx_command", return_value=A + "\n" + B + "\n"):
-                self.assertTrue(recover_local_native_stage(path, "/bin/kzw-pane"))
+                self.assertTrue(recover_local_native_stage(path, "/bin/kzw"))
             self.assertEqual(target.read_text(), snapshot)
             self.assertFalse(stage.exists())
             self.assertFalse(journal.exists())
@@ -274,7 +274,7 @@ class WorkspaceTests(unittest.TestCase):
             root.mkdir(mode=0o700)
             (root / (B + ".json")).write_text(json.dumps({"pane": B, "host": "dev.example", "workspace": "Test"}))
             snapshot = rewrite_export(launch(7) + "\n" + launch(8),
-                                      {7: (A, "dev.example"), 8: (B, "dev.example")}, "/bin/kzw-pane")
+                                      {7: (A, "dev.example"), 8: (B, "dev.example")}, "/bin/kzw")
             (path / "native-stage.json").write_text(json.dumps({"kind": "kzw-native-stage-v1", "snapshot": snapshot,
                 "base_hash": hashlib.sha256(baseline.encode()).hexdigest(), "panes": [A, B], "added": [B]}))
             pending = path / "pending-create.json"
@@ -282,7 +282,7 @@ class WorkspaceTests(unittest.TestCase):
                                            "request_id": "a" * 32}))
             with patch("kzw.cli.zmx_command", return_value=A + "\n"):
                 with self.assertRaisesRegex(ValueError, "refusing to recreate"):
-                    recover_local_managed_creation(path, "/bin/kzw-pane")
+                    recover_local_managed_creation(path, "/bin/kzw")
             self.assertTrue(pending.exists())
             self.assertEqual((path / "workspace.kitty-session").read_text(), baseline)
             unlink = Path.unlink
@@ -293,9 +293,9 @@ class WorkspaceTests(unittest.TestCase):
             with patch("kzw.cli.zmx_command", return_value=A + "\n" + B + "\n"):
                 with patch("pathlib.Path.unlink", autospec=True, side_effect=interrupted):
                     with self.assertRaises(OSError):
-                        recover_local_managed_creation(path, "/bin/kzw-pane")
+                        recover_local_managed_creation(path, "/bin/kzw")
                 self.assertFalse((path / "native-stage.json").exists())
-                self.assertTrue(recover_local_managed_creation(path, "/bin/kzw-pane"))
+                self.assertTrue(recover_local_managed_creation(path, "/bin/kzw"))
             self.assertFalse(pending.exists())
 
     def test_remote_managed_stage_recovery_retains_journal_until_status_confirmed(self):
@@ -309,7 +309,7 @@ class WorkspaceTests(unittest.TestCase):
             pending.write_text(json.dumps({"kind": "tab", "pane": B, "host": "origin", "target": A,
                                            "request_id": "a" * 32}))
             snapshot = rewrite_export(launch(7) + "\n" + launch(8),
-                                      {7: (A, "origin"), 8: (B, "origin")}, "/bin/kzw-pane")
+                                      {7: (A, "origin"), 8: (B, "origin")}, "/bin/kzw")
             portable, panes = remote_client.translate(snapshot, "", "origin", True)
             remote = {"revision": 1, "panes": [A], "reservations": [B],
                       "staged": {"revision": 1, "snapshot": portable, "panes": panes}}
@@ -319,9 +319,9 @@ class WorkspaceTests(unittest.TestCase):
                  patch("kzw.cli.remote_client.pull"), \
                  patch("kzw.cli.remote_client.status", side_effect=[OSError("offline"), {"live": panes, "missing": []}]):
                 with self.assertRaises(OSError):
-                    recover_remote_managed_creation(path, "Test", "origin", "/bin/kzw-pane")
+                    recover_remote_managed_creation(path, "Test", "origin", "/bin/kzw")
                 self.assertTrue(pending.exists())
-                self.assertTrue(recover_remote_managed_creation(path, "Test", "origin", "/bin/kzw-pane"))
+                self.assertTrue(recover_remote_managed_creation(path, "Test", "origin", "/bin/kzw"))
             self.assertFalse(pending.exists())
 
     def test_focus_change_during_capture_fails_closed(self):
@@ -331,7 +331,7 @@ class WorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch("kzw.cli.query", side_effect=[json.dumps(before), "export", json.dumps(after)]):
                 with self.assertRaises(ValueError):
-                    capture(Path(directory), "/bin/kzw-pane")
+                    capture(Path(directory), "/bin/kzw")
             self.assertFalse((Path(directory) / "workspace.kitty-session").exists())
 
     def test_restore_focus_uses_stable_pane_id(self):
@@ -346,7 +346,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_failed_detach_capture_does_not_close_windows(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch("kzw.cli.state_dir", return_value=Path(directory)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.capture_locked", side_effect=ValueError("incomplete")), \
              patch("kzw.cli.query") as query:
             with self.assertRaises(ValueError):
@@ -356,7 +356,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_detach_retries_transient_layout_change_before_closing(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch("kzw.cli.state_dir", return_value=Path(directory)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.capture_locked", side_effect=[ValueError("layout changed while taking snapshot"), 2]) as capture, \
              patch("kzw.cli.time.sleep"), patch("kzw.cli.query", side_effect=[json.dumps(tree()), ""]) as query:
             (Path(directory) / "panes.json").write_text(json.dumps([A, B]))
@@ -381,7 +381,7 @@ class WorkspaceTests(unittest.TestCase):
             return snapshot_reply(args, current, export)
         with tempfile.TemporaryDirectory() as directory, patch("kzw.cli.query", side_effect=query):
             with self.assertRaises(ValueError):
-                capture_locked(Path(directory), "/bin/kzw-pane", allow_removals=True, expected_panes={7: (A, "")})
+                capture_locked(Path(directory), "/bin/kzw", allow_removals=True, expected_panes={7: (A, "")})
             self.assertFalse((Path(directory) / "workspace.kitty-session").exists())
 
     def test_cleanup_preserves_record_on_failure(self):
@@ -410,7 +410,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_invalid_tab_rejected_without_terminating(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch("kzw.cli.state_dir", return_value=Path(directory)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.capture_locked"), \
              patch("kzw.cli.query", return_value=json.dumps(tree())), \
              patch("kzw.cli.zmx_command") as zmx:
@@ -421,7 +421,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_close_refuses_unknown_pane_before_destroying_anything(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch("kzw.cli.state_dir", return_value=Path(directory)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.capture_locked"), \
              patch("kzw.cli.query", return_value=json.dumps(tree())) as query, \
              patch("kzw.cli.zmx_command") as zmx:
@@ -434,7 +434,7 @@ class WorkspaceTests(unittest.TestCase):
         from kzw.cli import close_target
         with tempfile.TemporaryDirectory() as directory, \
              patch("kzw.cli.state_dir", return_value=Path(directory)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.capture_locked"), \
              patch("kzw.cli.query", return_value=json.dumps(tree())) as query, \
              patch("kzw.cli.zmx_command") as zmx:
@@ -484,7 +484,7 @@ class WorkspaceTests(unittest.TestCase):
             path = Path(directory)
             (path / "remote.json").write_text("{}")
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.remote_client.renew_lease", side_effect=ValueError("lease lost")), \
                  patch("kzw.cli.query") as query:
                 with self.assertRaisesRegex(ValueError, "lease lost"):
@@ -505,7 +505,7 @@ class WorkspaceTests(unittest.TestCase):
             windows[0]["user_vars"]["kzw_host"] = "origin"
             with patch.dict(os.environ, {"KZW_RPC_SOCKET": "", "KZW_REMOTE_STATE_HOME": ""}), \
                  patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.capture_stable_locked"), patch("kzw.cli.view_query", return_value=json.dumps(current)) as kitty, \
                  patch("kzw.remote_client.coordinator_command", return_value=["fake"]), \
                  patch("kzw.remote_client.Channel") as construct:
@@ -526,7 +526,7 @@ class WorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.capture_locked", side_effect=ValueError(message)) as capture, \
                  patch("kzw.cli.time.sleep"), patch("kzw.cli.query") as query:
                 with self.assertRaisesRegex(ValueError, "not managed"):
@@ -541,7 +541,7 @@ class WorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
              patch("kzw.cli.capture_locked", side_effect=[ValueError(message), 1]) as capture, \
              patch("kzw.cli.time.sleep"):
-            self.assertEqual(capture_stable_locked(Path(directory), "/bin/kzw-pane"), 1)
+            self.assertEqual(capture_stable_locked(Path(directory), "/bin/kzw"), 1)
         self.assertEqual(capture.call_count, 2)
 
     def test_retry_create_finishes_only_matching_live_pane(self):
@@ -552,7 +552,7 @@ class WorkspaceTests(unittest.TestCase):
             pending = path / "pending-create.json"
             pending.write_text(json.dumps({"pane": B, "host": "dev.example"}))
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.query", return_value=json.dumps(tree())), \
                  patch("kzw.cli.zmx_command", return_value=B + "\n"), \
                  patch("kzw.cli.capture_locked") as capture:
@@ -568,7 +568,7 @@ class WorkspaceTests(unittest.TestCase):
             pending = path / "pending-create.json"
             pending.write_text(json.dumps({"pane": B, "host": "dev.example"}))
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.query", return_value=json.dumps(tree())), \
                  patch("kzw.cli.zmx_command", return_value=""), \
                  patch("kzw.cli.capture_locked") as capture:
@@ -592,7 +592,7 @@ class WorkspaceTests(unittest.TestCase):
                 self.assertEqual(json.loads((directory / "pending-close.json").read_text())["phase"], "layout-saved")
                 return [B]
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.query", return_value=json.dumps(survivor)) as query, \
                  patch("kzw.cli.capture_locked") as capture, \
                  patch("kzw.cli.cleanup_close_locked", side_effect=cleanup):
@@ -614,7 +614,7 @@ class WorkspaceTests(unittest.TestCase):
             pending = path / "pending-close.json"
             pending.write_text(json.dumps(record))
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.query", return_value=json.dumps(changed)) as query, \
                  patch("kzw.cli.cleanup_close_locked") as cleanup:
                 with self.assertRaisesRegex(ValueError, "differs"):
@@ -636,7 +636,7 @@ class WorkspaceTests(unittest.TestCase):
             path = Path(directory)
             (path / "pending-close.json").write_text(json.dumps(record))
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.query", side_effect=lambda *args: next(replies)) as query, \
                  patch("kzw.cli.capture_locked"), \
                  patch("kzw.cli.cleanup_close_locked", return_value=[B]):
@@ -836,7 +836,7 @@ class WorkspaceTests(unittest.TestCase):
                      patch("kzw.cli.remote_client.status", **status_args), \
                      patch("kzw.cli.remote_client.publish") as publish, \
                      patch("sys.stdout", new_callable=io.StringIO) as output:
-                    self.assertEqual(synchronize_exits(path, "/bin/kzw-pane"), 0)
+                    self.assertEqual(synchronize_exits(path, "/bin/kzw"), 0)
                 self.assertEqual(output.getvalue(), "")
                 self.assertEqual((path / "workspace.kitty-session").read_text(), "complete saved layout\n")
                 self.assertEqual(json.loads((path / "panes.json").read_text()), panes)
@@ -848,7 +848,7 @@ class WorkspaceTests(unittest.TestCase):
             path = Path(directory)
             (path / "remote.json").write_text("{}")
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.capture_stable_locked", return_value=1), \
                  patch("kzw.cli.remote_client.ensure_current_revision", side_effect=ValueError("revision changed")), \
                  patch("kzw.cli.query") as query:

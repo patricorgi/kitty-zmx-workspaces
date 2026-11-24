@@ -16,7 +16,7 @@ PANE = "kzw-" + "a" * 32
 SNAPSHOT = ("# kzw-focus {\"pane\":\"" + PANE + "\"}\n"
             "new_tab Test\nlayout splits\ncd /old/computer\n"
             "launch 'kitty-unserialize-data={\"id\":1}' --cwd=/old/computer "
-            "--var=kzw_host=origin /old/bin/kzw-pane --pane " + PANE + " --host origin --existing\n")
+            "--var=kzw_host=origin /old/bin/kzw pane --pane " + PANE + " --host origin --existing\n")
 
 
 class RemoteClientTests(unittest.TestCase):
@@ -322,10 +322,10 @@ class RemoteClientTests(unittest.TestCase):
         remote_client.publish(first, SNAPSHOT, [PANE])
         saved = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
         self.assertNotIn("/old/computer", saved["snapshot"])
-        self.assertNotIn("/old/bin/kzw-pane", saved["snapshot"])
-        remote_client.pull(second, "Test", "origin", "/new/bin/kzw-pane")
+        self.assertNotIn("/old/bin/kzw", saved["snapshot"])
+        remote_client.pull(second, "Test", "origin", "/new/bin/kzw")
         restored = (second / "workspace.kitty-session").read_text()
-        self.assertIn("/new/bin/kzw-pane", restored)
+        self.assertIn("/new/bin/kzw", restored)
         self.assertIn(PANE, restored)
         self.assertEqual(json.loads((second / "panes.json").read_text()), [PANE])
         for directory in (first, second):
@@ -412,7 +412,7 @@ class RemoteClientTests(unittest.TestCase):
         with patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             remote_client.reserve_pane(first, PANE, "a" * 32)
         with self.assertRaisesRegex(ValueError, "automatic reconciliation is disabled"):
-            remote_client.pull(second, "Test", "origin", "/bin/kzw-pane")
+            remote_client.pull(second, "Test", "origin", "/bin/kzw")
         self.assertFalse((second / "workspace.kitty-session").exists())
         remote_client.release_lease(first)
 
@@ -483,7 +483,7 @@ class RemoteClientTests(unittest.TestCase):
         listing = subprocess.CompletedProcess([], 0, PANE + "\n" + second + "\n", "")
         which = shutil.which
         with patch("kzw.cli.state_dir", return_value=directory), \
-             patch("kzw.cli.shutil.which", side_effect=lambda name, **kw: "/bin/kzw-pane" if name == "kzw-pane" else which(name, **kw)), \
+             patch("kzw.cli.shutil.which", side_effect=lambda name, **kw: "/bin/kzw" if name == "kzw" else which(name, **kw)), \
              patch("kzw.cli.query", side_effect=kitty), \
              patch("kzw.cli.zmx_command", return_value=second + "\n"), \
              patch("kzw.remote.subprocess.run", return_value=listing), \
@@ -524,10 +524,10 @@ class RemoteClientTests(unittest.TestCase):
         ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]
         with patch("kzw.cli.uuid.uuid4", side_effect=ids), \
              patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
-            session = prepare_bootstrap(directory, "Test", "origin", "/a path/kzw-pane")
+            session = prepare_bootstrap(directory, "Test", "origin", "/a path/kzw")
         record = json.loads((directory / "pending-create.json").read_text())
         self.assertEqual(record["pane"], PANE)
-        self.assertIn("'/a path/kzw-pane' --pane " + PANE, session.read_text())
+        self.assertIn("'/a path/kzw' pane --pane " + PANE, session.read_text())
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["reservations"], [PANE])
         mark_bootstrap_launching(directory)
         tree = [{"id": 1, "last_focused": True, "tabs": [{"is_active": True, "windows": [
@@ -539,11 +539,11 @@ class RemoteClientTests(unittest.TestCase):
                     json.dumps({"tree": tree, "session": export, "os_window_id": 1}))
         with patch("kzw.cli.query", side_effect=kitty), patch("kzw.cli.zmx_command", return_value=""):
             with self.assertRaisesRegex(ValueError, "waiting"):
-                finish_bootstrap(directory, "/a path/kzw-pane")
+                finish_bootstrap(directory, "/a path/kzw")
         self.assertTrue((directory / "pending-create.json").exists())
         self.assertTrue(session.exists())
         with patch("kzw.cli.query", side_effect=kitty), patch("kzw.cli.zmx_command", return_value=PANE + "\n"):
-            finish_bootstrap(directory, "/a path/kzw-pane")
+            finish_bootstrap(directory, "/a path/kzw")
         state = self.store.dispatch({"method": "workspace.get", "workspace": "Test"})
         self.assertEqual(state["panes"], [PANE])
         self.assertEqual(state["reservations"], [])
@@ -559,16 +559,16 @@ class RemoteClientTests(unittest.TestCase):
         ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]
         with patch("kzw.cli.uuid.uuid4", side_effect=ids), \
              patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
-            session = prepare_bootstrap(directory, "Test", "origin", "/bin/kzw-pane")
+            session = prepare_bootstrap(directory, "Test", "origin", "/bin/kzw")
         with patch("kzw.cli.zmx_command", return_value=""):
-            self.assertEqual(recover_bootstrap(directory, "Test", "origin", "/bin/kzw-pane"), session)
+            self.assertEqual(recover_bootstrap(directory, "Test", "origin", "/bin/kzw"), session)
         self.assertNotIn("--existing", session.read_text())
         mark_bootstrap_launching(directory)
         with patch("kzw.cli.zmx_command", return_value=""):
             with self.assertRaisesRegex(ValueError, "refusing to recreate"):
-                recover_bootstrap(directory, "Test", "origin", "/bin/kzw-pane")
+                recover_bootstrap(directory, "Test", "origin", "/bin/kzw")
         with patch("kzw.cli.zmx_command", return_value=PANE + "\n"):
-            recover_bootstrap(directory, "Test", "origin", "/bin/kzw-pane")
+            recover_bootstrap(directory, "Test", "origin", "/bin/kzw")
         self.assertIn("--existing", session.read_text())
         self.assertEqual(json.loads((directory / "pending-create.json").read_text())["phase"], "launching")
         remote_client.release_lease(directory)
@@ -587,10 +587,10 @@ class RemoteClientTests(unittest.TestCase):
              patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
              patch("kzw.cli.remote_client.reserve_pane", side_effect=lost):
             with self.assertRaises(OSError):
-                prepare_bootstrap(directory, "Test", "origin", "/bin/kzw-pane")
+                prepare_bootstrap(directory, "Test", "origin", "/bin/kzw")
         self.assertEqual(json.loads((directory / "pending-create.json").read_text())["phase"], "reserving")
         with patch("kzw.cli.zmx_command", return_value=""):
-            session = recover_bootstrap(directory, "Test", "origin", "/bin/kzw-pane")
+            session = recover_bootstrap(directory, "Test", "origin", "/bin/kzw")
         self.assertTrue(session.is_file())
         self.assertEqual(json.loads((directory / "pending-create.json").read_text())["phase"], "reserved")
         remote_client.release_lease(directory)
@@ -603,10 +603,10 @@ class RemoteClientTests(unittest.TestCase):
         ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]
         with patch("kzw.cli.uuid.uuid4", side_effect=ids), \
              patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
-            session = prepare_bootstrap(directory, "Test", "origin", "/bin/kzw-pane")
+            session = prepare_bootstrap(directory, "Test", "origin", "/bin/kzw")
         remote_client.release_lease(directory)
         with patch("kzw.cli.state_dir", return_value=directory), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.zmx_command", return_value=""), \
              patch("kzw.cli.run", return_value=0) as run:
             self.assertEqual(attach_remote("Test", "origin"), 0)
@@ -622,7 +622,7 @@ class RemoteClientTests(unittest.TestCase):
         ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]
         with patch("kzw.cli.uuid.uuid4", side_effect=ids), \
              patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
-            prepare_bootstrap(directory, "Test", "origin", "/bin/kzw-pane")
+            prepare_bootstrap(directory, "Test", "origin", "/bin/kzw")
         mark_bootstrap_launching(directory)
         def lost_ack(host, request):
             self.store.dispatch(request)
@@ -631,7 +631,7 @@ class RemoteClientTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 remote_client.publish(directory, SNAPSHOT, [PANE])
         self.assertIn("pending", json.loads((directory / "remote.json").read_text()))
-        self.assertTrue(reconcile_bootstrap_commit(directory, "Test", "origin", "/bin/kzw-pane"))
+        self.assertTrue(reconcile_bootstrap_commit(directory, "Test", "origin", "/bin/kzw"))
         self.assertFalse((directory / "pending-create.json").exists())
         self.assertFalse((directory / "bootstrap.kitty-session").exists())
         self.assertIn(PANE, (directory / "workspace.kitty-session").read_text())
@@ -649,11 +649,11 @@ class RemoteClientTests(unittest.TestCase):
         ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]
         with patch("kzw.cli.uuid.uuid4", side_effect=ids), \
              patch("kzw.remote.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
-            session = prepare_bootstrap(directory, "Test", "origin", "/bin/kzw-pane", allow_empty=True)
+            session = prepare_bootstrap(directory, "Test", "origin", "/bin/kzw", allow_empty=True)
         self.assertEqual((directory / "workspace.kitty-session").read_text(), EMPTY_SNAPSHOT)
         self.assertEqual(json.loads((directory / "pending-create.json").read_text())["starting_snapshot"], "empty")
         with patch("kzw.cli.zmx_command", return_value=""):
-            self.assertEqual(recover_bootstrap(directory, "Test", "origin", "/bin/kzw-pane"), session)
+            self.assertEqual(recover_bootstrap(directory, "Test", "origin", "/bin/kzw"), session)
         self.assertEqual(self.store.dispatch({"method": "workspace.get", "workspace": "Test"})["snapshot"], EMPTY_SNAPSHOT)
         remote_client.release_lease(directory)
 
@@ -661,7 +661,7 @@ class RemoteClientTests(unittest.TestCase):
         first = self.directory("first")
         second = self.directory("second")
         remote_client.create(first, "Test", "origin")
-        remote_client.pull(second, "Test", "origin", "/bin/kzw-pane")
+        remote_client.pull(second, "Test", "origin", "/bin/kzw")
         remote_client.publish(first, SNAPSHOT, [PANE])
         with self.assertRaises(ValueError):
             remote_client.publish(second, SNAPSHOT.replace("new_tab Test", "new_tab stale"), [PANE])
@@ -681,7 +681,7 @@ class RemoteClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             remote_client.translate(SNAPSHOT, "", "different", True)
         with self.assertRaises(ValueError):
-            remote_client.translate("launch echo dangerous\n", "/bin/kzw-pane", "origin", False)
+            remote_client.translate("launch echo dangerous\n", "/bin/kzw", "origin", False)
 
     def test_existing_local_workspace_is_never_overwritten(self):
         directory = self.directory("first")

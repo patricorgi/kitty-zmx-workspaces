@@ -41,7 +41,7 @@ class RemoteExitIntegration(unittest.TestCase):
                 remote_client.acquire_lease(directory, "Test", host)
                 stop = remote_client.start_lease_heartbeat(directory)
                 remote_client.reserve_pane(directory, pane, uuid.uuid4().hex)
-                snapshot, panes = remote_client.translate(layout(pane), "/bin/kzw-pane", host, False)
+                snapshot, panes = remote_client.translate(layout(pane), "/bin/kzw", host, False)
                 remote_client.stage_layout(directory, snapshot, panes)
 
                 def attach(existing=False):

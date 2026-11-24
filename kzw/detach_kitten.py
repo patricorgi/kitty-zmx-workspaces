@@ -7,6 +7,10 @@ import subprocess
 import tempfile
 
 from kittens.tui.handler import result_handler
+try:
+    from kzw.launcher import executable as kzw_executable
+except ModuleNotFoundError:
+    from launcher import executable as kzw_executable
 from kitty.fast_data_types import add_timer, remove_timer
 
 
@@ -44,7 +48,7 @@ def handle_result(args, answer, target_window_id, boss):
         return
     if getattr(manager, "_kzw_detach_in_progress", None) is not None:
         return
-    executable = shutil.which("kzw") or str(Path.home() / ".local/bin/kzw")
+    executable = kzw_executable(window)
     cmd = [executable, "detach", name]
     origin_key = "kzw_local_origin" if local else "kzw_origin"
     origin = variables.get(origin_key, "" if "kzw_workspace" in variables or local else os.environ.get("KZW_WORKSPACE_ORIGIN", ""))

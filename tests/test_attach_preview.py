@@ -31,7 +31,7 @@ class AttachPreviewTests(unittest.TestCase):
     def test_preview_precedes_ssh_and_canceled_preview_releases_lease(self):
         with tempfile.TemporaryDirectory() as root, \
                 patch.object(cli, "state_dir", return_value=Path(root)), \
-                patch.object(cli.shutil, "which", return_value="/bin/kzw-pane"), \
+                patch.object(cli.shutil, "which", return_value="/bin/kzw"), \
                 patch("kzw.attach_preview.AttachPreview") as factory, \
                 patch.object(cli, "startup_status") as status, \
                 patch.object(cli.remote_client, "reuse_configured_ssh_once", return_value=nullcontext()), \

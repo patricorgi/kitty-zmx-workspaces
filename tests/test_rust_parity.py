@@ -28,7 +28,7 @@ class RustSnapshotParity(unittest.TestCase):
                 data = json.dumps({"id": 7, "title": title, "cmd_at_shell_startup": "do not run"})
                 export = "new_tab Test\n" + shlex.join(["launch", "kitty-unserialize-data=" + data,
                                                             "--var=kzw_staging=1", "--cwd=/a b", "echo", "unsafe"]) + "\n"
-                executable = "/path with 'quotes'/kzw-pane"
+                executable = "/path with 'quotes'/kzw"
                 expected = rewrite_export(export, pane_map(tree), executable)
                 result = self.transform(tree, export, executable)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -46,5 +46,5 @@ class RustSnapshotParity(unittest.TestCase):
                        "launch 'kitty-unserialize-data={\"id\":8}'\n"):
             with self.subTest(export=export):
                 with self.assertRaises(ValueError):
-                    rewrite_export(export, pane_map(tree), "/bin/kzw-pane")
-                self.assertNotEqual(self.transform(tree, export, "/bin/kzw-pane").returncode, 0)
+                    rewrite_export(export, pane_map(tree), "/bin/kzw")
+                self.assertNotEqual(self.transform(tree, export, "/bin/kzw").returncode, 0)

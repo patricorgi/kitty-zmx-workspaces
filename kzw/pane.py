@@ -233,7 +233,7 @@ def main():
 
 def _main():
     global _attachment, _retry_network
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(prog="kzw pane")
     parser.add_argument("--pane")
     parser.add_argument("--host", default=os.environ.get("KZW_HOST", ""))
     parser.add_argument("--existing", action="store_true", help="refuse to create a missing session")

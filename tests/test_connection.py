@@ -81,7 +81,7 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(self.health.state(), "")
 
     def test_cancelled_publication_retains_exact_durable_operation(self):
-        snapshot = ("new_tab Test\nlayout splits\nlaunch 'kitty-unserialize-data={\"id\":1}' /bin/kzw-pane --pane " + PANE +
+        snapshot = ("new_tab Test\nlayout splits\nlaunch 'kitty-unserialize-data={\"id\":1}' /bin/kzw pane --pane " + PANE +
                     " --host origin --existing\n")
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

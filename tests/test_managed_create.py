@@ -35,13 +35,13 @@ class ManagedCreateTests(unittest.TestCase):
             (path / "panes.json").write_text("[]\n")
             ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]
             with patch("kzw.cli.uuid.uuid4", side_effect=ids), patch("kzw.cli.zmx_command", return_value=""):
-                session = prepare_bootstrap(path, "Test", "host", "/bin/kzw-pane", allow_empty=True)
+                session = prepare_bootstrap(path, "Test", "host", "/bin/kzw", allow_empty=True)
             mark_bootstrap_launching(path)
             with patch("kzw.cli.zmx_command", return_value=""):
                 with self.assertRaisesRegex(ValueError, "refusing to recreate"):
-                    recover_bootstrap(path, "Test", "host", "/bin/kzw-pane")
+                    recover_bootstrap(path, "Test", "host", "/bin/kzw")
             with patch("kzw.cli.zmx_command", return_value=A + "\n"):
-                recover_bootstrap(path, "Test", "host", "/bin/kzw-pane")
+                recover_bootstrap(path, "Test", "host", "/bin/kzw")
             self.assertIn("--existing", session.read_text())
 
     def test_local_bootstrap_recovers_after_snapshot_saved_before_journal_removal(self):
@@ -51,12 +51,12 @@ class ManagedCreateTests(unittest.TestCase):
             path = Path(tmp)
             ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]
             with patch("kzw.cli.uuid.uuid4", side_effect=ids), patch("kzw.cli.zmx_command", return_value=""):
-                session = prepare_bootstrap(path, "Test", "host", "/bin/kzw-pane")
+                session = prepare_bootstrap(path, "Test", "host", "/bin/kzw")
             mark_bootstrap_launching(path)
             export = "new_tab Test\nlaunch 'kitty-unserialize-data={\"id\":1}'\n"
-            (path / "workspace.kitty-session").write_text(rewrite_export(export, {1: (A, "host")}, "/bin/kzw-pane"))
+            (path / "workspace.kitty-session").write_text(rewrite_export(export, {1: (A, "host")}, "/bin/kzw"))
             (path / "panes.json").write_text(json.dumps([A]))
-            self.assertTrue(reconcile_local_bootstrap_commit(path, "Test", "host", "/bin/kzw-pane"))
+            self.assertTrue(reconcile_local_bootstrap_commit(path, "Test", "host", "/bin/kzw"))
             self.assertFalse((path / "pending-create.json").exists())
             self.assertFalse(session.exists())
 
@@ -68,7 +68,7 @@ class ManagedCreateTests(unittest.TestCase):
             (path / "panes.json").write_text("[]\n")
             ids = [types.SimpleNamespace(hex="a" * 32), types.SimpleNamespace(hex="b" * 32)]
             with patch("kzw.cli.uuid.uuid4", side_effect=ids), patch("kzw.cli.zmx_command", return_value=""):
-                session = prepare_bootstrap(path, "Test", "host", "/bin/kzw-pane", allow_empty=True)
+                session = prepare_bootstrap(path, "Test", "host", "/bin/kzw", allow_empty=True)
             self.assertEqual((path / "workspace.kitty-session").read_text(), EMPTY_SNAPSHOT)
             mark_bootstrap_launching(path)
             current = [{"last_focused": True, "tabs": [{"is_active": True, "windows": [
@@ -76,7 +76,7 @@ class ManagedCreateTests(unittest.TestCase):
             with patch("kzw.cli.query", return_value=json.dumps(current)), \
                  patch("kzw.cli.zmx_command", return_value=A + "\n"), \
                  patch("kzw.cli.capture_locked") as capture:
-                finish_bootstrap(path, "/bin/kzw-pane")
+                finish_bootstrap(path, "/bin/kzw")
             self.assertEqual(capture.call_args.kwargs["expected_panes"], {1: (A, "host")})
             self.assertFalse(session.exists())
             self.assertFalse((path / "pending-create.json").exists())
@@ -91,7 +91,7 @@ class ManagedCreateTests(unittest.TestCase):
             child.poll.side_effect = [None, 0]
             title_stop = Mock()
             with patch("kzw.cli.state_dir", return_value=path), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.prepare_bootstrap", return_value=bootstrap) as prepare, \
                  patch("kzw.cli.mark_bootstrap_launching") as mark, \
                  patch("kzw.cli.finish_bootstrap") as finish, \
@@ -103,9 +103,9 @@ class ManagedCreateTests(unittest.TestCase):
                 self.assertEqual(run("Test", "origin", remote_attached=True, new_instance=True,
                                      appearance={"options": ["-o", "font_size=19.5", "-o", "mark1_foreground=#123456"],
                                                  "marker": ["function", "helpers/privacy_marker.py"]}), 0)
-            prepare.assert_called_once_with(path, "Test", "origin", "/bin/kzw-pane")
+            prepare.assert_called_once_with(path, "Test", "origin", "/bin/kzw")
             mark.assert_called_once_with(path)
-            finish.assert_called_once_with(path, "/bin/kzw-pane")
+            finish.assert_called_once_with(path, "/bin/kzw")
             self.assertIn(str(bootstrap), popen.call_args.args[0])
             self.assertIn("font_size=19.5", popen.call_args.args[0])
             self.assertIn("mark1_foreground=#123456", popen.call_args.args[0])
@@ -133,7 +133,7 @@ class ManagedCreateTests(unittest.TestCase):
     def test_create_saves_only_after_verified_identity_and_session(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.uuid.uuid4") as uid, \
              patch("sys.stdout", new_callable=io.StringIO) as output, \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query, \
@@ -151,7 +151,7 @@ class ManagedCreateTests(unittest.TestCase):
         for kind in ("right", "below", "split", "tab"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp, \
                  patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.uuid.uuid4") as uid, \
                  patch("kzw.cli.zmx_command", return_value=""), \
                  patch("kzw.shell_cwd.resolve") as reported, \
@@ -168,7 +168,7 @@ class ManagedCreateTests(unittest.TestCase):
     def test_automatic_split_uses_managed_creation(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.uuid.uuid4") as uid, \
              patch("kzw.cli.zmx_command", side_effect=["", B + "\n"]), \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query:
@@ -183,7 +183,7 @@ class ManagedCreateTests(unittest.TestCase):
         for reported_cwd in ("/reported directory", ValueError("wrong origin")):
             with self.subTest(cwd=reported_cwd), tempfile.TemporaryDirectory() as tmp, \
                  patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-                 patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+                 patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
                  patch("kzw.cli.uuid.uuid4") as uid, \
                  patch("kzw.cli.zmx_command", return_value=""), \
                  patch("kzw.shell_cwd.resolve", side_effect=[reported_cwd]) as reported, \
@@ -203,7 +203,7 @@ class ManagedCreateTests(unittest.TestCase):
     def test_wrong_origin_cannot_probe_or_create(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.query", return_value=json.dumps(tree([(1, A)]))) as query:
             with self.assertRaisesRegex(ValueError, "target changed"):
                 create_pane("Test", "tab", 1, A, "another-host")
@@ -214,7 +214,7 @@ class ManagedCreateTests(unittest.TestCase):
     def test_failed_launch_keeps_journal_and_blocks_close_and_detach(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.zmx_command", return_value=""), \
              patch("sys.stdout", new_callable=io.StringIO) as output, \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), OSError("lost reply")]):
@@ -230,7 +230,7 @@ class ManagedCreateTests(unittest.TestCase):
     def test_tab_creation_logs_stable_pane_identity(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.uuid.uuid4") as uid, \
              patch("kzw.cli.query", side_effect=[json.dumps(tree([(1, A)])), "2", json.dumps(tree([(1, A), (2, B)]))]) as query, \
              patch("kzw.cli.zmx_command", return_value=""), \
@@ -243,7 +243,7 @@ class ManagedCreateTests(unittest.TestCase):
     def test_changed_target_does_not_launch(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.query", return_value=json.dumps(tree([(1, B)]))) as query:
             with self.assertRaisesRegex(ValueError, "target changed"):
                 create_pane("Test", "below", 1, A, "")
@@ -254,7 +254,7 @@ class ManagedCreateTests(unittest.TestCase):
     def test_creation_waits_for_workspace_mutation_lock(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch("kzw.cli.state_dir", return_value=Path(tmp)), \
-             patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"), \
+             patch("kzw.cli.shutil.which", return_value="/bin/kzw"), \
              patch("kzw.cli.query", return_value=json.dumps(tree([(1, B)]))):
             started = threading.Event()
             finished = threading.Event()

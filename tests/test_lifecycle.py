@@ -100,7 +100,7 @@ class LifecycleScenarios(unittest.TestCase):
         self.path = Path(self.temp.name)
         self.fake = FakeKitty()
         self.patchers = [patch("kzw.cli.state_dir", return_value=self.path),
-                         patch("kzw.cli.shutil.which", return_value="/bin/kzw-pane"),
+                         patch("kzw.cli.shutil.which", return_value="/bin/kzw"),
                          patch("kzw.cli.query", side_effect=self.fake.query),
                          patch("kzw.cli.zmx_command", side_effect=self.fake.zmx)]
         for patcher in self.patchers:
@@ -133,7 +133,7 @@ class LifecycleScenarios(unittest.TestCase):
         # identity, while its independently owned output persists across detach.
         self.fake.add(2, 4, 4)
         self.fake.sessions[identity(4)]["output"] = "New\n"
-        capture(self.path, "/bin/kzw-pane")
+        capture(self.path, "/bin/kzw")
         self.assertIn('set_layout_state {"pairs": [2, 3, 4]}', (self.path / "workspace.kitty-session").read_text())
         detach("Test")
         self.fake.attached = True

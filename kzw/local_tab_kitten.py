@@ -9,6 +9,10 @@ import subprocess
 import tempfile
 
 from kittens.tui.handler import result_handler
+try:
+    from kzw.launcher import executable as kzw_executable
+except ModuleNotFoundError:
+    from launcher import executable as kzw_executable
 
 
 def main(args):
@@ -88,7 +92,7 @@ def handle_result(args, answer, target_window_id, boss):
         boss.show_error("Local tab requires a fresh attachment",
                         "Detach and reattach this workspace first. Its existing sessions will keep running.")
         return
-    executable = shutil.which("kzw") or str(Path.home() / ".local/bin/kzw")
+    executable = kzw_executable(window)
     command = [executable, "_local-tab", name, "--window-id", str(window.id), "--host", origin]
     if action == "close":
         if not local or len(list(window.tabref())) != 1:

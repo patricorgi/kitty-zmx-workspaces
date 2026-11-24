@@ -15,7 +15,7 @@ A, B = ("kzw-" + c * 32 for c in "ab")
 
 
 def snapshot(panes):
-    return "".join(shlex.join(["launch", FLAG + json.dumps({"id": wid}), "/bin/kzw-pane",
+    return "".join(shlex.join(["launch", FLAG + json.dumps({"id": wid}), "/bin/kzw", "pane",
                                "--pane", pane, "--host", "", "--existing"]) + "\n"
                    for wid, pane in panes.items())
 
@@ -54,9 +54,9 @@ class NativeCloseTests(unittest.TestCase):
     def test_unexplained_missing_pane_and_stale_receipt_do_not_authorize_cleanup(self):
         self.confirmed()
         with patch.object(cli, "list_os_windows", return_value=[]), patch.object(cli, "cleanup_close_locked") as cleanup:
-            native_close.synchronize(self.directory, "/bin/kzw-pane")
+            native_close.synchronize(self.directory, "/bin/kzw")
             cli.write_view(self.directory, "unix:/test", os.getpid(), 7, [A, B])
-            native_close.synchronize(self.directory, "/bin/kzw-pane")
+            native_close.synchronize(self.directory, "/bin/kzw")
             cleanup.assert_not_called()
         self.assertFalse(self.pending.exists())
         self.assertEqual(self.saved.read_text(), snapshot({3: A, 4: B}))
@@ -68,7 +68,7 @@ class NativeCloseTests(unittest.TestCase):
              patch("kzw.exits.snapshot_for_exit", return_value=snapshot({4: B})), \
              patch.object(cli, "cleanup_close_locked", side_effect=OSError("unavailable")):
             with self.assertRaisesRegex(OSError, "unavailable"):
-                native_close.synchronize(self.directory, "/bin/kzw-pane")
+                native_close.synchronize(self.directory, "/bin/kzw")
         self.assertEqual(self.saved.read_text(), snapshot({4: B}))
         journal = json.loads(self.pending.read_text())
         self.assertEqual(journal["phase"], "layout-saved")
@@ -81,7 +81,7 @@ class NativeCloseTests(unittest.TestCase):
         with patch.object(cli, "list_os_windows", side_effect=OSError("socket closed")), \
              patch.object(cli, "cleanup_close_locked") as cleanup:
             with self.assertRaisesRegex(OSError, "socket closed"):
-                native_close.synchronize(self.directory, "/bin/kzw-pane")
+                native_close.synchronize(self.directory, "/bin/kzw")
             cleanup.assert_not_called()
         self.assertFalse(self.pending.exists())
         self.assertEqual(self.saved.read_text(), snapshot({3: A}))

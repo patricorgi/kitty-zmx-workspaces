@@ -1,6 +1,6 @@
 """Opt-in, destructive-only-to-own-panes real local Kitty/zmx smoke test.
 
-Set KZW_RUN_INTEGRATION=1 and put kitty, zmx, kzw and kzw-pane on PATH.
+Set KZW_RUN_INTEGRATION=1 and put kitty, zmx and kzw on PATH.
 This opens Kitty windows in a separate background instance on macOS.
 Only pane identities observed in this test's isolated Kitty instance are
 eligible for cleanup. A hard crash can leave those sessions behind.
@@ -23,8 +23,8 @@ from kzw.core import focused_pane, pane_map
 @unittest.skipUnless(os.environ.get("KZW_RUN_INTEGRATION") == "1", "set KZW_RUN_INTEGRATION=1 for real local Kitty/zmx")
 class RealWorkspaceLifecycle(unittest.TestCase):
     def setUp(self):
-        if any(not shutil.which(tool) for tool in ("kitty", "zmx", "kzw", "kzw-pane")):
-            self.skipTest("requires local kitty, zmx, kzw and kzw-pane on PATH")
+        if any(not shutil.which(tool) for tool in ("kitty", "zmx", "kzw")):
+            self.skipTest("requires local kitty, zmx and kzw on PATH")
         # Keep the Unix socket path short enough for macOS's sun_path limit.
         cache = Path.home() / ".cache"
         cache.mkdir(exist_ok=True)

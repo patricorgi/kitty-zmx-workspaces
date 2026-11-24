@@ -45,7 +45,7 @@ def prefix_for_launch(ctx):
     python = shutil.which("python3", path=child.get("PATH") or os.defpath)
     if python is None:
         return None
-    keys = (*CONTEXT, "KZW_RPC_SOCKET", "KZW_SSH_KITTEN", "KZW_CONNECTION_DISPLAY",
+    keys = (*CONTEXT, "KZW_EXECUTABLE", "KZW_RPC_SOCKET", "KZW_SSH_KITTEN", "KZW_CONNECTION_DISPLAY",
             "KZW_DEBUG", "XDG_STATE_HOME", "XDG_CACHE_HOME", "ZMX_DIR", "PATH")
     # The workspace's launcher environment may differ from Kitty's, including
     # its broker/socket and the local session namespace. Never inherit these
@@ -102,8 +102,10 @@ def run():
             tree = json.loads(remote_raw(view["address"], "ls", "--match-tab",
                                          f"window_id:{source_id} or window_id:{target_id}"))
             if check_target(view, tree, instance_pid, source_id, pane, target_id, context):
-                executable = str(ROOT / "bin/kzw-pane")
-                return os.execve(executable, [executable], context)
+                executable = workspace.get("KZW_EXECUTABLE", "")
+                if not os.path.isabs(executable):
+                    raise ValueError("workspace launcher path is unavailable")
+                return os.execve(executable, [executable, "pane"], context)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         print(f"kzw: native tab not managed: {exc}", file=sys.stderr)
     # Keep the native command when the action targeted a different OS window.

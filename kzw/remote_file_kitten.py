@@ -23,8 +23,8 @@ def wrapper_host(window):
     if not isinstance(argv, (list, tuple)) or not argv or not all(isinstance(arg, str) for arg in argv):
         return ""
     program = Path(argv[0]).name.lower()
-    if program == "kzw-pane":
-        args = argv[1:]
+    if program == "kzw" and argv[1:2] == ["pane"]:
+        args = argv[2:]
     elif program.startswith("python") and argv[1:3] == ["-m", "kzw.pane"]:
         args = argv[3:]
     else:

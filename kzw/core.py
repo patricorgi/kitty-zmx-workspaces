@@ -104,7 +104,7 @@ def rewrite_export(text, panes, pane_executable):
             if not transient:
                 options.append(arg)
         pane, host = panes[window_id]
-        command = [pane_executable, "--pane", pane, "--host", host, "--existing"]
+        command = [pane_executable, "pane", "--pane", pane, "--host", host, "--existing"]
         lines.append(shlex.join(["launch", FLAG + json.dumps(data, separators=(",", ":")), *options, *command]))
     if seen != set(panes):
         raise ValueError("layout export did not include every managed pane")

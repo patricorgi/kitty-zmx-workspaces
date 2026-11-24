@@ -152,7 +152,7 @@ class LeaseRecoveryTests(unittest.TestCase):
         for committed in (False, True):
             with self.subTest(committed=committed):
                 portable = layout(PANE).replace("new_tab Test", "new_tab retry" + str(committed))
-                snapshot, panes = remote_client.translate(portable, "/bin/kzw-pane", "origin", False)
+                snapshot, panes = remote_client.translate(portable, "/bin/kzw", "origin", False)
                 revision = json.loads((self.directory / "remote.json").read_text())["revision"]
 
                 def lost(host, req):

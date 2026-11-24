@@ -7,6 +7,10 @@ import shutil
 import subprocess
 
 from kittens.tui.handler import result_handler
+try:
+    from kzw.launcher import executable as kzw_executable
+except ModuleNotFoundError:
+    from launcher import executable as kzw_executable
 
 
 def main(args):
@@ -28,7 +32,7 @@ def handle_result(args, answer, target_window_id, boss):
         boss.show_error("Cannot open queue", "Select a managed kzw terminal with a valid origin host.")
         return
     origin = values.get("kzw_origin", "")
-    executable = shutil.which("kzw") or str(Path.home() / ".local/bin/kzw")
+    executable = kzw_executable(window)
     command = [executable, "_managed-create", workspace, "tab", str(window.id), pane,
                "--host", host, "--initial-program", "condor-queue"]
     if origin:

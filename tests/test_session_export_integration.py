@@ -27,13 +27,13 @@ class SessionExportIntegrationTests(unittest.TestCase):
             self.skipTest("kitty is required")
         with tempfile.TemporaryDirectory(prefix="kzw-export-", dir=os.environ.get("OPENCODE_TEST_TMP")) as temp:
             base = Path(temp)
-            launcher = base / "kzw-pane"
+            launcher = base / "kzw"
             launcher.write_text("#!/bin/sh\nprintf ready\nread -r unused\n")
             launcher.chmod(0o700)
             session = base / "Test.session"
             session.write_text(
                 "new_tab Test\nlaunch --var=kzw_pane=" + PANE + " --var=kzw_host= " +
-                shlex.join([str(launcher), "--pane", PANE, "--host", "", "--existing"]) + "\n")
+                shlex.join([str(launcher), "pane", "--pane", PANE, "--host", "", "--existing"]) + "\n")
             probe = base / "hooks.py"
             probe.write_text('''import json, runpy, sys
 from kittens.tui.handler import result_handler
@@ -98,7 +98,7 @@ def handle_result(args, answer, target_window_id, boss):
                     source = tree[0]["tabs"][0]["windows"][0]["id"]
                     second = int(raw("launch", "--match", f"window_id:{source}", "--type=window",
                                      "--location=hsplit", "--var=kzw_pane=" + OTHER, "--var=kzw_host=",
-                                     str(launcher), "--pane", OTHER, "--host", "", "--existing").strip())
+                                     str(launcher), "pane", "--pane", OTHER, "--host", "", "--existing").strip())
                     unrelated = int(raw("launch", "--type=os-window", "--os-window-state=minimized",
                                         "/bin/sh", "-c", "read -r unused").strip())
                     before = json.loads(raw("ls"))
@@ -107,7 +107,7 @@ def handle_result(args, answer, target_window_id, boss):
                     from kzw.core import pane_map, rewrite_export
                     panes = pane_map(first["snapshot"]["tree"])
                     self.assertEqual(set(panes), {source, second})
-                    restored = rewrite_export(first["snapshot"]["session"], panes, "kzw-pane")
+                    restored = rewrite_export(first["snapshot"]["session"], panes, "kzw")
                     self.assertEqual(sum(line.startswith("launch ") for line in restored.splitlines()), 2)
                     self.assertIn("--existing", restored)
                     for result in (first, json.loads(raw("kitten", "--match", f"id:{source}",

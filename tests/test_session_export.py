@@ -14,7 +14,7 @@ class FakeWindow:
         self.id = window_id
         self.user_vars = {"kzw_pane": PANE, "kzw_host": "origin"}
         self.creation_spec = SimpleNamespace(
-            cmd=["/bin/kzw-pane", "--pane", PANE, "--host", "origin", "--existing"], overlay_for=None)
+            cmd=["/bin/kzw", "pane", "--pane", PANE, "--host", "origin", "--existing"], overlay_for=None)
         self.window_custom_type = ""
         self.actions_on_close = [lambda *args: None]
         self.actions_on_focus_change = [lambda *args: None]

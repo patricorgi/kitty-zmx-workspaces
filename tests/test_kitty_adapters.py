@@ -65,7 +65,7 @@ class KittyAdapterTests(unittest.TestCase):
         for mode in ("valid", "missing pane", "moved pane", "missing window", "bad args"):
             with self.subTest(mode=mode):
                 selected = Mock(tabs=[])
-                launch = 'launch kitty-unserialize-data=\'{"id":7}\' /bin/kzw-pane'
+                launch = 'launch kitty-unserialize-data=\'{"id":7}\' /bin/kzw'
                 selected.serialize_state_as_session.return_value = iter(["new_tab Test", "layout splits", launch])
                 unrelated = Mock()
                 variables = {"kzw_pane": "kzw-" + "a" * 32, "kzw_host": ""}
@@ -104,7 +104,7 @@ class KittyAdapterTests(unittest.TestCase):
     def test_atomic_snapshot_pairs_layout_with_only_its_workspace_tree(self):
         module = load_adapter("scoped_session")
         selected, unrelated = Mock(tabs=[]), Mock()
-        launch = 'launch kitty-unserialize-data=\'{"id":7}\' /bin/kzw-pane'
+        launch = 'launch kitty-unserialize-data=\'{"id":7}\' /bin/kzw'
         selected.serialize_state_as_session.return_value = iter(["new_tab Test", "layout splits", launch])
         variables = {"kzw_pane": "kzw-" + "a" * 32, "kzw_host": ""}
         window = types.SimpleNamespace(os_window_id=42, user_vars=variables)

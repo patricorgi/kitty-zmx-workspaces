@@ -19,6 +19,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from .core import FOCUS_PREFIX, FLAG, PANE, atomic_write, check_name, focused_pane, pane_map, rewrite_export, saved_focus
 from .titles import ACTIVE_TAB_TITLE_TEMPLATE, TAB_TITLE_TEMPLATE, start_title_monitor
 from . import kitty_instance
+from .launcher import executable as kzw_executable
 from . import remote_client
 from . import supervisor_window
 from .utility_tabs import only_utilities, workspace_tree
@@ -160,6 +161,7 @@ def workspace_context(name, directory, host="", remote_attached=False, rpc_socke
     origin = host if remote_attached else ""
     signal = str(directory / "watcher.changed")
     env = {
+        "KZW_EXECUTABLE": kzw_executable(),
         "KZW_HOST": host,
         "KZW_WORKSPACE": name,
         "KZW_WORKSPACE_ORIGIN": origin,
@@ -516,7 +518,7 @@ def recover_local_native_stage(directory, executable):
             continue
         args = shlex.split(line)
         if (len(args) < 8 or not args[1].startswith("kitty-unserialize-data=") or
-                args[-6] != executable or args[-5] != "--pane" or args[-3] != "--host" or
+                args[-7:-5] != [executable, "pane"] or args[-5] != "--pane" or args[-3] != "--host" or
                 args[-1] != "--existing" or args[-4] in found):
             raise ValueError("invalid launch in native layout stage")
         found[args[-4]] = args[-2]
@@ -778,9 +780,7 @@ def detach(name, origin=""):
     directory = state_dir(name, origin) if origin else state_dir(name)
     if (directory / "pending-close.json").exists():
         raise ValueError("a pane close is incomplete; run kzw retry-close first")
-    executable = shutil.which("kzw-pane")
-    if not executable:
-        raise ValueError("kzw-pane not found on PATH")
+    executable = kzw_executable()
     view = view_state(directory)
     # Serialize with the supervisor so it cannot overwrite the final snapshot
     # while the windows are being torn down. Failure to save means no close.
@@ -1003,9 +1003,7 @@ def remote_operation(host):
 
 def close_target(name, kind, target_id, origin="", confirmed_selection=None):
     directory = state_dir(name, origin) if origin else state_dir(name)
-    executable = shutil.which("kzw-pane")
-    if not executable:
-        raise ValueError("kzw-pane not found on PATH")
+    executable = kzw_executable()
     with capture_lock(directory), remote_operation(origin):
         if (directory / "remote.json").exists():
             remote_client.renew_lease(directory)
@@ -1087,9 +1085,7 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
     if initial_program not in ("", "condor-queue") or (initial_program and kind != "tab"):
         raise ValueError("invalid initial tab program")
     directory = state_dir(name, origin) if origin else state_dir(name)
-    executable = shutil.which("kzw-pane")
-    if not executable:
-        raise ValueError("kzw-pane not found on PATH")
+    executable = kzw_executable()
     with capture_lock(directory):
         coordinated = (directory / "remote.json").exists()
         if coordinated:
@@ -1147,7 +1143,7 @@ def create_pane(name, kind, window_id, expected_pane, host, origin="", cwd_uri="
                            ["--env=" + key + "=" + value for key, value in env_context.items()])
         options = ["--type=tab", "--tab-title=..."] if kind == "tab" else ["--next-to", f"id:{window_id}",
                                                          "--location=" + {"right": "hsplit", "below": "vsplit", "split": "split"}[kind]]
-        command = [executable, "--pane", pane, "--host", host, "--stage-new"]
+        command = [executable, "pane", "--pane", pane, "--host", host, "--stage-new"]
         if initial_program:
             options = ["--type=tab", "--tab-title=HTCondor Queue", "--next-to=id:" + str(window_id), "--location=after"]
             command += ["--initial-program", initial_program]
@@ -1238,9 +1234,7 @@ def resume_partial_close_locked(directory, record, pending):
     remote = record.get("remote") is True
     if remote != (directory / "remote.json").exists():
         raise ValueError("close journal origin does not match the workspace")
-    executable = shutil.which("kzw-pane")
-    if not executable:
-        raise ValueError("kzw-pane not found on PATH")
+    executable = kzw_executable()
     tree = json.loads(view_query(directory, "ls"))
     current = pane_map(tree)
     if current == before:
@@ -1303,9 +1297,7 @@ def retry_close(name, origin=""):
 def retry_create(name, origin=""):
     """Finish a journaled creation only while its complete Kitty view exists."""
     directory = state_dir(name, origin) if origin else state_dir(name)
-    executable = shutil.which("kzw-pane")
-    if not executable:
-        raise ValueError("kzw-pane not found on PATH")
+    executable = kzw_executable()
     with recovery_lease(directory), capture_lock(directory):
         pending = directory / "pending-create.json"
         if not pending.is_file() or (directory / "pending-close.json").exists() or (directory / "pending-exit.json").exists():
@@ -1345,7 +1337,7 @@ def remove_bootstrap_session(directory, name, host, executable, pane):
     """Remove only an unmodified startup file created for this bootstrap."""
     session = directory / "bootstrap.kitty-session"
     if session.is_file() and not session.is_symlink():
-        base = "new_tab " + check_name(name) + "\nlayout splits\nlaunch " + shlex.join([executable, "--pane", pane, "--host", host])
+        base = "new_tab " + check_name(name) + "\nlayout splits\nlaunch " + shlex.join([executable, "pane", "--pane", pane, "--host", host])
         if session.read_text() in (base + "\n", base + " --existing\n"):
             session.unlink()
 
@@ -1370,7 +1362,7 @@ def prepare_bootstrap(directory, name, host, executable, allow_empty=False):
             raise ValueError("bootstrap pane ID already belongs to a live zmx session")
         record["phase"] = "reserved"
         atomic_write(pending, json.dumps(record) + "\n")
-        launch = shlex.join([executable, "--pane", pane, "--host", host])
+        launch = shlex.join([executable, "pane", "--pane", pane, "--host", host])
         atomic_write(session, "new_tab " + check_name(name) + "\nlayout splits\nlaunch " + launch + "\n")
         return session
 
@@ -1415,7 +1407,7 @@ def recover_bootstrap(directory, name, host, executable):
         if phase != "launching" and live:
             raise ValueError("unexpected existing bootstrap session; state retained")
         session = directory / "bootstrap.kitty-session"
-        initial = "new_tab " + check_name(name) + "\nlayout splits\nlaunch " + shlex.join([executable, "--pane", pane, "--host", host]) + "\n"
+        initial = "new_tab " + check_name(name) + "\nlayout splits\nlaunch " + shlex.join([executable, "pane", "--pane", pane, "--host", host]) + "\n"
         desired = initial if phase != "launching" else initial.rstrip("\n") + " --existing\n"
         if session.is_symlink() or (session.exists() and session.read_text() not in (initial, desired)):
             raise ValueError("bootstrap session file differs from its journal")
@@ -1479,7 +1471,7 @@ def reconcile_local_bootstrap_commit(directory, name, host, executable):
             raise ValueError("local bootstrap manifest differs from the journal")
         launches = [shlex.split(line) for line in snapshot.read_text().splitlines() if line.startswith("launch ")]
         if (len(launches) != 1 or len(launches[0]) < 8 or
-                not launches[0][1].startswith("kitty-unserialize-data=") or launches[0][-6] != executable or
+                not launches[0][1].startswith("kitty-unserialize-data=") or launches[0][-7:-5] != [executable, "pane"] or
                 launches[0][-5:] != ["--pane", pane, "--host", host, "--existing"]):
             raise ValueError("local bootstrap snapshot differs from the journal")
         pending.unlink()
@@ -1546,9 +1538,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
     directory = state_dir(name, host) if remote_attached else state_dir(name)
     if (directory / "remote.json").exists() and not remote_attached:
         raise ValueError("coordinator workspace: use kzw attach NAME (add --host for a remote origin)")
-    pane_executable = shutil.which("kzw-pane")
-    if not pane_executable:
-        raise ValueError("kzw-pane not found; install the project and activate its environment")
+    pane_executable = kzw_executable()
     if not shutil.which("kitty"):
         raise ValueError("kitty not found on PATH")
     if not host and not shutil.which("zmx"):
@@ -1613,6 +1603,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
         else:
             env = os.environ.copy()
             env.pop("KZW_BACKGROUND_SUPERVISOR", None)
+            env["KZW_EXECUTABLE"] = pane_executable
             env.pop("KZW_STARTUP_STATUS", None)
             env["KZW_HOST"] = host
             env["KZW_WORKSPACE"] = name
@@ -1707,7 +1698,7 @@ def run(name, host, remote_attached=False, existing_lock=None, bootstrap_session
                 # Mask Kitty's automatic wrapper title until the process monitor has
                 # identified the actual foreground program, including on new tabs.
                 args = ["kitty", "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only",
-                        "-o", f"shell={pane_executable}", "-o", "enabled_layouts=splits,tall,stack",
+                        "-o", "shell=" + shlex.join([pane_executable, "pane"]), "-o", "enabled_layouts=splits,tall,stack",
                         "-o", "macos_quit_when_last_window_closed=yes",
                         "-o", "tab_bar_min_tabs=1",
                         "-o", f'tab_title_template="{TAB_TITLE_TEMPLATE}"',
@@ -2186,9 +2177,7 @@ def retire_empty_coordinator_workspace(directory, name, host):
 @remote_client.persistent_rpc()
 def attach_remote(name, host, create_empty=False, appearance=None, new_instance=False, show_preview=False):
     directory = state_dir(name, host)
-    executable = shutil.which("kzw-pane")
-    if not executable:
-        raise ValueError("kzw-pane not found on PATH")
+    executable = kzw_executable()
     with open(directory / "lock", "a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2453,6 +2442,7 @@ def spawn_background(args):
 def parse_args():
     parser = argparse.ArgumentParser(prog="kzw")
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("pane", help="run a managed Kitty pane")
     local_parser = commands.add_parser("_local-tab", help=argparse.SUPPRESS)
     local_parser.add_argument("name")
     local_parser.add_argument("--host", default="")
@@ -2663,9 +2653,7 @@ def main(args=None):
             print("Workspace server is stopping; zmx sessions are preserved")
             return 0
         if args.command == "save":
-            executable = shutil.which("kzw-pane")
-            if not executable:
-                raise ValueError("kzw-pane not found on PATH")
+            executable = kzw_executable()
             directory = state_dir(args.name, args.host) if args.host else state_dir(args.name)
             print(f"Saved {capture(directory, executable, args.allow_removals)} panes")
             return 0
@@ -2727,6 +2715,10 @@ def main(args=None):
 
 
 def entrypoint():
+    if os.path.isabs(sys.argv[0]) and Path(sys.argv[0]).name == "kzw":
+        os.environ["KZW_EXECUTABLE"] = sys.argv[0]
+    if sys.argv[1:2] == ["pane"]:
+        os.execv(sys.executable, [sys.executable, "-m", "kzw.pane", *sys.argv[2:]])
     # The optional Bash hook synchronously invokes exactly this local command
     # before displaying a prompt. Retain ordinary parsing for every other form.
     if (len(sys.argv) == 5 and sys.argv[1:3] == ["sessions", "_record"]

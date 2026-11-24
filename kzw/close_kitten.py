@@ -7,6 +7,10 @@ import shutil
 import subprocess
 
 from kittens.tui.handler import result_handler
+try:
+    from kzw.launcher import executable as kzw_executable
+except ModuleNotFoundError:
+    from launcher import executable as kzw_executable
 
 
 def main(args):
@@ -60,7 +64,7 @@ def handle_result(args, answer, target_window_id, boss):
     def confirmed(yes):
         if not yes:
             return
-        executable = shutil.which("kzw") or str(Path.home() / ".local/bin/kzw")
+        executable = kzw_executable(window)
         cmd = [executable, "_confirmed-close", name, kind, str(target), json.dumps(selection)]
         if origin:
             cmd += ["--host", origin]

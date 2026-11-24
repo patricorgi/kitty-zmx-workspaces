@@ -79,7 +79,7 @@ def handle_result(args, answer, target_window_id, boss):
     session = '\n'.join(lines)
     # Validate completeness before returning; the caller still rewrites all
     # programs to existing-session attachment and the server validates ownership.
-    rewrite_export(session, panes, "kzw-pane")
+    rewrite_export(session, panes, "kzw")
     result = {'os_window_id': window.os_window_id, 'session': session}
     if len(args) == 3:
         # Both representations are read in one Kitty event-loop callback, so
