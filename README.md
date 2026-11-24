@@ -42,6 +42,12 @@ Add `--host HOST` for a remote workspace. For example, run
 `check`, and the session picker's inventory checks can reuse an existing SSH
 connection to that host; no configuration is required.
 
+To reorder managed tabs within a workspace, drag a tab along the tab bar
+and drop it at the insertion marker, or use Kitty's `move_tab_backward` and
+`move_tab_forward` actions. `kzw detach` saves the new order, including the
+splits and focused pane, for the next attach. The separate **Local** companion
+tab still restores last.
+
 When you run `kzw attach Demo --host HOST` from shared Kitty, a **Connecting**
 window opens before SSH validation finishes. The saved layout loads into that
 same window once verified. Close the preview to cancel, or check the window
