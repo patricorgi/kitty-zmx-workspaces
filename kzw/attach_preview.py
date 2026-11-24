@@ -5,28 +5,63 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 import uuid
 
 
-def splash_message(name, host):
-    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    path = config / "kzw/splash.txt"
-    default = f"Connecting to {name} ({host})..."
+def splash_directory():
+    return (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "kzw").absolute()
+
+
+def read_template(path, limit):
     try:
         if not path.is_file():
-            return default
+            return ""
         with path.open(encoding="utf-8") as stream:
-            template = stream.read(8193)
+            template = stream.read(limit + 1)
     except (OSError, UnicodeError):
-        return default
-    if len(template) > 8192:
-        return default
+        return ""
+    return template if len(template) <= limit else ""
+
+
+def expand_template(template, name, host):
     values = {"workspace": name, "host": host}
     text = re.sub(r"\{(workspace|host)\}", lambda m: values[m[1]], template)
     # Allow line breaks and indentation, but never pass through terminal controls.
-    text = "".join(c for c in text if c in "\n\t" or unicodedata.category(c) != "Cc")
-    return text if text.strip() else default
+    return "".join(c for c in text if c in "\n\t" or unicodedata.category(c) != "Cc")
+
+
+def splash_message(name, host, directory=None):
+    template = read_template((directory or splash_directory()) / "splash.txt", 8192)
+    text = expand_template(template, name, host)
+    return text if text.strip() else expand_template("Connecting to {workspace} ({host})...", name, host)
+
+
+def splash_frames(directory, name, host):
+    source = read_template(directory / "splash.frames", 262144)
+    frames = []
+    lines = []
+    delay = None
+    for line in source.removesuffix("\n").split("\n"):
+        if line.startswith("@frame"):
+            header = re.fullmatch(r"@frame ([0-9]{1,5})", line)
+            if not header or not 50 <= int(header[1]) <= 10000:
+                return []
+            if delay is not None:
+                frames.append((delay, "\n".join(lines)))
+            delay = int(header[1])
+            lines = []
+        elif delay is None:
+            return []
+        else:
+            lines.append(line)
+    if delay is not None:
+        frames.append((delay, "\n".join(lines)))
+    if not 1 <= len(frames) <= 256 or any(len(text) > 8192 for _, text in frames):
+        return []
+    frames = [(ms, expand_template(text, name, host)) for ms, text in frames]
+    return frames if all(text.strip() for _, text in frames) else []
 
 
 def splash_screen(message, columns, rows):
@@ -60,8 +95,18 @@ class AttachPreview:
         self.window = int(kitty_instance.remote_raw(
             self.shared["address"], "launch", "--type=os-window", "--tab-title=Connecting…",
             f"--var=kzw_attach_preview={self.nonce}", sys.executable, "-I", str(Path(__file__).resolve()),
-            splash_message(name, host)).strip())
+            str(splash_directory()), name, host).strip())
         self.populated = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, exc, traceback):
+        if not self.populated:
+            if isinstance(exc, Exception):
+                self.error(exc)
+            else:
+                self.close()
 
     def command(self, action, value=""):
         from . import kitty_instance
@@ -86,11 +131,30 @@ class AttachPreview:
             self.close()
 
 
-if __name__ == "__main__":
+def render_frame(message, redraw=False):
     try:
-        columns, rows = os.get_terminal_size()
+        columns, rows = os.get_terminal_size(sys.stdout.fileno())
     except OSError:
         columns, rows = 80, 24
-    sys.stdout.write(splash_screen(sys.argv[1], columns or 80, rows or 24))
+    screen = splash_screen(message, columns or 80, rows or 24)
+    if redraw:
+        # Present the erase and repaint together; shorter frames leave no stale cells.
+        screen = "\x1b[?2026h\x1b[2J" + screen + "\x1b[?2026l"
+    sys.stdout.write(screen)
     sys.stdout.flush()
+
+
+def show_preview(directory, name, host):
+    frames = splash_frames(directory, name, host)
+    if len(frames) > 1:
+        sys.stdout.write("\x1b[?1049h")  # Keep repeated frames out of scrollback.
+        while True:
+            for ms, text in frames:
+                render_frame(text, redraw=True)
+                time.sleep(ms / 1000)
+    render_frame(frames[0][1] if frames else splash_message(name, host, directory))
     os.execl("/bin/sleep", "sleep", "86400")
+
+
+if __name__ == "__main__":
+    show_preview(Path(sys.argv[1]), sys.argv[2], sys.argv[3])

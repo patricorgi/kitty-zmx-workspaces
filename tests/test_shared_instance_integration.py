@@ -264,6 +264,35 @@ class SharedInstanceIntegrationTests(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 canceled.command("populate", json.dumps([str(layout), pane, 1]))
 
+    def test_animated_splash_renders_text_and_hands_off_mid_loop(self):
+        from kzw.attach_preview import AttachPreview
+        from unittest.mock import patch
+
+        directory = self.tmp / "config/kzw"
+        directory.mkdir(parents=True)
+        (directory / "splash.frames").write_text(
+            "@frame 400\n⣿ Preparing {workspace}\nsecond line\n@frame 400\n⠶ {host}\n", encoding="utf-8")
+        layout = self.tmp / "animated.session"
+        layout.write_text("new_tab Test\nlaunch /bin/sleep 600\n")
+        with patch.dict(os.environ, {**self.env, "XDG_CONFIG_HOME": str(directory.parent)}), \
+                AttachPreview("Test", "local") as preview:
+            seen = set()
+            deadline = time.monotonic() + 5
+            while len(seen) < 2 and time.monotonic() < deadline:
+                lines = self.raw("get-text", "--match", f"id:{preview.window}").splitlines()
+                content = [line.strip() for line in lines if line.strip()]
+                if content == ["⣿ Preparing Test", "second line"]:
+                    seen.add("long")
+                if content == ["⠶ local"]:
+                    seen.add("short")
+            self.assertEqual(seen, {"long", "short"})
+            before = next(ow for ow in json.loads(self.raw("ls")) if any(
+                w["id"] == preview.window for tab in ow["tabs"] for w in tab["windows"]))
+            self.assertEqual(int(preview.command("populate", json.dumps([str(layout), None, 1]))), before["id"])
+            preview.populated = True
+            restored = next(ow for ow in json.loads(self.raw("ls")) if ow["id"] == before["id"])
+            self.assertEqual([tab["title"] for tab in restored["tabs"]], ["Test"])
+
     def test_native_tab_uses_shared_workspace_without_helper_mapping(self):
         self.baseline = self.sessions()
         created = self.kzw("create", "Test", "--attach")

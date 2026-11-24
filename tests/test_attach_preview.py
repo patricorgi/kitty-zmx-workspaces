@@ -3,10 +3,10 @@ from contextlib import nullcontext
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from kzw import cli
-from kzw.attach_preview import splash_message, splash_screen
+from kzw.attach_preview import show_preview, splash_frames, splash_message, splash_screen
 
 
 class AttachPreviewTests(unittest.TestCase):
@@ -26,7 +26,36 @@ class AttachPreviewTests(unittest.TestCase):
         self.assertEqual(splash_screen("准备\n\nDone", 20, 10),
                          "\x1b[?25l\x1b[4;9H准备\x1b[5;9H\x1b[6;9HDone")
         self.assertEqual(splash_screen("准备 x\nsecond\nthird", 3, 2),
-                         "\x1b[?25l\x1b[1;1H准\x1b[2;1Hsec")
+                          "\x1b[?25l\x1b[1;1H准\x1b[2;1Hsec")
+
+    def test_animation_loops_in_order_with_per_frame_holds(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            (directory / "splash.frames").write_text(
+                "@frame 50\n⣿ {workspace}\n\none\n@frame 400\n{host}\x07\n", encoding="utf-8")
+            with patch("kzw.attach_preview.render_frame") as paint, \
+                    patch("sys.stdout"), \
+                    patch("time.sleep", side_effect=[None, None, KeyboardInterrupt]) as hold:
+                with self.assertRaises(KeyboardInterrupt):
+                    show_preview(directory, "Test", "local")
+            first = call("⣿ Test\n\none", redraw=True)
+            self.assertEqual(paint.call_args_list, [first, call("local", redraw=True), first])
+            self.assertEqual(hold.call_args_list, [call(.05), call(.4), call(.05)])
+
+    def test_bad_animation_falls_back_to_static_text(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            path = directory / "splash.frames"
+            (directory / "splash.txt").write_text("Loading {workspace}")
+            for data in (b"", b"\xff", b"hi\n@frame 50\nok", b"@frame 0\nx", b"@frame 10001\nx",
+                         b"@frame 50\nok\n@frame 100\n \n", b"@frame 100\n" + b"x" * 8193,
+                         b"@frame 50\nx\n" * 257, b"x" * 262145):
+                with self.subTest(data=data[:20]):
+                    path.write_bytes(data)
+                    self.assertEqual(splash_frames(directory, "Test", "local"), [])
+            with patch("kzw.attach_preview.render_frame") as paint, patch("os.execl"):
+                show_preview(directory, "Test", "local")
+            paint.assert_called_once_with("Loading Test")
 
     def test_preview_precedes_ssh_and_canceled_preview_releases_lease(self):
         with tempfile.TemporaryDirectory() as root, \
