@@ -60,9 +60,8 @@ No Kitty configuration or helper is needed.
 
 ## Limitations
 
-- An established SSH attachment ending closes its pane if the pane was already
-  saved. A disconnect preserves the zmx session and saved layout; reattach to
-  restore the pane. Only a verified shell exit removes it from the saved layout.
+- An SSH disconnect leaves the pane open and kzw retries the existing session.
+  Only a verified shell exit closes the pane and removes it from the saved layout.
 
 - kzw is experimental. Crashes or interrupted operations may require manual
   recovery, and recent layout changes may be lost.

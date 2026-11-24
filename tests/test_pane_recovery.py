@@ -15,6 +15,26 @@ PANE = "kzw-" + "a" * 32
 
 
 class PaneRecoveryTests(unittest.TestCase):
+    def test_established_ssh_completion_preserves_pane_and_retries_same_session(self):
+        for status in (0, 255):
+            attachment = Mock(transport_ended=True, ready_command="")
+            env = {"KZW_WORKSPACE_ORIGIN": "origin", "KZW_WORKSPACE_DIRECTORY": "/private/Test",
+                   "KZW_WORKSPACE": "Test", "KZW_CONNECTION_DISPLAY": "1"}
+            done = subprocess.CompletedProcess([], status)
+            with self.subTest(status=status), patch.dict(os.environ, env, clear=True), \
+                 patch("sys.argv", ["kzw-pane", "--pane", PANE, "--host", "origin"]), \
+                 patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO), \
+                 patch("kzw.attachment.Attachment", return_value=attachment), \
+                 patch("kzw.pane.network.get", return_value=Mock(**{"wait_online.return_value": True})), \
+                 patch("kzw.ssh_transport.pane_options", return_value=[]), \
+                 patch("kzw.pane.verify_workspace_lease"), \
+                 patch("kzw.pane.report_attachment_ended") as ended, \
+                 patch("kzw.pane.run_attachment", side_effect=[done, KeyboardInterrupt]) as attach:
+                with self.assertRaises(KeyboardInterrupt):
+                    pane.main()
+            ended.assert_called_once_with(retry=True)
+            self.assertIn("zmx list --short", attach.call_args_list[1].args[0][-1])
+
     def test_offline_before_ssh_start_is_not_confused_with_an_unknown_remote_startup(self):
         for error, needs_existing in ((network.OfflineError("offline"), False),
                                       (NotStarted("preflight interrupted"), False),

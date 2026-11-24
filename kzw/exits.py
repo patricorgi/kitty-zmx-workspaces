@@ -7,7 +7,7 @@ import subprocess
 from contextlib import nullcontext
 
 from . import remote_client
-from .core import FOCUS_PREFIX, PANE, atomic_write, focused_pane, pane_map, rewrite_export
+from .core import FOCUS_PREFIX, atomic_write, focused_pane, pane_map, rewrite_export
 from .layout_prune import prune_snapshot
 
 
@@ -51,24 +51,8 @@ def snapshot_for_exit(directory, executable, tree):
         session, mapping, executable)
 
 
-def record_transport_end(directory, pane):
-    """Only auto-close views already present in the durable layout."""
-    manifest = directory / "panes.json"
-    if not PANE.fullmatch(pane) or not manifest.is_file() or pane not in json.loads(manifest.read_text()):
-        return False
-    signals = directory / "transport-ended"
-    signals.mkdir(mode=0o700, exist_ok=True)
-    if signals.is_symlink():
-        raise ValueError("unsafe transport end directory")
-    atomic_write(signals / pane, "")
-    try:
-        (directory / "watcher.changed").touch()
-    except OSError:
-        pass
-    return True
-
-
 def transport_candidates(directory, saved):
+    """Read markers left by older wrappers that closed on transport loss."""
     signals = directory / "transport-ended"
     if signals.is_symlink() or not signals.is_dir():
         return set()

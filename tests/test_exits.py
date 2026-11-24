@@ -317,8 +317,10 @@ class ExitTests(unittest.TestCase):
         self.assertEqual(self.closes, [])
 
     def test_transport_end_preserves_live_session_and_prunes_only_proven_exit(self):
-        self.assertTrue(exits.record_transport_end(self.directory, B))
-        self.assertTrue(exits.record_transport_end(self.directory, C))
+        signals = self.directory / "transport-ended"
+        signals.mkdir()
+        for pane in (B, C):
+            (signals / pane).touch()
         self.tree[0]["tabs"][0]["windows"] = self.tree[0]["tabs"][0]["windows"][:1]
         self.assertEqual(self.sync(), 0)
         self.assertEqual((self.directory / "workspace.kitty-session").read_text(), self.source)
@@ -328,8 +330,10 @@ class ExitTests(unittest.TestCase):
         self.assertEqual(self.closes, [])
 
     def test_transport_end_can_reconcile_after_last_view_disappears(self):
+        signals = self.directory / "transport-ended"
+        signals.mkdir()
         for pane in (A, B, C):
-            self.assertTrue(exits.record_transport_end(self.directory, pane))
+            (signals / pane).touch()
         self.ended(A, B, C)
         self.tree = []
         self.assertEqual(exits.synchronize(self.directory, "/bin/kzw-pane", tree=[]), 3)

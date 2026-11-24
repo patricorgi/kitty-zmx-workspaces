@@ -114,15 +114,14 @@ class Attachment:
                 except ProcessLookupError:
                     pass
 
-    def ended(self, *, show_reconnecting=True):
+    def ended(self):
         with self.lock:
             if self.process is not None:
                 self.initial_phase = "restoring"
             self.process = None
             self.process_group = None
             self.direct = True
-            if show_reconnecting:
-                self.set_phase("reconnecting")
+            self.set_phase("reconnecting")
 
     def signal_child(self, signum):
         if self.process_group is not None:
@@ -280,7 +279,7 @@ class Attachment:
             self.transport_ended = acknowledged and not self.wake.is_set() and not self.stop.is_set()
             process.stderr.close()
             process.stdout.close()
-            self.ended(show_reconnecting=not self.transport_ended)
+            self.ended()
 
     def close(self):
         self.stop.set()

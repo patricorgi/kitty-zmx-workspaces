@@ -352,10 +352,6 @@ def _main():
             set_attachment_ended(False)
             with attachment_terminal():
                 result = run_attachment(cmd, env, bool(args.host))
-            if coordinated and args.host and _attachment is not None and _attachment.transport_ended is True:
-                from .exits import record_transport_end
-                if record_transport_end(Path(os.environ["KZW_WORKSPACE_DIRECTORY"]), pane):
-                    return  # Kitty closes this local wrapper; origin cleanup is separate.
             if result.returncode:
                 raise RuntimeError(f"attachment exited with status {result.returncode}")
             last_error = None
@@ -366,7 +362,12 @@ def _main():
             if str(exc) != last_error:
                 print(f"kzw: {exc}; waiting to reconnect", file=sys.stderr, flush=True)
             last_error = str(exc)
-        retry = bool(failed and (args.host or coordinated or needs_journal or needs_absence_check or needs_stage))
+        # SSH completion (including status zero) does not prove the persistent
+        # shell exited. Keep the Kitty view until the supervisor has origin
+        # evidence, and reconnect only to the same session in the meantime.
+        retry = bool((coordinated and args.host and _attachment is not None and
+                      _attachment.transport_ended is True) or
+                     (failed and (args.host or coordinated or needs_journal or needs_absence_check or needs_stage)))
         if os.environ.get("KZW_DEBUG") == "1":
             print("kzw: attachment ended; checking whether the session still exists" +
                   ("; retrying connection" if retry else ""), file=sys.stderr, flush=True)

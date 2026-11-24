@@ -57,9 +57,15 @@ class RemoteExitLatencyIntegrationTests(unittest.TestCase):
                    and int(fields[1]) == original[split]["pid"] and Path(fields[2]).name == "ssh"]
         self.assertEqual(len(clients), 1)
         os.kill(clients[0], signal.SIGKILL)
-        fixture.wait(lambda: split not in {w["id"] for w in fixture.windows()})
+        def split_pane():
+            return next((w for w in fixture.windows() if w["id"] == split), None)
+
+        fixture.wait(lambda: (w := split_pane()) and w["user_vars"].get("kzw_attach_ended") == "1")
         self.assertEqual(set(json.loads((directory / "panes.json").read_text())), owned)
         self.assertEqual(remote_identities(), before)
+        fixture.wait(lambda: (w := split_pane()) and w["user_vars"].get("kzw_attach_ended") == "0")
+        self.assertEqual(split_pane()["pid"], original[split]["pid"])
+        self.assertFalse((directory / "transport-ended").exists())
         result = kit.kzw("detach", "Test", "--host", host)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         started = time.monotonic()
@@ -76,7 +82,9 @@ class RemoteExitLatencyIntegrationTests(unittest.TestCase):
         self.assertEqual(remote_identities(), before)
 
         timings = []
-        for wid, text in ((split, "\x04"), (tab, "exit 7\r"), (source, "\x04")):
+        # Use explicit shell exits here so the remote user's Ctrl+D bindings
+        # and input modes cannot turn this into a Readline test.
+        for wid, text in ((split, "exit\r"), (tab, "exit 7\r"), (source, "exit\r")):
             token = "KZW_EXIT_READY_" + str(wid)
             last_send = [0.0]
 
@@ -94,7 +102,10 @@ class RemoteExitLatencyIntegrationTests(unittest.TestCase):
                 self.fail(f"{exc}\n{(directory / 'supervisor.log').read_text()}")
             start = time.monotonic()
             kit.raw("send-text", "--match", "id:" + str(wid), text)
-            fixture.wait(lambda: wid not in {w["id"] for w in fixture.windows()})
+            try:
+                fixture.wait(lambda: wid not in {w["id"] for w in fixture.windows()})
+            except AssertionError as exc:
+                self.fail(f"{exc}\nLive sessions: {remote_identities()}\n{(directory / 'supervisor.log').read_text()}")
             timings.append(round(time.monotonic() - start, 3))
             pane = original[wid]["user_vars"]["kzw_pane"]
             try:
