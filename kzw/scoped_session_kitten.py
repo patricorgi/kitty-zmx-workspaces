@@ -20,6 +20,14 @@ except ModuleNotFoundError as exc:
     from remote_file_menu_kitten import install as install_remote_file
     import utility_tabs
 
+# A running Kitty can already have an older kzw package on sys.path.
+try:
+    from kzw.viewer_kitten import install as install_live_pdf
+except ModuleNotFoundError as exc:
+    if exc.name not in ("kzw", "kzw.viewer_kitten"):
+        raise
+    from viewer_kitten import install as install_live_pdf
+
 
 def current_workspace_tree():
     """Use the local-tab-aware adapter even in a long-running Kitty instance.
@@ -64,6 +72,7 @@ def handle_result(args, answer, target_window_id, boss):
     windows = [boss.window_id_map[window_id] for window_id in panes]
     for managed in windows:
         install_remote_file(boss, managed)
+        install_live_pdf(boss, managed)
     matched = None
     if has_utilities:
         matched = frozenset(boss.window_id_map[w["id"]] for tab in tree[0]["tabs"] for w in tab["windows"])

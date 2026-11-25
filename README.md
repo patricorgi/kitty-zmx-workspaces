@@ -58,6 +58,11 @@ on the remote host (GNU `ls`), **Ctrl+Shift-click** the filename, then choose
 remote-file menu, including when the alias uses a jump host.
 With the personal Linux Yazi keymap, highlight or mark one file and press
 **M**, then **d** to open that menu directly in the active managed remote pane.
+The default Yazi opener (**Enter** or **o**) opens PDFs in Skim and images
+in Preview on the Mac. For a live PDF preview you can also press **M**, then **p**. Skim
+opens a local copy that updates after remote rebuilds. Enable automatic file
+reload in Skim. Repeat **M p** on the same PDF to stop; detaching the pane
+also stops the watch. The preview never writes back to the remote file.
 
 When you run `kzw attach Demo --host HOST` from shared Kitty, a **Connecting**
 window opens before SSH validation finishes. The saved layout loads into that
