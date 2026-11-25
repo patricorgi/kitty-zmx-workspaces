@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/9a65a9ae-26fe-43d1-8700-7f1a89547301
 
 ## Installation
 
-Install Python 3.10+, Kitty 0.49+, and zmx. For remote workspaces, make sure
+Install Python 3.10+, Kitty 0.51+, and zmx. For remote workspaces, make sure
 you can SSH to the host and that it has Python 3 and zmx.
 
 ```sh
